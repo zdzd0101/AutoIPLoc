@@ -7,6 +7,7 @@ class LocationService: ObservableObject {
     @Published var statusText = "未启动定位模拟"
     @Published var currentIP = "-"
     @Published var locationDetail = "-"
+    @Published var currentTimezone = "-"
     @Published var isAutoMode = true
     @Published var isSimulating = false
     
@@ -21,12 +22,10 @@ class LocationService: ObservableObject {
         startNetworkWatcher()
     }
     
-    // 1. 后台无声保活：生成一段极简空 WAV 数据循环播放，防止切后台被 iOS 挂起
     private func setupBackgroundAudio() {
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: .mixWithOthers)
         try? AVAudioSession.sharedInstance().setActive(true)
         
-        // 构造 1 秒静音 WAV 数据
         var header = Data([
             0x52,0x49,0x46,0x46, 0x24,0x08,0x00,0x00, 0x57,0x41,0x56,0x45, 0x66,0x6d,0x74,0x20,
             0x10,0x00,0x00,0x00, 0x01,0x00, 0x01,0x00, 0x44,0xac,0x00,0x00, 0x88,0x58,0x01,0x00,
@@ -40,12 +39,11 @@ class LocationService: ObservableObject {
         audioPlayer?.play()
     }
     
-    // 2. 监听飞行模式关闭 / 网络切换
     private func startNetworkWatcher() {
         monitor.pathUpdateHandler = { [weak self] path in
             guard let self = self, self.isAutoMode else { return }
             if path.status == .satisfied {
-                DispatchQueue.main.async { self.statusText = "检测到网络恢复，4秒后同步IP..." }
+                DispatchQueue.main.async { self.statusText = "检测到网络恢复，4秒后同步IP与时区..." }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
                     self.syncNow(force: false)
                 }
@@ -54,9 +52,8 @@ class LocationService: ObservableObject {
         monitor.start(queue: netQueue)
     }
     
-    // 3. 获取出口 IP 经纬度并注入系统 GPS
     func syncNow(force: Bool = true) {
-        guard let url = URL(string: "http://ip-api.com/json/?fields=status,country,city,lat,lon,query") else { return }
+        guard let url = URL(string: "http://ip-api.com/json/?fields=status,country,city,lat,lon,timezone,query") else { return }
         DispatchQueue.main.async { self.statusText = "正在查询当前出口 IP..." }
         
         URLSession.shared.dataTask(with: url) { [weak self] data, _, err in
@@ -75,7 +72,6 @@ class LocationService: ObservableObject {
                 return
             }
             
-            // 添加约 80~150 米随机坐标微扰，避免死板重合
             let finalLat = lat + Double.random(in: -0.001...0.001)
             let finalLon = lon + Double.random(in: -0.001...0.001)
             
@@ -93,17 +89,24 @@ class LocationService: ObservableObject {
             self.sim.flush()
             self.sim.startLocationSimulation()
             
+            // 自动同步系统全局时区
+            let tzName = (json["timezone"] as? String) ?? "America/Los_Angeles"
+            if let tz = TimeZone(identifier: tzName) {
+                CFTimeZoneSetDefault(tz as CFTimeZone)
+                NSTimeZone.default = tz
+            }
+            
             DispatchQueue.main.async {
                 self.lastIP = ip
                 self.currentIP = ip
+                self.currentTimezone = tzName
                 self.locationDetail = "\(json["country"] ?? "") · \(json["city"] ?? "") (\(String(format: "%.4f", finalLat)), \(String(format: "%.4f", finalLon)))"
                 self.isSimulating = true
-                self.statusText = "✅ 已全自动跟随 IP 定位"
+                self.statusText = "✅ 已同步 IP 定位与系统时区"
             }
         }.resume()
     }
     
-    // 4. 一键停止模拟，恢复真实定位
     func stopNow() {
         sim.stopLocationSimulation()
         sim.clearSimulatedLocations()
@@ -125,6 +128,7 @@ struct ContentView: View {
                 Section(header: Text("当前状态")) {
                     Text(service.statusText).font(.headline)
                     HStack { Text("出口 IP"); Spacer(); Text(service.currentIP).foregroundColor(.secondary) }
+                    HStack { Text("同步时区"); Spacer(); Text(service.currentTimezone).foregroundColor(.secondary) }
                     HStack { Text("模拟坐标"); Spacer(); Text(service.locationDetail).font(.caption).foregroundColor(.secondary) }
                 }
                 
