@@ -22,6 +22,7 @@ class LocationService: ObservableObject {
         startNetworkWatcher()
     }
     
+    // 无声后台保活，确保切后台或开关飞行模式后仍能自动触发同步
     private func setupBackgroundAudio() {
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: .mixWithOthers)
         try? AVAudioSession.sharedInstance().setActive(true)
@@ -39,6 +40,7 @@ class LocationService: ObservableObject {
         audioPlayer?.play()
     }
     
+    // 监听飞行模式切换及网络变化
     private func startNetworkWatcher() {
         monitor.pathUpdateHandler = { [weak self] path in
             guard let self = self, self.isAutoMode else { return }
@@ -52,6 +54,7 @@ class LocationService: ObservableObject {
         monitor.start(queue: netQueue)
     }
     
+    // 获取当前出口 IP 归属地、坐标与时区并写入系统底层
     func syncNow(force: Bool = true) {
         guard let url = URL(string: "http://ip-api.com/json/?fields=status,country,city,lat,lon,timezone,query") else { return }
         DispatchQueue.main.async { self.statusText = "正在查询当前出口 IP..." }
@@ -72,6 +75,7 @@ class LocationService: ObservableObject {
                 return
             }
             
+            // 添加约 80~150 米随机坐标微扰，避免死板重合在同一个小数点
             let finalLat = lat + Double.random(in: -0.001...0.001)
             let finalLon = lon + Double.random(in: -0.001...0.001)
             
@@ -89,11 +93,19 @@ class LocationService: ObservableObject {
             self.sim.flush()
             self.sim.startLocationSimulation()
             
-            // 自动同步系统全局时区
+            // 自动同步修改系统全局时区软链接并发送系统级变更广播
             let tzName = (json["timezone"] as? String) ?? "America/Los_Angeles"
-            if let tz = TimeZone(identifier: tzName) {
-                CFTimeZoneSetDefault(tz as CFTimeZone)
-                NSTimeZone.default = tz
+            let tzPath = "/var/db/timezone/zoneinfo/\(tzName)"
+            if FileManager.default.fileExists(atPath: tzPath) {
+                try? FileManager.default.removeItem(atPath: "/var/db/timezone/localtime")
+                try? FileManager.default.createSymbolicLink(atPath: "/var/db/timezone/localtime", withDestinationPath: tzPath)
+                CFNotificationCenterPostNotification(
+                    CFNotificationCenterGetDarwinNotifyCenter(),
+                    CFNotificationName("SignificantTimeChangeNotification" as CFString),
+                    nil,
+                    nil,
+                    true
+                )
             }
             
             DispatchQueue.main.async {
