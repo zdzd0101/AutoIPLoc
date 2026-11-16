@@ -1,0 +1,35 @@
+name: Build TrollStore TIPA
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and Sign TIPA
+        run: |
+          mkdir -p Payload/AutoIPLoc.app
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          
+          # 直接调用 swiftc 编译 iOS arm64 二进制，无需繁琐的 xcodeproj 工程文件
+          swiftc main.swift \
+            -import-objc-header Bridge.h \
+            -sdk "$SDK_PATH" \
+            -target arm64-apple-ios15.0 \
+            -framework SwiftUI -framework UIKit -framework CoreLocation -framework Network -framework AVFoundation \
+            -o Payload/AutoIPLoc.app/AutoIPLoc
+            
+          cp Info.plist Payload/AutoIPLoc.app/Info.plist
+          
+          # 下载 ldid 并注入巨魔所需系统权限
+          curl -L https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_macos_x86_64 -o ldid
+          chmod +x ldid
+          ./ldid -Sentitlements.plist Payload/AutoIPLoc.app/AutoIPLoc
+          
+          # 打包为 .tipa
+          zip -r AutoIPLoc.tipa Payload
+      - name: Upload TIPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoIPLoc-TrollStore
+          path: AutoIPLoc.tipa
