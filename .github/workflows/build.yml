@@ -22,7 +22,7 @@ jobs:
           cp Info.plist Payload/AutoIPLoc.app/Info.plist
           
           # 下载 ldid 并注入巨魔所需系统权限
-          curl -L https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_macos_x86_64 -o ldid
+          curl -L https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_macosx_arm64 -o ldid
           chmod +x ldid
           ./ldid -Sentitlements.plist Payload/AutoIPLoc.app/AutoIPLoc
           
