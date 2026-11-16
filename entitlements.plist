@@ -6,11 +6,11 @@
     <true/>
     <key>com.apple.private.security.no-sandbox</key>
     <true/>
-    <key>com.apple.private.set-system-timezone</key>
-    <true/>
     <key>com.apple.locationd.simulation</key>
     <true/>
     <key>com.apple.locationd.authorizeapplications</key>
+    <true/>
+    <key>com.apple.private.set-system-timezone</key>
     <true/>
 </dict>
 </plist>
