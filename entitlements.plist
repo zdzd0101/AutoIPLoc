@@ -4,13 +4,19 @@
 <dict>
     <key>platform-application</key>
     <true/>
+    <key>com.apple.private.security.no-container</key>
+    <true/>
     <key>com.apple.private.security.no-sandbox</key>
+    <true/>
+    <key>com.apple.private.corelocation.simulation</key>
     <true/>
     <key>com.apple.locationd.simulation</key>
     <true/>
-    <key>com.apple.locationd.authorizeapplications</key>
+    <key>com.apple.private.timed</key>
     <true/>
-    <key>com.apple.private.set-system-timezone</key>
+    <key>com.apple.private.set-time-zone</key>
+    <true/>
+    <key>com.apple.private.MobileContainerManager.allowed</key>
     <true/>
 </dict>
 </plist>
