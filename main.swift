@@ -13,14 +13,16 @@ import AVFoundation
 }
 
 // MARK: - 2. 封装系统全局时区修改器 (Root 提权修改底层 localtime + 通知系统刷新)
-@_silgen_name("posix_spawnattr_set_persona_np")
-func posix_spawnattr_set_persona_np(_ attr: UnsafeMutablePointer<posix_spawnattr_t?>, _ persona_id: uid_t, _ flags: UInt32) -> Int32
-@_silgen_name("posix_spawnattr_set_persona_uid_np")
-func posix_spawnattr_set_persona_uid_np(_ attr: UnsafeMutablePointer<posix_spawnattr_t?>, _ uid: uid_t) -> Int32
-@_silgen_name("posix_spawnattr_set_persona_gid_np")
-func posix_spawnattr_set_persona_gid_np(_ attr: UnsafeMutablePointer<posix_spawnattr_t?>, _ gid: gid_t) -> Int32
-
 class SystemTimeZoneUpdater {
+    @_silgen_name("posix_spawnattr_set_persona_np")
+    private static func posix_spawnattr_set_persona_np(_ attr: UnsafeMutablePointer<posix_spawnattr_t?>, _ persona_id: uid_t, _ flags: UInt32) -> Int32
+
+    @_silgen_name("posix_spawnattr_set_persona_uid_np")
+    private static func posix_spawnattr_set_persona_uid_np(_ attr: UnsafeMutablePointer<posix_spawnattr_t?>, _ uid: uid_t) -> Int32
+
+    @_silgen_name("posix_spawnattr_set_persona_gid_np")
+    private static func posix_spawnattr_set_persona_gid_np(_ attr: UnsafeMutablePointer<posix_spawnattr_t?>, _ gid: gid_t) -> Int32
+
     static func applyTimeZone(_ tzIdentifier: String) -> Bool {
         let zonePath = "/usr/share/zoneinfo/\(tzIdentifier)"
         guard !tzIdentifier.isEmpty, FileManager.default.fileExists(atPath: zonePath) else {
@@ -48,9 +50,9 @@ class SystemTimeZoneUpdater {
     private static func runAsRoot(_ command: String) -> Bool {
         var attr: posix_spawnattr_t?
         posix_spawnattr_init(&attr)
-        posix_spawnattr_set_persona_np(&attr, 99, 1) // POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE
-        posix_spawnattr_set_persona_uid_np(&attr, 0)
-        posix_spawnattr_set_persona_gid_np(&attr, 0)
+        _ = posix_spawnattr_set_persona_np(&attr, 99, 1) // POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE
+        _ = posix_spawnattr_set_persona_uid_np(&attr, 0)
+        _ = posix_spawnattr_set_persona_gid_np(&attr, 0)
 
         var pid: pid_t = 0
         let argv: [UnsafeMutablePointer<CChar>?] = [
