@@ -12,34 +12,63 @@ import AVFoundation
     func stopLocationSimulation()
 }
 
-// MARK: - 2. 封装系统全局时区修改器 (CoreTime.framework)
+// MARK: - 2. 封装系统全局时区修改器 (Root 提权修改底层 localtime + 通知系统刷新)
+@_silgen_name("posix_spawnattr_set_persona_np")
+func posix_spawnattr_set_persona_np(_ attr: UnsafeMutablePointer<posix_spawnattr_t?>, _ persona_id: uid_t, _ flags: UInt32) -> Int32
+@_silgen_name("posix_spawnattr_set_persona_uid_np")
+func posix_spawnattr_set_persona_uid_np(_ attr: UnsafeMutablePointer<posix_spawnattr_t?>, _ uid: uid_t) -> Int32
+@_silgen_name("posix_spawnattr_set_persona_gid_np")
+func posix_spawnattr_set_persona_gid_np(_ attr: UnsafeMutablePointer<posix_spawnattr_t?>, _ gid: gid_t) -> Int32
+
 class SystemTimeZoneUpdater {
-    typealias TMSetAutomaticTimeZoneEnabledFunc = @convention(c) (Bool) -> Void
-    typealias TMSetTimeZoneFunc = @convention(c) (CFString) -> Bool
-
     static func applyTimeZone(_ tzIdentifier: String) -> Bool {
-        guard !tzIdentifier.isEmpty, TimeZone(identifier: tzIdentifier) != nil else {
+        let zonePath = "/usr/share/zoneinfo/\(tzIdentifier)"
+        guard !tzIdentifier.isEmpty, FileManager.default.fileExists(atPath: zonePath) else {
             return false
         }
-        let path = "/System/Library/PrivateFrameworks/CoreTime.framework/CoreTime"
-        guard let handle = dlopen(path, RTLD_NOW) else {
-            return false
-        }
-        defer { dlclose(handle) }
 
-        // 1. 强制关闭系统自动时区（防止被基站/Wi-Fi拉回国内时间）
-        if let autoSym = dlsym(handle, "TMSetAutomaticTimeZoneEnabled") {
-            let setAuto = unsafeBitCast(autoSym, to: TMSetAutomaticTimeZoneEnabledFunc.self)
-            setAuto(false)
+        // 1. 先关闭自动时区偏好设置
+        let dtDomain = "com.apple.preferences.datetime" as CFString
+        CFPreferencesSetValue("AutomaticTimeZoneEnabled" as CFString, kCFBooleanFalse, dtDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
+        CFPreferencesSetValue("timezone" as CFString, tzIdentifier as CFString, dtDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
+        CFPreferencesSynchronize(dtDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
+
+        // 2. 以 root (uid 0) 身份重写 /var/db/timezone/localtime 软链接
+        let cmd = "rm -f /var/db/timezone/localtime && ln -sf \(zonePath) /var/db/timezone/localtime && chmod 755 /var/db/timezone/localtime && killall -HUP timed 2>/dev/null || true"
+        let ok = runAsRoot(cmd)
+
+        // 3. 发送系统全局时区变更广播，触发状态栏与 Safari 实时刷新
+        let center = CFNotificationCenterGetDarwinNotifyCenter()
+        CFNotificationCenterPostNotification(center, CFNotificationName("NSSystemTimeZoneDidChangeNotification" as CFString), nil, nil, true)
+        CFNotificationCenterPostNotification(center, CFNotificationName("SignificantTimeChangeNotification" as CFString), nil, nil, true)
+
+        return ok
+    }
+
+    private static func runAsRoot(_ command: String) -> Bool {
+        var attr: posix_spawnattr_t?
+        posix_spawnattr_init(&attr)
+        posix_spawnattr_set_persona_np(&attr, 99, 1) // POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE
+        posix_spawnattr_set_persona_uid_np(&attr, 0)
+        posix_spawnattr_set_persona_gid_np(&attr, 0)
+
+        var pid: pid_t = 0
+        let argv: [UnsafeMutablePointer<CChar>?] = [
+            strdup("/bin/sh"),
+            strdup("-c"),
+            strdup(command),
+            nil
+        ]
+        defer {
+            for ptr in argv where ptr != nil { free(ptr) }
+            posix_spawnattr_destroy(&attr)
         }
 
-        // 2. 写入新时区并通知 SpringBoard / timed 刷新
-        if let tzSym = dlsym(handle, "TMSetTimeZone") {
-            let setTZ = unsafeBitCast(tzSym, to: TMSetTimeZoneFunc.self)
-            let ok = setTZ(tzIdentifier as CFString)
-            CFPreferencesSetValue("timezone" as CFString, tzIdentifier as CFString, "com.apple.preferences.datetime" as CFString, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
-            CFPreferencesSynchronize("com.apple.preferences.datetime" as CFString, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
-            return ok
+        let status = posix_spawn(&pid, "/bin/sh", nil, &attr, argv, environ)
+        if status == 0 {
+            var exitCode: Int32 = 0
+            waitpid(pid, &exitCode, 0)
+            return exitCode == 0
         }
         return false
     }
