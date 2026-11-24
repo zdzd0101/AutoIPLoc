@@ -6,11 +6,10 @@
     <dict>
         <key>Bundles</key>
         <array>
+            <string>com.apple.UIKit</string>
             <string>com.apple.Maps</string>
             <string>com.apple.geod</string>
             <string>com.apple.GeoServices</string>
-            <string>com.apple.locationd</string>
-            <string>com.apple.UIKit</string>
         </array>
     </dict>
 </dict>
