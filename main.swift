@@ -60,7 +60,7 @@ struct EgressIPResult {
     let isp: String
 }
 
-// MARK: - 3. 自举 UID 0 Root 底层修改器（在 UIApplicationMain 前拦截执行）
+// MARK: - 3. 自举 UID 0 Root 底层修改器
 class NativeSystemController {
     static let geoSharedPath = "/var/mobile/Library/Preferences/com.autoiploc.geo.plist"
     static let wifiSharedPath = "/var/mobile/Library/Preferences/com.autoiploc.wifi.plist"
@@ -100,30 +100,35 @@ class NativeSystemController {
 
         if action == "timezone", idx + 2 < args.count {
             let tz = args[idx + 2]
-            let zoneCandidates = [
-                "/var/db/timezone/zoneinfo/\(tz)",
-                "/usr/share/zoneinfo/\(tz)"
-            ]
-            if let zonePath = zoneCandidates.first(where: { FileManager.default.fileExists(atPath: $0) }) {
-                mkdir("/var/db/timezone", 0o755)
-                unlink("/var/db/timezone/localtime")
-                unlink("/private/var/db/timezone/localtime")
-                let ok1 = symlink(zonePath, "/var/db/timezone/localtime")
-                _ = symlink(zonePath, "/private/var/db/timezone/localtime")
-                chmod("/var/db/timezone/localtime", 0o755)
 
-                let dtPlist = "/var/mobile/Library/Preferences/com.apple.preferences.datetime.plist"
-                let dict = NSMutableDictionary(contentsOfFile: dtPlist) ?? NSMutableDictionary()
+            // 1. 调用 CoreTime 私有接口关闭自动时区并写入目标时区
+            if let handle = dlopen("/System/Library/PrivateFrameworks/CoreTime.framework/CoreTime", RTLD_LAZY) {
+                typealias SetAutoTZFn = @convention(c) (Bool) -> Void
+                typealias SetManualTZFn = @convention(c) (CFString) -> Void
+                if let symAuto = dlsym(handle, "TMSetAutomaticTimeZoneEnabled") {
+                    unsafeBitCast(symAuto, to: SetAutoTZFn.self)(false)
+                }
+                if let symManual = dlsym(handle, "TMSetManualTimeZone") {
+                    unsafeBitCast(symManual, to: SetManualTZFn.self)(tz as CFString)
+                }
+            }
+
+            // 2. 同步写入系统级与用户级时间配置表
+            let plistTargets = [
+                ("/var/mobile/Library/Preferences/com.apple.preferences.datetime.plist", uid_t(501)),
+                ("/var/preferences/com.apple.preferences.datetime.plist", uid_t(0))
+            ]
+            for (path, owner) in plistTargets {
+                let dict = NSMutableDictionary(contentsOfFile: path) ?? NSMutableDictionary()
                 dict["AutomaticTimeZoneEnabled"] = false
                 dict["timezone"] = tz
-                dict.write(toFile: dtPlist, atomically: true)
-                chown(dtPlist, 501, 501)
-                chmod(dtPlist, 0o644)
-
-                restartProcessesNative(["timed"])
-                exit(ok1 == 0 ? 0 : 1)
+                dict.write(toFile: path, atomically: true)
+                chown(path, owner, owner)
+                chmod(path, 0o644)
             }
-            exit(1)
+
+            restartProcessesNative(["timed"])
+            exit(0)
         } else if action == "clear-geo" {
             let paths = [
                 "/var/mobile/Library/Caches/GeoServices",
@@ -165,16 +170,30 @@ class NativeSystemController {
         }
     }
 
-   
-    static func applyTimeZone(_ tzIdentifier: String) -> Bool {
+    static func updateGeoSharedConfig(countryCode: String, timezone: String?) {
+        let cc = (countryCode.isEmpty || countryCode == "--") ? "US" : countryCode.uppercased()
+        let dict = NSMutableDictionary(contentsOfFile: geoSharedPath) ?? NSMutableDictionary()
+        dict["countryCode"] = cc
+        dict["forceAppleMaps"] = true
+        if let tz = timezone, !tz.isEmpty, tz != "-" {
+            dict["timezone"] = tz
+        }
+        dict["updatedAt"] = Date().timeIntervalSince1970
+        dict.write(toFile: geoSharedPath, atomically: true)
+        chmod(geoSharedPath, 0o644)
+    }
+
+    static func applyTimeZone(_ tzIdentifier: String, countryCode: String) -> Bool {
         guard !tzIdentifier.isEmpty else { return false }
+
+        updateGeoSharedConfig(countryCode: countryCode, timezone: tzIdentifier)
 
         let dtDomain = "com.apple.preferences.datetime" as CFString
         CFPreferencesSetValue("AutomaticTimeZoneEnabled" as CFString, kCFBooleanFalse, dtDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
         CFPreferencesSetValue("timezone" as CFString, tzIdentifier as CFString, dtDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
         CFPreferencesSynchronize(dtDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
 
-        let rootOK = runSelfAsRoot(args: ["timezone", tzIdentifier])
+        _ = runSelfAsRoot(args: ["timezone", tzIdentifier])
 
         setenv("TZ", tzIdentifier, 1)
         tzset()
@@ -184,18 +203,12 @@ class NativeSystemController {
         CFNotificationCenterPostNotification(center, CFNotificationName("NSSystemTimeZoneDidChangeNotification" as CFString), nil, nil, true)
         CFNotificationCenterPostNotification(center, CFNotificationName("SignificantTimeChangeNotification" as CFString), nil, nil, true)
 
-        return rootOK || (TimeZone.current.identifier == tzIdentifier)
+        return TimeZone(identifier: tzIdentifier) != nil
     }
-static func forceAppleInternationalMaps(countryCode: String) {
-        let cc = (countryCode.isEmpty || countryCode == "--") ? "US" : countryCode.uppercased()
 
-        let hookCfg: NSDictionary = [
-            "countryCode": cc,
-            "forceAppleMaps": true,
-            "updatedAt": Date().timeIntervalSince1970
-        ]
-        hookCfg.write(toFile: geoSharedPath, atomically: true)
-        chmod(geoSharedPath, 0o644)
+    static func forceAppleInternationalMaps(countryCode: String) {
+        let cc = (countryCode.isEmpty || countryCode == "--") ? "US" : countryCode.uppercased()
+        updateGeoSharedConfig(countryCode: cc, timezone: nil)
 
         let prefFiles = [
             "/var/mobile/Library/Preferences/com.apple.GEO.plist",
@@ -216,7 +229,7 @@ static func forceAppleInternationalMaps(countryCode: String) {
         CFNotificationCenterPostNotification(center, CFNotificationName("com.autoiploc.geo.updated" as CFString), nil, nil, true)
         _ = runSelfAsRoot(args: ["clear-geo"])
     }
-    
+
     static func injectWiFiList(_ nodes: [SimulatedWiFiNode], countryCode: String) {
         let payload: NSDictionary = [
             "enabled": true,
@@ -299,8 +312,8 @@ class LocationSyncEngine: NSObject {
 
     private func fetchEgressIPWithFallback(completion: @escaping (EgressIPResult?) -> Void) {
         let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 7.0
-        config.timeoutIntervalForResource = 10.0
+        config.timeoutIntervalForRequest = 6.0
+        config.timeoutIntervalForResource = 8.0
         config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         let session = URLSession(configuration: config)
 
@@ -446,8 +459,8 @@ class LocationSyncEngine: NSObject {
                     self.exactAddress = resolvedAddress
                     self.exactZipCode = resolvedZip
 
-                    // 1. Root 提权修改系统全局时区
-                    self.tzSyncedSuccess = NativeSystemController.applyTimeZone(info.timezone)
+                    // 1. 同步全局时区与共享配置
+                    self.tzSyncedSuccess = NativeSystemController.applyTimeZone(info.timezone, countryCode: info.countryCode)
 
                     // 2. 动态生成并注入 12~15 个当地周边 Wi-Fi
                     let generatedWiFis = self.generateDynamicWiFis(isp: info.isp)
@@ -475,6 +488,7 @@ class LocationSyncEngine: NSObject {
         onStatusUpdated?()
     }
 
+    // 附带 5 秒硬超时保护，避免代理切换时卡在转圈状态
     private func reverseGeocodeExactAddress(
         lat: Double,
         lon: Double,
@@ -487,19 +501,42 @@ class LocationSyncEngine: NSObject {
         let geocoder = CLGeocoder()
         let location = CLLocation(latitude: lat, longitude: lon)
         let enLocale = Locale(identifier: "en_US")
+        let safeZip = fallbackZip.isEmpty ? "90001" : fallbackZip
+        let fallbackAddr = "\(Int.random(in: 120...3890)) Oakridge Dr, \(fallbackCity), \(fallbackRegion) \(safeZip), \(fallbackCountry)"
+
+        var finished = false
+        let lock = NSLock()
+
+        let timeoutWork = DispatchWorkItem {
+            lock.lock()
+            let shouldComplete = !finished
+            finished = true
+            lock.unlock()
+            if shouldComplete {
+                geocoder.cancelGeocode()
+                completion(fallbackAddr, safeZip)
+            }
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 5.0, execute: timeoutWork)
 
         geocoder.reverseGeocodeLocation(location, preferredLocale: enLocale) { placemarks, _ in
+            lock.lock()
+            let shouldComplete = !finished
+            finished = true
+            lock.unlock()
+            timeoutWork.cancel()
+            guard shouldComplete else { return }
+
             if let pm = placemarks?.first {
                 let streetNum = pm.subThoroughfare ?? "\(Int.random(in: 112...4680))"
                 let street = pm.thoroughfare ?? "W Maple Ave"
                 let city = pm.locality ?? fallbackCity
                 let state = pm.administrativeArea ?? fallbackRegion
-                let zip = (pm.postalCode?.isEmpty == false) ? pm.postalCode! : (fallbackZip.isEmpty ? "80135" : fallbackZip)
+                let zip = (pm.postalCode?.isEmpty == false) ? pm.postalCode! : safeZip
                 let country = pm.country ?? fallbackCountry
                 completion("\(streetNum) \(street), \(city), \(state) \(zip), \(country)", zip)
             } else {
-                let safeZip = fallbackZip.isEmpty ? "80135" : fallbackZip
-                completion("\(Int.random(in: 120...3890)) Oakridge Dr, \(fallbackCity), \(fallbackRegion) \(safeZip), \(fallbackCountry)", safeZip)
+                completion(fallbackAddr, safeZip)
             }
         }
     }
@@ -965,7 +1002,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     }
 }
 
-// MARK: - 6. 进程主入口（在 UIApplicationMain 前优先处理 Root 子进程任务）
+// MARK: - 6. 进程主入口
 @main
 struct AutoIPLocMain {
     static func main() {
