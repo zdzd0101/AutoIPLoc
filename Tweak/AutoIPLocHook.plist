@@ -7,13 +7,10 @@
         <key>Bundles</key>
         <array>
             <string>com.apple.Maps</string>
-            <string>com.local.carriercheck</string>
-        </array>
-        <key>Executables</key>
-        <array>
-            <string>locationd</string>
-            <string>geod</string>
-            <string>Maps</string>
+            <string>com.apple.geod</string>
+            <string>com.apple.GeoServices</string>
+            <string>com.apple.locationd</string>
+            <string>com.apple.UIKit</string>
         </array>
     </dict>
 </dict>
