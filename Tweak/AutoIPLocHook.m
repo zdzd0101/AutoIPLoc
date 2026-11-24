@@ -6,33 +6,65 @@
 #import <CFNetwork/CFNetwork.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+#import <mach-o/nlist.h>
 #import <ifaddrs.h>
 #import <dlfcn.h>
 #import <string.h>
+
+#if __has_include(<ptrauth.h>)
+#include <ptrauth.h>
+#endif
 
 typedef void (*MSHookFunction_t)(void *symbol, void *replace, void **result);
 
 static NSString *const kGeoPrefPath = @"/var/mobile/Library/Preferences/com.autoiploc.geo.plist";
 static NSString *const kWifiPrefPath = @"/var/mobile/Library/Preferences/com.autoiploc.wifi.plist";
 
-// 直接从进程已加载的 ElleKit/TweakInject 镜像获取 PAC 安全的 MSHookFunction
-static MSHookFunction_t ResolveElleKitHook(void) {
-    void *fn = dlsym(RTLD_DEFAULT, "MSHookFunction");
-    if (fn) return (MSHookFunction_t)fn;
+// 直接扫描内存镜像的 Mach-O 符号表解析 ElleKit MSHookFunction（绕过 RootHide dlsym 隐藏并支持 arm64e PAC）
+static MSHookFunction_t FindElleKitHookFunction(void) {
+    void *sym = dlsym(RTLD_DEFAULT, "MSHookFunction");
+    if (sym) return (MSHookFunction_t)sym;
 
-    uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; i++) {
-        const char *path = _dyld_get_image_name(i);
-        if (!path) continue;
-        if (strstr(path, "AutoIPLocHook") != NULL) continue;
-        if (strstr(path, "ellekit") != NULL ||
-            strstr(path, "TweakInject") != NULL ||
-            strstr(path, "Substrate") != NULL ||
-            strstr(path, "jbroot") != NULL) {
-            void *handle = dlopen(path, RTLD_NOLOAD | RTLD_NOW);
-            if (handle) {
-                fn = dlsym(handle, "MSHookFunction");
-                if (fn) return (MSHookFunction_t)fn;
+    uint32_t imgCount = _dyld_image_count();
+    for (uint32_t i = 1; i < imgCount; i++) {
+        const char *imgPath = _dyld_get_image_name(i);
+        if (!imgPath || strstr(imgPath, "AutoIPLocHook") != NULL) continue;
+
+        const struct mach_header_64 *hdr = (const struct mach_header_64 *)_dyld_get_image_header(i);
+        if (!hdr || hdr->magic != MH_MAGIC_64) continue;
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+
+        struct segment_command_64 *linkedit = NULL;
+        struct symtab_command *symtab_cmd = NULL;
+        uintptr_t cur = (uintptr_t)hdr + sizeof(struct mach_header_64);
+        for (uint32_t j = 0; j < hdr->ncmds; j++) {
+            struct load_command *lc = (struct load_command *)cur;
+            if (lc->cmd == LC_SEGMENT_64) {
+                struct segment_command_64 *seg = (struct segment_command_64 *)lc;
+                if (strcmp(seg->segname, "__LINKEDIT") == 0) {
+                    linkedit = seg;
+                }
+            } else if (lc->cmd == LC_SYMTAB) {
+                symtab_cmd = (struct symtab_command *)lc;
+            }
+            cur += lc->cmdsize;
+        }
+
+        if (!linkedit || !symtab_cmd) continue;
+        uintptr_t linkedit_base = (uintptr_t)slide + linkedit->vmaddr - linkedit->fileoff;
+        struct nlist_64 *syms = (struct nlist_64 *)(linkedit_base + symtab_cmd->symoff);
+        char *strs = (char *)(linkedit_base + symtab_cmd->stroff);
+
+        for (uint32_t k = 0; k < symtab_cmd->nsyms; k++) {
+            if ((syms[k].n_type & N_TYPE) != N_SECT || syms[k].n_value == 0) continue;
+            const char *sname = strs + syms[k].n_un.n_strx;
+            if (strcmp(sname, "_MSHookFunction") == 0) {
+                void *fnPtr = (void *)((uintptr_t)slide + syms[k].n_value);
+#ifdef __arm64e__
+                fnPtr = ptrauth_sign_unauthenticated(fnPtr, ptrauth_key_function_pointer, 0);
+#endif
+                return (MSHookFunction_t)fnPtr;
             }
         }
     }
@@ -118,27 +150,24 @@ static CFTimeZoneRef hook_CFTimeZoneCopySystem(void) {
     return orig_CFTimeZoneCopySystem ? orig_CFTimeZoneCopySystem() : CFTimeZoneCopySystem();
 }
 
-// 3. 接管 MobileGestalt 区域码
+// 3. 接管 MobileGestalt 硬件区域码（解除国行 CH/A 限制）
 static CFPropertyListRef (*orig_MGCopyAnswer)(CFStringRef prop);
 static CFPropertyListRef hook_MGCopyAnswer(CFStringRef prop) {
     if (prop != NULL) {
-        NSDictionary *cfg = LoadGeoConfig();
-        if ([cfg[@"forceAppleMaps"] boolValue]) {
-            NSString *key = (__bridge NSString *)prop;
-            NSString *targetCC = GetTargetCountryCode();
-            if ([key isEqualToString:@"RegionCode"]) {
-                return (__bridge_retained CFPropertyListRef)targetCC;
-            }
-            if ([key isEqualToString:@"RegionInfo"]) {
-                NSString *regionInfo = [targetCC isEqualToString:@"US"] ? @"LL/A" : [NSString stringWithFormat:@"%@/A", targetCC];
-                return (__bridge_retained CFPropertyListRef)regionInfo;
-            }
+        NSString *key = (__bridge NSString *)prop;
+        NSString *targetCC = GetTargetCountryCode();
+        if ([key isEqualToString:@"RegionCode"]) {
+            return (__bridge_retained CFPropertyListRef)targetCC;
+        }
+        if ([key isEqualToString:@"RegionInfo"]) {
+            NSString *regionInfo = [targetCC isEqualToString:@"US"] ? @"LL/A" : [NSString stringWithFormat:@"%@/A", targetCC];
+            return (__bridge_retained CFPropertyListRef)regionInfo;
         }
     }
     return orig_MGCopyAnswer ? orig_MGCopyAnswer(prop) : NULL;
 }
 
-// 4. 屏蔽漫游基站 460 国家码（防止触发高德地图）
+// 4. 屏蔽漫游基站 460 国家码
 static NSString *(*orig_mobileCountryCode)(id self, SEL _cmd);
 static NSString *hook_mobileCountryCode(id self, SEL _cmd) {
     NSString *orig = orig_mobileCountryCode ? orig_mobileCountryCode(self, _cmd) : nil;
@@ -268,20 +297,24 @@ static NSURL *hook_urlOverride(id self, SEL _cmd, NSURL *url) {
     return orig_urlOverride ? orig_urlOverride(self, _cmd, url) : nil;
 }
 
-// 8. 抹除软件模拟定位标记
+// 8. 抹除软件模拟定位标记与强制国际版地图 SKU
 static BOOL hook_returnNO(id self, SEL _cmd) {
     return NO;
 }
 
-// 9. 强制苹果国际原生地图国家码与阻断高德切换
 static NSString *hook_targetCountryCode(id self, SEL _cmd) {
     return GetTargetCountryCode();
+}
+
+static NSString *hook_deviceCountrySKU(id self, SEL _cmd) {
+    NSString *cc = GetTargetCountryCode();
+    return [cc isEqualToString:@"US"] ? @"LL" : cc;
 }
 
 static void hook_noop(id self, SEL _cmd) {
 }
 
-// 10. 接管系统 Wi-Fi 信息接口返回模拟美国热点
+// 9. 接管系统 Wi-Fi 信息接口返回模拟美国热点
 static NSDictionary *GetActiveMockWiFi(void) {
     NSDictionary *wifiCfg = [NSDictionary dictionaryWithContentsOfFile:kWifiPrefPath];
     if ([wifiCfg[@"enabled"] boolValue]) {
@@ -423,10 +456,10 @@ static void AutoIPLocHookEntry(void) {
             }
         }
 
-        // F. 强制苹果国际原生地图配置与阻断高德切换
+        // F. 接管 GEOPlatform deviceCountrySKU (CH -> LL) 与 GEOCountryConfiguration 彻底摆脱高德清单
         Class geoCls = objc_getClass("GEOCountryConfiguration");
         if (geoCls) {
-            NSArray *sels = @[@"countryCode", @"_countryCode", @"currentCountryCode", @"sourceCountryCode"];
+            NSArray *sels = @[@"countryCode", @"_countryCode", @"currentCountryCode", @"sourceCountryCode", @"_defaultCountryCode"];
             for (NSString *selName in sels) {
                 Method m = class_getInstanceMethod(geoCls, NSSelectorFromString(selName));
                 if (m) method_setImplementation(m, (IMP)hook_targetCountryCode);
@@ -438,10 +471,14 @@ static void AutoIPLocHookEntry(void) {
         if (platformCls) {
             Method mChina = class_getInstanceMethod(platformCls, NSSelectorFromString(@"isChina"));
             if (mChina) method_setImplementation(mChina, (IMP)hook_returnNO);
+            Method mChinaA = class_getInstanceMethod(platformCls, NSSelectorFromString(@"isChinaA"));
+            if (mChinaA) method_setImplementation(mChinaA, (IMP)hook_returnNO);
+            Method mSKU = class_getInstanceMethod(platformCls, NSSelectorFromString(@"deviceCountrySKU"));
+            if (mSKU) method_setImplementation(mSKU, (IMP)hook_deviceCountrySKU);
         }
 
-        // G. 使用 ElleKit 原生 MSHookFunction 接管 C 函数（100% 兼容 arm64e PAC，不崩溃 Maps）
-        MSHookFunction_t hookFn = ResolveElleKitHook();
+        // G. 扫描 Mach-O 符号表直接获取 ElleKit MSHookFunction 接管系统 C 函数
+        MSHookFunction_t hookFn = FindElleKitHookFunction();
         if (hookFn) {
             hookFn((void *)_dyld_get_image_name, (void *)hook_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
 
