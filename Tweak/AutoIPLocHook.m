@@ -1,19 +1,21 @@
 #import <Foundation/Foundation.h>
 #import <CoreLocation/CoreLocation.h>
 #import <SystemConfiguration/CaptiveNetwork.h>
+#import <CFNetwork/CFNetwork.h>
 #import <objc/runtime.h>
 #import <mach/mach.h>
 #import <mach/vm_map.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <mach-o/nlist.h>
+#import <ifaddrs.h>
 #import <dlfcn.h>
 #import <string.h>
 
 static NSString *const kGeoPrefPath = @"/var/mobile/Library/Preferences/com.autoiploc.geo.plist";
 static NSString *const kWifiPrefPath = @"/var/mobile/Library/Preferences/com.autoiploc.wifi.plist";
 
-// 安全 Mach-O GOT/LAZY 符号重绑定（带 vm_protect 写权限申请，绝不引发内存保护闪退）
+// 安全 Mach-O GOT/LAZY 符号重绑定（带 vm_protect 写权限申请）
 static void safe_rebind_symbol_in_image(const struct mach_header *header, intptr_t slide, const char *target_name, void *replacement, void **replaced) {
     if (!header || header->magic != MH_MAGIC_64) return;
 
@@ -87,12 +89,51 @@ static void safe_rebind_symbol_in_image(const struct mach_header *header, intptr
     }
 }
 
-// 1. 抹除软件模拟定位标记 (isSimulatedBySoftware = NO, isProducedByAccessory = NO)
+// 1. 隐藏系统 HTTP/SOCKS/PAC 代理设置（返回原生无代理字典）
+static CFDictionaryRef (*orig_CFNetworkCopySystemProxySettings)(void);
+static CFDictionaryRef hook_CFNetworkCopySystemProxySettings(void) {
+    NSDictionary *cleanProxy = @{
+        @"HTTPEnable": @0,
+        @"HTTPSEnable": @0,
+        @"SOCKSEnable": @0,
+        @"ProxyAutoConfigEnable": @0,
+        @"FTPPassive": @1,
+        @"ExceptionsList": @[@"*.local", @"169.254/16"]
+    };
+    return (__bridge_retained CFDictionaryRef)cleanProxy;
+}
+
+// 2. 过滤本地 VPN 虚拟隧道网卡 (utun / ipsec / ppp)，保持内存块首地址不变防止 freeifaddrs 异常
+static int (*orig_getifaddrs)(struct ifaddrs **ifap);
+static int hook_getifaddrs(struct ifaddrs **ifap) {
+    int ret = orig_getifaddrs ? orig_getifaddrs(ifap) : -1;
+    if (ret == 0 && ifap && *ifap) {
+        struct ifaddrs *curr = *ifap;
+        struct ifaddrs *prev = NULL;
+        while (curr != NULL) {
+            if (curr->ifa_name &&
+                (strncmp(curr->ifa_name, "utun", 4) == 0 ||
+                 strncmp(curr->ifa_name, "ipsec", 5) == 0 ||
+                 strncmp(curr->ifa_name, "ppp", 3) == 0)) {
+                if (prev != NULL) {
+                    prev->ifa_next = curr->ifa_next;
+                    curr = curr->ifa_next;
+                    continue;
+                }
+            }
+            prev = curr;
+            curr = curr->ifa_next;
+        }
+    }
+    return ret;
+}
+
+// 3. 抹除软件模拟定位标记
 static BOOL hook_returnNO(id self, SEL _cmd) {
     return NO;
 }
 
-// 2. 强制 GEOCountryConfiguration 返回当前 IP 国家码（彻底去除高德地图）
+// 4. 强制苹果国际原生地图国家码
 static NSString *(*orig_countryCode)(id self, SEL _cmd);
 static NSString *hook_countryCode(id self, SEL _cmd) {
     NSDictionary *cfg = [NSDictionary dictionaryWithContentsOfFile:kGeoPrefPath];
@@ -103,7 +144,7 @@ static NSString *hook_countryCode(id self, SEL _cmd) {
     return orig_countryCode ? orig_countryCode(self, _cmd) : @"US";
 }
 
-// 3. 接管系统 CNCopyCurrentNetworkInfo 与 NEHotspotNetwork 返回模拟美国 Wi-Fi
+// 5. 接管系统 Wi-Fi 信息接口返回模拟美国热点
 static NSDictionary *GetActiveMockWiFi(void) {
     NSDictionary *wifiCfg = [NSDictionary dictionaryWithContentsOfFile:kWifiPrefPath];
     if ([wifiCfg[@"enabled"] boolValue]) {
@@ -139,24 +180,9 @@ static CFDictionaryRef hook_CNCopyCurrentNetworkInfo(CFStringRef interfaceName) 
     return orig_CNCopyCurrentNetworkInfo ? orig_CNCopyCurrentNetworkInfo(interfaceName) : NULL;
 }
 
-static NSString *(*orig_hotspotSSID)(id self, SEL _cmd);
-static NSString *hook_hotspotSSID(id self, SEL _cmd) {
-    NSDictionary *topAP = GetActiveMockWiFi();
-    if (topAP[@"SSID"]) return topAP[@"SSID"];
-    return orig_hotspotSSID ? orig_hotspotSSID(self, _cmd) : nil;
-}
-
-static NSString *(*orig_hotspotBSSID)(id self, SEL _cmd);
-static NSString *hook_hotspotBSSID(id self, SEL _cmd) {
-    NSDictionary *topAP = GetActiveMockWiFi();
-    if (topAP[@"BSSID"]) return topAP[@"BSSID"];
-    return orig_hotspotBSSID ? orig_hotspotBSSID(self, _cmd) : nil;
-}
-
 __attribute__((constructor))
 static void AutoIPLocHookEntry(void) {
     @autoreleasepool {
-        // A. 抹除所有 App 读取到的模拟定位标记
         Class srcInfoCls = objc_getClass("CLLocationSourceInformation");
         if (srcInfoCls) {
             Method mSim = class_getInstanceMethod(srcInfoCls, NSSelectorFromString(@"isSimulatedBySoftware"));
@@ -172,7 +198,6 @@ static void AutoIPLocHookEntry(void) {
             if (mLocPriv) method_setImplementation(mLocPriv, (IMP)hook_returnNO);
         }
 
-        // B. 强制苹果国际原生地图国家码
         Class geoCls = objc_getClass("GEOCountryConfiguration");
         if (geoCls) {
             Method m1 = class_getInstanceMethod(geoCls, NSSelectorFromString(@"countryCode"));
@@ -189,24 +214,10 @@ static void AutoIPLocHookEntry(void) {
             if (mChina) method_setImplementation(mChina, (IMP)hook_returnNO);
         }
 
-        // C. 接管 NEHotspotNetwork Wi-Fi 属性
-        Class hotspotCls = objc_getClass("NEHotspotNetwork");
-        if (hotspotCls) {
-            Method mSSID = class_getInstanceMethod(hotspotCls, NSSelectorFromString(@"SSID"));
-            if (mSSID) {
-                orig_hotspotSSID = (void *)method_getImplementation(mSSID);
-                method_setImplementation(mSSID, (IMP)hook_hotspotSSID);
-            }
-            Method mBSSID = class_getInstanceMethod(hotspotCls, NSSelectorFromString(@"BSSID"));
-            if (mBSSID) {
-                orig_hotspotBSSID = (void *)method_getImplementation(mBSSID);
-                method_setImplementation(mBSSID, (IMP)hook_hotspotBSSID);
-            }
-        }
-
-        // D. 安全重绑定当前主程序及 SystemConfiguration 符号（跳过系统动态库缓存只读段避免崩溃）
         const struct mach_header *mainHdr = _dyld_get_image_header(0);
         intptr_t mainSlide = _dyld_get_image_vmaddr_slide(0);
+        safe_rebind_symbol_in_image(mainHdr, mainSlide, "CFNetworkCopySystemProxySettings", (void *)hook_CFNetworkCopySystemProxySettings, (void **)&orig_CFNetworkCopySystemProxySettings);
+        safe_rebind_symbol_in_image(mainHdr, mainSlide, "getifaddrs", (void *)hook_getifaddrs, (void **)&orig_getifaddrs);
         safe_rebind_symbol_in_image(mainHdr, mainSlide, "CNCopyCurrentNetworkInfo", (void *)hook_CNCopyCurrentNetworkInfo, (void **)&orig_CNCopyCurrentNetworkInfo);
         safe_rebind_symbol_in_image(mainHdr, mainSlide, "CNCopySupportedInterfaces", (void *)hook_CNCopySupportedInterfaces, (void **)&orig_CNCopySupportedInterfaces);
     }
