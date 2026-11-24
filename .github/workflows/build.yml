@@ -1,9 +1,13 @@
 name: Build TrollStore TIPA and Tweak
 on: [push, workflow_dispatch]
 
+concurrency:
+  group: build-autoiploc
+  cancel-in-progress: true
+
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
 
@@ -27,7 +31,13 @@ jobs:
 
           cp Info.plist Payload/AutoIPLoc.app/Info.plist
 
-          curl -fsSL https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_macosx_arm64 -o ldid
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "arm64" ]; then
+            LDID_URL="https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_macosx_arm64"
+          else
+            LDID_URL="https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_macosx_x86_64"
+          fi
+          curl -fsSL "$LDID_URL" -o ldid
           chmod +x ldid
           ./ldid -Sentitlements.plist Payload/AutoIPLoc.app/AutoIPLoc
 
