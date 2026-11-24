@@ -31,13 +31,7 @@ jobs:
 
           cp Info.plist Payload/AutoIPLoc.app/Info.plist
 
-          ARCH=$(uname -m)
-          if [ "$ARCH" = "arm64" ]; then
-            LDID_URL="https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_macosx_arm64"
-          else
-            LDID_URL="https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_macosx_x86_64"
-          fi
-          curl -fsSL "$LDID_URL" -o ldid
+          curl -fsSL https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_macosx_x86_64 -o ldid
           chmod +x ldid
           ./ldid -Sentitlements.plist Payload/AutoIPLoc.app/AutoIPLoc
 
@@ -50,7 +44,7 @@ jobs:
             -arch arm64 -arch arm64e \
             -isysroot "$SDK_PATH" \
             -miphoneos-version-min=15.0 \
-            -framework Foundation -framework UIKit -framework CoreLocation -framework SystemConfiguration -framework CFNetwork \
+            -framework Foundation -framework UIKit -framework CoreLocation -framework CoreTelephony -framework SystemConfiguration -framework CFNetwork \
             -fobjc-arc \
             Tweak/AutoIPLocHook.m \
             -o deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
@@ -59,7 +53,7 @@ jobs:
           cp Tweak/AutoIPLocHook.plist deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
 
           INSTALLED_SIZE=$(du -sk deb_pkg/var | cut -f1)
-          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 2.1.2\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Zero-dep RootHide hook for proxy/NIC stealth, timezone auto-sync & international Maps\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
+          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 2.2.0\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Self-contained arm64e Mach-O hook for stealth proxy, timezone & Maps\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
 
           chmod 0755 deb_pkg/DEBIAN
           chmod 0644 deb_pkg/DEBIAN/control
