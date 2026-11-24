@@ -4,7 +4,6 @@ import Network
 import AVFoundation
 import Darwin
 
-// MARK: - 1. 系统私有定位接口与 Root Persona 提权声明
 @objc protocol CLSimulationManagerProtocol {
     func clearSimulatedLocations()
     func appendSimulatedLocation(_ location: CLLocation)
@@ -28,7 +27,6 @@ private func posix_spawnattr_set_persona_uid_np(_ attr: UnsafeMutablePointer<pos
 @_silgen_name("posix_spawnattr_set_persona_gid_np")
 private func posix_spawnattr_set_persona_gid_np(_ attr: UnsafeMutablePointer<posix_spawnattr_t?>, _ gid: gid_t) -> Int32
 
-// MARK: - 2. 数据模型
 struct SimulatedWiFiNode: Codable {
     let ssid: String
     let bssid: String
@@ -60,7 +58,6 @@ struct EgressIPResult {
     let isp: String
 }
 
-// MARK: - 3. 自举 UID 0 Root 底层修改器
 class NativeSystemController {
     static let geoSharedPath = "/var/mobile/Library/Preferences/com.autoiploc.geo.plist"
     static let wifiSharedPath = "/var/mobile/Library/Preferences/com.autoiploc.wifi.plist"
@@ -101,7 +98,7 @@ class NativeSystemController {
         if action == "timezone", idx + 2 < args.count {
             let tz = args[idx + 2]
 
-            // 1. 调用 CoreTime 私有接口关闭自动时区并写入目标时区
+            // 1. 调用 CoreTime 私有接口关闭自动时区并下发目标时区到 timed 守护进程
             if let handle = dlopen("/System/Library/PrivateFrameworks/CoreTime.framework/CoreTime", RTLD_LAZY) {
                 typealias SetAutoTZFn = @convention(c) (Bool) -> Void
                 typealias SetManualTZFn = @convention(c) (CFString) -> Void
@@ -116,21 +113,25 @@ class NativeSystemController {
             // 2. 同步写入系统级与用户级时间配置表
             let plistTargets = [
                 ("/var/mobile/Library/Preferences/com.apple.preferences.datetime.plist", uid_t(501)),
-                ("/var/preferences/com.apple.preferences.datetime.plist", uid_t(0))
+                ("/var/preferences/com.apple.preferences.datetime.plist", uid_t(0)),
+                ("/var/preferences/com.apple.timed.plist", uid_t(0))
             ]
             for (path, owner) in plistTargets {
                 let dict = NSMutableDictionary(contentsOfFile: path) ?? NSMutableDictionary()
                 dict["AutomaticTimeZoneEnabled"] = false
+                dict["TMAutomaticTimeZoneEnabled"] = false
                 dict["timezone"] = tz
                 dict.write(toFile: path, atomically: true)
                 chown(path, owner, owner)
                 chmod(path, 0o644)
             }
 
-            restartProcessesNative(["timed"])
+            // 等待 350ms 让 timed 完成 XPC 事务与状态栏时钟刷新，切勿立即强杀
+            usleep(350_000)
             exit(0)
         } else if action == "clear-geo" {
             let paths = [
+                "/var/mobile/Library/GeoServices",
                 "/var/mobile/Library/Caches/GeoServices",
                 "/var/mobile/Library/Caches/com.apple.Maps",
                 "/var/mobile/Library/Caches/com.apple.geod"
@@ -251,7 +252,6 @@ class NativeSystemController {
     }
 }
 
-// MARK: - 4. 核心防泄漏定位、高精度街道解析与 Wi-Fi 同步引擎
 class LocationSyncEngine: NSObject {
     static let shared = LocationSyncEngine()
 
@@ -292,12 +292,13 @@ class LocationSyncEngine: NSObject {
         setupNetworkMonitor()
     }
 
+    // 监听 Wi-Fi / 蜂窝流量 / 代理隧道(other) 任意通道变化并自动同步时区与定位
     private func setupNetworkMonitor() {
-        var lastSatisfied = false
+        var lastSignature = ""
         pathMonitor.pathUpdateHandler = { [weak self] path in
             guard let self = self else { return }
-            let isNowSatisfied = (path.status == .satisfied)
-            if isNowSatisfied && !lastSatisfied && self.autoSyncOnNetworkChange {
+            let sig = "\(path.status == .satisfied)|w:\(path.usesInterfaceType(.wifi))|c:\(path.usesInterfaceType(.cellular))|o:\(path.usesInterfaceType(.other))"
+            if path.status == .satisfied && sig != lastSignature && self.autoSyncOnNetworkChange {
                 self.debounceWorkItem?.cancel()
                 let work = DispatchWorkItem { [weak self] in
                     self?.syncWithCurrentIP()
@@ -305,7 +306,7 @@ class LocationSyncEngine: NSObject {
                 self.debounceWorkItem = work
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: work)
             }
-            lastSatisfied = isNowSatisfied
+            lastSignature = sig
         }
         pathMonitor.start(queue: monitorQueue)
     }
@@ -459,7 +460,7 @@ class LocationSyncEngine: NSObject {
                     self.exactAddress = resolvedAddress
                     self.exactZipCode = resolvedZip
 
-                    // 1. 同步全局时区与共享配置
+                    // 1. 同步系统时区与状态栏时钟
                     self.tzSyncedSuccess = NativeSystemController.applyTimeZone(info.timezone, countryCode: info.countryCode)
 
                     // 2. 动态生成并注入 12~15 个当地周边 Wi-Fi
@@ -467,7 +468,7 @@ class LocationSyncEngine: NSObject {
                     self.nearbyWiFis = generatedWiFis
                     NativeSystemController.injectWiFiList(generatedWiFis, countryCode: info.countryCode)
 
-                    // 3. 切换苹果国际原生地图
+                    // 3. 切换苹果国际原生地图并清除高德缓存
                     NativeSystemController.forceAppleInternationalMaps(countryCode: info.countryCode)
 
                     // 4. 注入底层 GPS 坐标并启动心跳保活
@@ -488,7 +489,6 @@ class LocationSyncEngine: NSObject {
         onStatusUpdated?()
     }
 
-    // 附带 5 秒硬超时保护，避免代理切换时卡在转圈状态
     private func reverseGeocodeExactAddress(
         lat: Double,
         lon: Double,
@@ -695,7 +695,6 @@ class LocationSyncEngine: NSObject {
     }
 }
 
-// MARK: - 5. 主界面 UIViewController
 class MainViewController: UIViewController {
     private let scrollView = UIScrollView()
     private let contentStack = UIStackView()
@@ -801,7 +800,7 @@ class MainViewController: UIViewController {
 
         let switchCard = makeCard()
         let swTitle = UILabel()
-        swTitle.text = "开关飞行模式自动同步 IP + 时区 + Wi-Fi"
+        swTitle.text = "网络与代理切换自动同步 IP + 时区 + Wi-Fi"
         swTitle.font = .systemFont(ofSize: 14, weight: .medium)
         autoSwitch.isOn = LocationSyncEngine.shared.autoSyncOnNetworkChange
         autoSwitch.addTarget(self, action: #selector(toggleAutoSync), for: .valueChanged)
@@ -1002,7 +1001,6 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     }
 }
 
-// MARK: - 6. 进程主入口
 @main
 struct AutoIPLocMain {
     static func main() {
