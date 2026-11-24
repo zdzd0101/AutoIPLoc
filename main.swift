@@ -142,13 +142,14 @@ class NativeSystemController {
         } else if action == "clear-geo" {
             let fm = FileManager.default
             var paths = [
+                "/var/mobile/Library/Preferences/com.apple.GEO.plist",
+                "/var/mobile/Library/Preferences/com.apple.Maps.plist",
                 "/var/mobile/Library/GeoServices",
                 "/var/mobile/Library/Caches/GeoServices",
                 "/var/mobile/Library/Caches/com.apple.Maps",
                 "/var/mobile/Library/Caches/com.apple.geod"
             ]
 
-            // 清理 iOS 16 geod 独立守护进程容器内的旧高德清单缓存
             let containerRoots = [
                 "/var/mobile/Containers/Data/InternalDaemon",
                 "/var/containers/Data/System"
@@ -159,8 +160,10 @@ class NativeSystemController {
                         let base = "\(root)/\(sub)/Library"
                         let geoDir = "\(base)/GeoServices"
                         let geoCache = "\(base)/Caches/GeoServices"
+                        let geoPlist = "\(base)/Preferences/com.apple.GEO.plist"
                         if fm.fileExists(atPath: geoDir) { paths.append(geoDir) }
                         if fm.fileExists(atPath: geoCache) { paths.append(geoCache) }
+                        if fm.fileExists(atPath: geoPlist) { paths.append(geoPlist) }
                     }
                 }
             }
@@ -239,24 +242,6 @@ class NativeSystemController {
     static func forceAppleInternationalMaps(countryCode: String) {
         let cc = (countryCode.isEmpty || countryCode == "--") ? "US" : countryCode.uppercased()
         updateGeoSharedConfig(countryCode: cc, timezone: nil)
-
-        let prefFiles = [
-            "/var/mobile/Library/Preferences/com.apple.GEO.plist",
-            "/var/mobile/Library/Preferences/com.apple.Maps.plist"
-        ]
-        for path in prefFiles {
-            let dict = NSMutableDictionary(contentsOfFile: path) ?? NSMutableDictionary()
-            dict["CountryCode"] = cc
-            dict["GEOCountryCode"] = cc
-            dict["LastKnownCountryCode"] = cc
-            dict.removeObject(forKey: "AutoNavi")
-            dict.removeObject(forKey: "CN_Config")
-            dict.write(toFile: path, atomically: true)
-            chmod(path, 0o644)
-        }
-
-        let center = CFNotificationCenterGetDarwinNotifyCenter()
-        CFNotificationCenterPostNotification(center, CFNotificationName("com.autoiploc.geo.updated" as CFString), nil, nil, true)
         _ = runSelfAsRoot(args: ["clear-geo"])
     }
 
@@ -342,7 +327,7 @@ class LocationSyncEngine: NSObject {
         pathMonitor.start(queue: monitorQueue)
     }
 
-    // 全部采用纯 HTTPS 且不限流的高可用接口，避免 HTTP 拦截与共享代理 IP 限流报错
+    // 优先使用上午秒连的 ip-api.com，不受 Cloudflare 住宅代理拦截影响
     private func fetchEgressIPWithFallback(completion: @escaping (EgressIPResult?) -> Void) {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 7.0
@@ -351,27 +336,26 @@ class LocationSyncEngine: NSObject {
         let session = URLSession(configuration: config)
 
         func trySource1() {
-            guard let url = URL(string: "https://api.ip.sb/geoip") else { trySource2(); return }
-            var req = URLRequest(url: url)
-            req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 16_2 like Mac OS X)", forHTTPHeaderField: "User-Agent")
-            session.dataTask(with: req) { data, _, _ in
+            guard let url = URL(string: "http://ip-api.com/json/?fields=status,country,countryCode,regionName,city,zip,lat,lon,timezone,isp,query") else { trySource2(); return }
+            session.dataTask(with: url) { data, _, _ in
                 if let data = data,
                    let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   let ip = json["ip"] as? String,
-                   let cc = json["country_code"] as? String,
-                   let lat = json["latitude"] as? Double,
-                   let lon = json["longitude"] as? Double {
+                   (json["status"] as? String) == "success",
+                   let ip = json["query"] as? String,
+                   let cc = json["countryCode"] as? String,
+                   let lat = json["lat"] as? Double,
+                   let lon = json["lon"] as? Double {
                     completion(EgressIPResult(
                         ip: ip,
                         countryCode: cc.uppercased(),
                         country: json["country"] as? String ?? cc,
-                        region: json["region"] as? String ?? "",
+                        region: json["regionName"] as? String ?? "",
                         city: json["city"] as? String ?? "",
-                        zip: json["postal_code"] as? String ?? "",
+                        zip: json["zip"] as? String ?? "",
                         lat: lat,
                         lon: lon,
-                        timezone: json["timezone"] as? String ?? "America/New_York",
-                        isp: (json["isp"] as? String) ?? (json["organization"] as? String) ?? "Residential ISP"
+                        timezone: json["timezone"] as? String ?? "America/Chicago",
+                        isp: json["isp"] as? String ?? "Residential ISP"
                     ))
                 } else {
                     trySource2()
@@ -400,7 +384,7 @@ class LocationSyncEngine: NSObject {
                         zip: json["postal"] as? String ?? "",
                         lat: lat,
                         lon: lon,
-                        timezone: tzDict?["id"] as? String ?? "America/New_York",
+                        timezone: tzDict?["id"] as? String ?? "America/Chicago",
                         isp: connDict?["isp"] as? String ?? "Residential ISP"
                     ))
                 } else {
@@ -410,26 +394,27 @@ class LocationSyncEngine: NSObject {
         }
 
         func trySource3() {
-            guard let url = URL(string: "https://freeipapi.com/api/json") else { completion(nil); return }
-            session.dataTask(with: url) { data, _, _ in
+            guard let url = URL(string: "https://api.ip.sb/geoip") else { completion(nil); return }
+            var req = URLRequest(url: url)
+            req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 16_2 like Mac OS X)", forHTTPHeaderField: "User-Agent")
+            session.dataTask(with: req) { data, _, _ in
                 if let data = data,
                    let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   let ip = json["ipAddress"] as? String,
-                   let cc = json["countryCode"] as? String,
+                   let ip = json["ip"] as? String,
+                   let cc = json["country_code"] as? String,
                    let lat = json["latitude"] as? Double,
                    let lon = json["longitude"] as? Double {
-                    let tzList = json["timeZones"] as? [String]
                     completion(EgressIPResult(
                         ip: ip,
                         countryCode: cc.uppercased(),
-                        country: json["countryName"] as? String ?? cc,
-                        region: json["regionName"] as? String ?? "",
-                        city: json["cityName"] as? String ?? "",
-                        zip: json["zipCode"] as? String ?? "",
+                        country: json["country"] as? String ?? cc,
+                        region: json["region"] as? String ?? "",
+                        city: json["city"] as? String ?? "",
+                        zip: json["postal_code"] as? String ?? "",
                         lat: lat,
                         lon: lon,
-                        timezone: tzList?.first ?? "America/New_York",
-                        isp: "Residential ISP"
+                        timezone: json["timezone"] as? String ?? "America/Chicago",
+                        isp: (json["isp"] as? String) ?? (json["organization"] as? String) ?? "Residential ISP"
                     ))
                 } else {
                     completion(nil)
@@ -454,7 +439,6 @@ class LocationSyncEngine: NSObject {
                 DispatchQueue.main.async {
                     self.isSyncing = false
                     if retryCount < 1 {
-                        // 隧道刚建立时自动静默重试一次，避免假报错
                         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
                             self.syncWithCurrentIP(isAutoTrigger: isAutoTrigger, retryCount: retryCount + 1)
                         }
@@ -541,7 +525,7 @@ class LocationSyncEngine: NSObject {
         let geocoder = CLGeocoder()
         let location = CLLocation(latitude: lat, longitude: lon)
         let enLocale = Locale(identifier: "en_US")
-        let safeZip = fallbackZip.isEmpty ? "10001" : fallbackZip
+        let safeZip = fallbackZip.isEmpty ? "47577" : fallbackZip
         let fallbackAddr = "\(Int.random(in: 120...3890)) Oakridge Dr, \(fallbackCity), \(fallbackRegion) \(safeZip), \(fallbackCountry)"
 
         var finished = false
@@ -862,7 +846,7 @@ class MainViewController: UIViewController {
         contentStack.addArrangedSubview(syncBtn)
 
         let forceMapBtn = UIButton(type: .system)
-        forceMapBtn.setTitle("强制切换苹果国际原生地图（清除高德水印）", for: .normal)
+        forceMapBtn.setTitle("重置并恢复苹果国际原生地图（清除高德缓存）", for: .normal)
         forceMapBtn.titleLabel?.font = .systemFont(ofSize: 14, weight: .semibold)
         forceMapBtn.backgroundColor = .systemBlue.withAlphaComponent(0.12)
         forceMapBtn.setTitleColor(.systemBlue, for: .normal)
@@ -999,7 +983,7 @@ class MainViewController: UIViewController {
     @objc private func tapForceAppleMaps() {
         let cc = LocationSyncEngine.shared.currentCountryCode
         NativeSystemController.forceAppleInternationalMaps(countryCode: cc)
-        showToast("已清理高德配置并重载苹果国际地图")
+        showToast("已清除旧 GEO 缓存并重载原生地图")
     }
 
     @objc private func tapRefreshWiFi() {
