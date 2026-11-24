@@ -4,16 +4,70 @@
 #import <SystemConfiguration/CaptiveNetwork.h>
 #import <CFNetwork/CFNetwork.h>
 #import <objc/runtime.h>
+#import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+#import <mach-o/nlist.h>
 #import <ifaddrs.h>
 #import <dlfcn.h>
 #import <string.h>
 
-extern void MSHookFunction(void *symbol, void *replace, void **result);
+#if __has_include(<ptrauth.h>)
+#include <ptrauth.h>
+#endif
+
+typedef void (*MSHookFunction_t)(void *symbol, void *replace, void **result);
 
 static NSString *const kGeoPrefPath = @"/var/mobile/Library/Preferences/com.autoiploc.geo.plist";
 static NSString *const kWifiPrefPath = @"/var/mobile/Library/Preferences/com.autoiploc.wifi.plist";
 
-// 判断调用方是否为系统网络/浏览器引擎（保证 SOCKS5 正常联网，仅对 App 风控探针隐藏代理）
+// 直接遍历进程加载的 Mach-O 镜像符号表定位 _MSHookFunction（绕过 RootHide 路径隐藏）
+static MSHookFunction_t FindElleKitHookFunction(void) {
+    void *sym = dlsym(RTLD_DEFAULT, "MSHookFunction");
+    if (sym) return (MSHookFunction_t)sym;
+
+    uint32_t imgCount = _dyld_image_count();
+    for (uint32_t i = 0; i < imgCount; i++) {
+        const struct mach_header_64 *hdr = (const struct mach_header_64 *)_dyld_get_image_header(i);
+        if (!hdr || hdr->magic != MH_MAGIC_64) continue;
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+
+        struct segment_command_64 *linkedit = NULL;
+        struct symtab_command *symtab_cmd = NULL;
+        uintptr_t cur = (uintptr_t)hdr + sizeof(struct mach_header_64);
+        for (uint32_t j = 0; j < hdr->ncmds; j++) {
+            struct load_command *lc = (struct load_command *)cur;
+            if (lc->cmd == LC_SEGMENT_64) {
+                struct segment_command_64 *seg = (struct segment_command_64 *)lc;
+                if (strcmp(seg->segname, "__LINKEDIT") == 0) {
+                    linkedit = seg;
+                }
+            } else if (lc->cmd == LC_SYMTAB) {
+                symtab_cmd = (struct symtab_command *)lc;
+            }
+            cur += lc->cmdsize;
+        }
+
+        if (!linkedit || !symtab_cmd) continue;
+        uintptr_t linkedit_base = (uintptr_t)slide + linkedit->vmaddr - linkedit->fileoff;
+        struct nlist_64 *syms = (struct nlist_64 *)(linkedit_base + symtab_cmd->symoff);
+        char *strs = (char *)(linkedit_base + symtab_cmd->stroff);
+
+        for (uint32_t k = 0; k < symtab_cmd->nsyms; k++) {
+            if ((syms[k].n_type & N_TYPE) != N_SECT || syms[k].n_value == 0) continue;
+            const char *sname = strs + syms[k].n_un.n_strx;
+            if (strcmp(sname, "_MSHookFunction") == 0) {
+                void *fnPtr = (void *)((uintptr_t)slide + syms[k].n_value);
+#ifdef __arm64e__
+                fnPtr = ptrauth_sign_unauthenticated(fnPtr, ptrauth_key_function_pointer, 0);
+#endif
+                return (MSHookFunction_t)fnPtr;
+            }
+        }
+    }
+    return NULL;
+}
+
+// 仅对系统网络/WebKit 放行真实 SOCKS5 代理，对诊断/业务 App 隐藏显式代理
 static BOOL IsSystemNetworkingCaller(void *retAddr) {
     if (!retAddr) return NO;
     Dl_info info;
@@ -40,7 +94,6 @@ static CFDictionaryRef CreateCleanProxyDict(void) {
     return (__bridge_retained CFDictionaryRef)cleanProxy;
 }
 
-// 1. 接管 CFNetworkCopySystemProxySettings
 static CFDictionaryRef (*orig_CFNetworkCopySystemProxySettings)(void);
 static CFDictionaryRef hook_CFNetworkCopySystemProxySettings(void) {
     if (IsSystemNetworkingCaller(__builtin_return_address(0)) && orig_CFNetworkCopySystemProxySettings) {
@@ -49,7 +102,6 @@ static CFDictionaryRef hook_CFNetworkCopySystemProxySettings(void) {
     return CreateCleanProxyDict();
 }
 
-// 2. 动态接管 SCDynamicStoreCopyProxies（避开 iOS SDK 编译期头限制）
 static CFDictionaryRef (*orig_SCDynamicStoreCopyProxies)(void *store);
 static CFDictionaryRef hook_SCDynamicStoreCopyProxies(void *store) {
     if (IsSystemNetworkingCaller(__builtin_return_address(0)) && orig_SCDynamicStoreCopyProxies) {
@@ -58,7 +110,7 @@ static CFDictionaryRef hook_SCDynamicStoreCopyProxies(void *store) {
     return CreateCleanProxyDict();
 }
 
-// 3. 过滤本地 VPN/代理 虚拟隧道网卡 (utun / ipsec / ppp)
+// 过滤 Shadowrocket 等产生的 utun / ipsec / ppp 虚拟隧道网卡
 static BOOL IsVirtualVPNInterface(const char *ifname) {
     if (!ifname) return NO;
     return (strncmp(ifname, "utun", 4) == 0 ||
@@ -87,7 +139,7 @@ static int hook_getifaddrs(struct ifaddrs **ifap) {
     return ret;
 }
 
-// 4. 屏蔽工具类 URL Scheme 探测 (apple-magnifier://, sileo://, filza:// 等)
+// 屏蔽工具 URL Scheme 暴露 (apple-magnifier:// 等)
 static BOOL IsBlockedURLScheme(NSString *scheme) {
     if (scheme.length == 0) return NO;
     NSSet *blocked = [NSSet setWithArray:@[
@@ -99,26 +151,22 @@ static BOOL IsBlockedURLScheme(NSString *scheme) {
 
 static BOOL (*orig_canOpenURL)(id self, SEL _cmd, NSURL *url);
 static BOOL hook_canOpenURL(id self, SEL _cmd, NSURL *url) {
-    if (IsBlockedURLScheme(url.scheme)) {
-        return NO;
-    }
+    if (IsBlockedURLScheme(url.scheme)) return NO;
     return orig_canOpenURL ? orig_canOpenURL(self, _cmd, url) : NO;
 }
 
 static NSArray *(*orig_appsForScheme)(id self, SEL _cmd, NSString *scheme);
 static NSArray *hook_appsForScheme(id self, SEL _cmd, NSString *scheme) {
-    if (IsBlockedURLScheme(scheme)) {
-        return @[];
-    }
+    if (IsBlockedURLScheme(scheme)) return @[];
     return orig_appsForScheme ? orig_appsForScheme(self, _cmd, scheme) : @[];
 }
 
-// 5. 抹除软件模拟定位标记
+// 抹除软件模拟定位标记
 static BOOL hook_returnNO(id self, SEL _cmd) {
     return NO;
 }
 
-// 6. 强制苹果国际原生地图国家码
+// 强制苹果国际原生地图国家码
 static NSString *(*orig_countryCode)(id self, SEL _cmd);
 static NSString *hook_countryCode(id self, SEL _cmd) {
     NSDictionary *cfg = [NSDictionary dictionaryWithContentsOfFile:kGeoPrefPath];
@@ -129,7 +177,7 @@ static NSString *hook_countryCode(id self, SEL _cmd) {
     return orig_countryCode ? orig_countryCode(self, _cmd) : @"US";
 }
 
-// 7. 接管系统 Wi-Fi 信息接口返回模拟美国热点
+// 接管系统 Wi-Fi 信息返回模拟美国热点
 static NSDictionary *GetActiveMockWiFi(void) {
     NSDictionary *wifiCfg = [NSDictionary dictionaryWithContentsOfFile:kWifiPrefPath];
     if ([wifiCfg[@"enabled"] boolValue]) {
@@ -153,8 +201,8 @@ static CFDictionaryRef (*orig_CNCopyCurrentNetworkInfo)(CFStringRef interfaceNam
 static CFDictionaryRef hook_CNCopyCurrentNetworkInfo(CFStringRef interfaceName) {
     NSDictionary *topAP = GetActiveMockWiFi();
     if (topAP != nil) {
-        NSString *ssid = topAP[@"SSID"] ?: @"CenturyLink3825-5G";
-        NSString *bssid = topAP[@"BSSID"] ?: @"20:4E:7F:FB:40:31";
+        NSString *ssid = topAP[@"SSID"] ?: @"TMOBILE-5G-4BAA";
+        NSString *bssid = topAP[@"BSSID"] ?: @"44:94:FC:C4:A3:C4";
         NSDictionary *result = @{
             (__bridge NSString *)kCNNetworkInfoKeySSID: ssid,
             (__bridge NSString *)kCNNetworkInfoKeyBSSID: bssid,
@@ -216,15 +264,22 @@ static void AutoIPLocHookEntry(void) {
             if (mChina) method_setImplementation(mChina, (IMP)hook_returnNO);
         }
 
-        MSHookFunction((void *)CFNetworkCopySystemProxySettings, (void *)hook_CFNetworkCopySystemProxySettings, (void **)&orig_CFNetworkCopySystemProxySettings);
+        MSHookFunction_t hookFn = FindElleKitHookFunction();
+        if (hookFn) {
+            void *symProxy = dlsym(RTLD_DEFAULT, "CFNetworkCopySystemProxySettings");
+            if (symProxy) hookFn(symProxy, (void *)hook_CFNetworkCopySystemProxySettings, (void **)&orig_CFNetworkCopySystemProxySettings);
 
-        void *symSCDyn = dlsym(RTLD_DEFAULT, "SCDynamicStoreCopyProxies");
-        if (symSCDyn) {
-            MSHookFunction(symSCDyn, (void *)hook_SCDynamicStoreCopyProxies, (void **)&orig_SCDynamicStoreCopyProxies);
+            void *symSCDyn = dlsym(RTLD_DEFAULT, "SCDynamicStoreCopyProxies");
+            if (symSCDyn) hookFn(symSCDyn, (void *)hook_SCDynamicStoreCopyProxies, (void **)&orig_SCDynamicStoreCopyProxies);
+
+            void *symIfaddrs = dlsym(RTLD_DEFAULT, "getifaddrs");
+            if (symIfaddrs) hookFn(symIfaddrs, (void *)hook_getifaddrs, (void **)&orig_getifaddrs);
+
+            void *symCurNet = dlsym(RTLD_DEFAULT, "CNCopyCurrentNetworkInfo");
+            if (symCurNet) hookFn(symCurNet, (void *)hook_CNCopyCurrentNetworkInfo, (void **)&orig_CNCopyCurrentNetworkInfo);
+
+            void *symSupIf = dlsym(RTLD_DEFAULT, "CNCopySupportedInterfaces");
+            if (symSupIf) hookFn(symSupIf, (void *)hook_CNCopySupportedInterfaces, (void **)&orig_CNCopySupportedInterfaces);
         }
-
-        MSHookFunction((void *)getifaddrs, (void *)hook_getifaddrs, (void **)&orig_getifaddrs);
-        MSHookFunction((void *)CNCopyCurrentNetworkInfo, (void *)hook_CNCopyCurrentNetworkInfo, (void **)&orig_CNCopyCurrentNetworkInfo);
-        MSHookFunction((void *)CNCopySupportedInterfaces, (void *)hook_CNCopySupportedInterfaces, (void **)&orig_CNCopySupportedInterfaces);
     }
 }
