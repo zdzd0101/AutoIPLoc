@@ -98,7 +98,6 @@ class NativeSystemController {
         if action == "timezone", idx + 2 < args.count {
             let tz = args[idx + 2]
 
-            // 1. 调用 CoreTime 私有接口关闭自动时区并下发目标时区到 timed 守护进程
             if let handle = dlopen("/System/Library/PrivateFrameworks/CoreTime.framework/CoreTime", RTLD_LAZY) {
                 typealias SetAutoTZFn = @convention(c) (Bool) -> Void
                 typealias SetManualTZFn = @convention(c) (CFString) -> Void
@@ -110,7 +109,6 @@ class NativeSystemController {
                 }
             }
 
-            // 2. 同步写入系统级与用户级时间配置表
             let plistTargets = [
                 ("/var/mobile/Library/Preferences/com.apple.preferences.datetime.plist", uid_t(501)),
                 ("/var/preferences/com.apple.preferences.datetime.plist", uid_t(0)),
@@ -126,8 +124,7 @@ class NativeSystemController {
                 chmod(path, 0o644)
             }
 
-            // 等待 350ms 让 timed 完成 XPC 事务与状态栏时钟刷新，切勿立即强杀
-            usleep(350_000)
+            restartProcessesNative(["cfprefsd", "timed"])
             exit(0)
         } else if action == "clear-geo" {
             let paths = [
@@ -139,7 +136,7 @@ class NativeSystemController {
             for p in paths {
                 try? FileManager.default.removeItem(atPath: p)
             }
-            restartProcessesNative(["geod", "Maps"])
+            restartProcessesNative(["cfprefsd", "geod", "Maps"])
             exit(0)
         } else if action == "kill", idx + 2 < args.count {
             let names = args[idx + 2].components(separatedBy: ",")
@@ -292,7 +289,6 @@ class LocationSyncEngine: NSObject {
         setupNetworkMonitor()
     }
 
-    // 监听 Wi-Fi / 蜂窝流量 / 代理隧道(other) 任意通道变化并自动同步时区与定位
     private func setupNetworkMonitor() {
         var lastSignature = ""
         pathMonitor.pathUpdateHandler = { [weak self] path in
@@ -460,18 +456,14 @@ class LocationSyncEngine: NSObject {
                     self.exactAddress = resolvedAddress
                     self.exactZipCode = resolvedZip
 
-                    // 1. 同步系统时区与状态栏时钟
                     self.tzSyncedSuccess = NativeSystemController.applyTimeZone(info.timezone, countryCode: info.countryCode)
 
-                    // 2. 动态生成并注入 12~15 个当地周边 Wi-Fi
                     let generatedWiFis = self.generateDynamicWiFis(isp: info.isp)
                     self.nearbyWiFis = generatedWiFis
                     NativeSystemController.injectWiFiList(generatedWiFis, countryCode: info.countryCode)
 
-                    // 3. 切换苹果国际原生地图并清除高德缓存
                     NativeSystemController.forceAppleInternationalMaps(countryCode: info.countryCode)
 
-                    // 4. 注入底层 GPS 坐标并启动心跳保活
                     self.pushSimulatedLocation(lat: residentialLat, lon: residentialLon)
                     self.startHeartbeat()
                     self.startSilentBackgroundAudio()
