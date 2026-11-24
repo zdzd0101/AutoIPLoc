@@ -98,7 +98,6 @@ class NativeSystemController {
         if action == "timezone", idx + 2 < args.count {
             let tz = args[idx + 2]
 
-            // 1. 更新系统底层 localtime 软链接
             let zoneCandidates = [
                 "/var/db/timezone/zoneinfo/\(tz)",
                 "/usr/share/zoneinfo/\(tz)"
@@ -110,7 +109,6 @@ class NativeSystemController {
                 _ = symlink(zonePath, "/private/var/db/timezone/localtime")
             }
 
-            // 2. 调用 CoreTime 私有接口下发手动时区至 timed 守护进程
             if let handle = dlopen("/System/Library/PrivateFrameworks/CoreTime.framework/CoreTime", RTLD_LAZY) {
                 typealias SetAutoTZFn = @convention(c) (Bool) -> Void
                 typealias SetManualTZFn = @convention(c) (CFString) -> Void
@@ -122,7 +120,6 @@ class NativeSystemController {
                 }
             }
 
-            // 3. 写入配置文件并通知 SpringBoard 状态栏时钟刷新（不强杀 timed）
             let plistTargets = [
                 ("/var/mobile/Library/Preferences/com.apple.preferences.datetime.plist", uid_t(501)),
                 ("/var/preferences/com.apple.preferences.datetime.plist", uid_t(0))
@@ -143,14 +140,33 @@ class NativeSystemController {
             CFNotificationCenterPostNotification(center, CFNotificationName("SignificantTimeChangeNotification" as CFString), nil, nil, true)
             exit(0)
         } else if action == "clear-geo" {
-            let paths = [
+            let fm = FileManager.default
+            var paths = [
                 "/var/mobile/Library/GeoServices",
                 "/var/mobile/Library/Caches/GeoServices",
                 "/var/mobile/Library/Caches/com.apple.Maps",
                 "/var/mobile/Library/Caches/com.apple.geod"
             ]
+
+            // 清理 iOS 16 geod 独立守护进程容器内的旧高德清单缓存
+            let containerRoots = [
+                "/var/mobile/Containers/Data/InternalDaemon",
+                "/var/containers/Data/System"
+            ]
+            for root in containerRoots {
+                if let subs = try? fm.contentsOfDirectory(atPath: root) {
+                    for sub in subs {
+                        let base = "\(root)/\(sub)/Library"
+                        let geoDir = "\(base)/GeoServices"
+                        let geoCache = "\(base)/Caches/GeoServices"
+                        if fm.fileExists(atPath: geoDir) { paths.append(geoDir) }
+                        if fm.fileExists(atPath: geoCache) { paths.append(geoCache) }
+                    }
+                }
+            }
+
             for p in paths {
-                try? FileManager.default.removeItem(atPath: p)
+                try? fm.removeItem(atPath: p)
             }
             restartProcessesNative(["cfprefsd", "geod", "Maps"])
             exit(0)
@@ -274,6 +290,7 @@ class LocationSyncEngine: NSObject {
     private var audioPlayer: AVAudioPlayer?
     private var heartbeatTimer: Timer?
     private var debounceWorkItem: DispatchWorkItem?
+    private var lastSuccessTimestamp: TimeInterval = 0
 
     private(set) var isSimulating = false
     private(set) var isSyncing = false
@@ -313,25 +330,57 @@ class LocationSyncEngine: NSObject {
             if path.status == .satisfied && sig != lastSignature && self.autoSyncOnNetworkChange {
                 self.debounceWorkItem?.cancel()
                 let work = DispatchWorkItem { [weak self] in
-                    self?.syncWithCurrentIP()
+                    guard let self = self else { return }
+                    if Date().timeIntervalSince1970 - self.lastSuccessTimestamp < 6.0 { return }
+                    self.syncWithCurrentIP(isAutoTrigger: true)
                 }
                 self.debounceWorkItem = work
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: work)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0, execute: work)
             }
             lastSignature = sig
         }
         pathMonitor.start(queue: monitorQueue)
     }
 
+    // 全部采用纯 HTTPS 且不限流的高可用接口，避免 HTTP 拦截与共享代理 IP 限流报错
     private func fetchEgressIPWithFallback(completion: @escaping (EgressIPResult?) -> Void) {
         let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 6.0
-        config.timeoutIntervalForResource = 8.0
+        config.timeoutIntervalForRequest = 7.0
+        config.timeoutIntervalForResource = 10.0
         config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         let session = URLSession(configuration: config)
 
         func trySource1() {
-            guard let url = URL(string: "https://ipwho.is/") else { trySource2(); return }
+            guard let url = URL(string: "https://api.ip.sb/geoip") else { trySource2(); return }
+            var req = URLRequest(url: url)
+            req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 16_2 like Mac OS X)", forHTTPHeaderField: "User-Agent")
+            session.dataTask(with: req) { data, _, _ in
+                if let data = data,
+                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let ip = json["ip"] as? String,
+                   let cc = json["country_code"] as? String,
+                   let lat = json["latitude"] as? Double,
+                   let lon = json["longitude"] as? Double {
+                    completion(EgressIPResult(
+                        ip: ip,
+                        countryCode: cc.uppercased(),
+                        country: json["country"] as? String ?? cc,
+                        region: json["region"] as? String ?? "",
+                        city: json["city"] as? String ?? "",
+                        zip: json["postal_code"] as? String ?? "",
+                        lat: lat,
+                        lon: lon,
+                        timezone: json["timezone"] as? String ?? "America/New_York",
+                        isp: (json["isp"] as? String) ?? (json["organization"] as? String) ?? "Residential ISP"
+                    ))
+                } else {
+                    trySource2()
+                }
+            }.resume()
+        }
+
+        func trySource2() {
+            guard let url = URL(string: "https://ipwho.is/") else { trySource3(); return }
             session.dataTask(with: url) { data, _, _ in
                 if let data = data,
                    let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -351,36 +400,8 @@ class LocationSyncEngine: NSObject {
                         zip: json["postal"] as? String ?? "",
                         lat: lat,
                         lon: lon,
-                        timezone: tzDict?["id"] as? String ?? "America/Los_Angeles",
+                        timezone: tzDict?["id"] as? String ?? "America/New_York",
                         isp: connDict?["isp"] as? String ?? "Residential ISP"
-                    ))
-                } else {
-                    trySource2()
-                }
-            }.resume()
-        }
-
-        func trySource2() {
-            guard let url = URL(string: "http://ip-api.com/json/?fields=status,country,countryCode,regionName,city,zip,lat,lon,timezone,isp,query") else { trySource3(); return }
-            session.dataTask(with: url) { data, _, _ in
-                if let data = data,
-                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   (json["status"] as? String) == "success",
-                   let ip = json["query"] as? String,
-                   let cc = json["countryCode"] as? String,
-                   let lat = json["lat"] as? Double,
-                   let lon = json["lon"] as? Double {
-                    completion(EgressIPResult(
-                        ip: ip,
-                        countryCode: cc.uppercased(),
-                        country: json["country"] as? String ?? cc,
-                        region: json["regionName"] as? String ?? "",
-                        city: json["city"] as? String ?? "",
-                        zip: json["zip"] as? String ?? "",
-                        lat: lat,
-                        lon: lon,
-                        timezone: json["timezone"] as? String ?? "America/Los_Angeles",
-                        isp: json["isp"] as? String ?? "Residential ISP"
                     ))
                 } else {
                     trySource3()
@@ -389,27 +410,26 @@ class LocationSyncEngine: NSObject {
         }
 
         func trySource3() {
-            guard let url = URL(string: "https://ipapi.co/json/") else { completion(nil); return }
-            var req = URLRequest(url: url)
-            req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 16_2 like Mac OS X)", forHTTPHeaderField: "User-Agent")
-            session.dataTask(with: req) { data, _, _ in
+            guard let url = URL(string: "https://freeipapi.com/api/json") else { completion(nil); return }
+            session.dataTask(with: url) { data, _, _ in
                 if let data = data,
                    let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   let ip = json["ip"] as? String,
-                   let cc = json["country_code"] as? String,
+                   let ip = json["ipAddress"] as? String,
+                   let cc = json["countryCode"] as? String,
                    let lat = json["latitude"] as? Double,
                    let lon = json["longitude"] as? Double {
+                    let tzList = json["timeZones"] as? [String]
                     completion(EgressIPResult(
                         ip: ip,
                         countryCode: cc.uppercased(),
-                        country: json["country_name"] as? String ?? cc,
-                        region: json["region"] as? String ?? "",
-                        city: json["city"] as? String ?? "",
-                        zip: json["postal"] as? String ?? "",
+                        country: json["countryName"] as? String ?? cc,
+                        region: json["regionName"] as? String ?? "",
+                        city: json["cityName"] as? String ?? "",
+                        zip: json["zipCode"] as? String ?? "",
                         lat: lat,
                         lon: lon,
-                        timezone: json["timezone"] as? String ?? "America/Los_Angeles",
-                        isp: json["org"] as? String ?? "Residential ISP"
+                        timezone: tzList?.first ?? "America/New_York",
+                        isp: "Residential ISP"
                     ))
                 } else {
                     completion(nil)
@@ -420,10 +440,12 @@ class LocationSyncEngine: NSObject {
         trySource1()
     }
 
-    func syncWithCurrentIP() {
+    func syncWithCurrentIP(isAutoTrigger: Bool = false, retryCount: Int = 0) {
         guard !isSyncing else { return }
         isSyncing = true
-        alertMessage = nil
+        if !isAutoTrigger {
+            alertMessage = nil
+        }
         onStatusUpdated?()
 
         fetchEgressIPWithFallback { [weak self] info in
@@ -431,7 +453,16 @@ class LocationSyncEngine: NSObject {
             guard let info = info else {
                 DispatchQueue.main.async {
                     self.isSyncing = false
-                    self.alertMessage = "⚠️ 当前节点无法连接 IP 探测接口，请切换可用海外节点后再同步。"
+                    if retryCount < 1 {
+                        // 隧道刚建立时自动静默重试一次，避免假报错
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                            self.syncWithCurrentIP(isAutoTrigger: isAutoTrigger, retryCount: retryCount + 1)
+                        }
+                        return
+                    }
+                    if !isAutoTrigger || !self.isSimulating {
+                        self.alertMessage = "⚠️ 当前节点无法连接 IP 探测接口，请切换可用海外节点后再同步。"
+                    }
                     self.onStatusUpdated?()
                 }
                 return
@@ -462,6 +493,7 @@ class LocationSyncEngine: NSObject {
                 DispatchQueue.main.async {
                     self.isSyncing = false
                     self.alertMessage = nil
+                    self.lastSuccessTimestamp = Date().timeIntervalSince1970
                     self.currentIP = info.ip
                     self.currentCountryCode = info.countryCode
                     self.currentCity = "\(info.country) · \(info.city)"
@@ -509,7 +541,7 @@ class LocationSyncEngine: NSObject {
         let geocoder = CLGeocoder()
         let location = CLLocation(latitude: lat, longitude: lon)
         let enLocale = Locale(identifier: "en_US")
-        let safeZip = fallbackZip.isEmpty ? "90001" : fallbackZip
+        let safeZip = fallbackZip.isEmpty ? "10001" : fallbackZip
         let fallbackAddr = "\(Int.random(in: 120...3890)) Oakridge Dr, \(fallbackCity), \(fallbackRegion) \(safeZip), \(fallbackCountry)"
 
         var finished = false
