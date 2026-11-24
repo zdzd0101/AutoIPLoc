@@ -17,7 +17,6 @@ jobs:
           mkdir -p Payload/AutoIPLoc.app
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
 
-          # 1. 编译巨魔 App (.tipa)
           swiftc main.swift \
             -parse-as-library \
             -import-objc-header Bridge.h \
@@ -34,7 +33,6 @@ jobs:
 
           zip -r AutoIPLoc.tipa Payload
 
-          # 2. 编译零外部依赖 Rootless 插件 (.deb)
           mkdir -p deb_pkg/DEBIAN
           mkdir -p deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries
 
@@ -51,7 +49,7 @@ jobs:
           cp Tweak/AutoIPLocHook.plist deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
 
           INSTALLED_SIZE=$(du -sk deb_pkg/var | cut -f1)
-          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 2.0.7\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Zero-dep RootHide hook for proxy stealth, simulation flag erase & timezone sync\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
+          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 2.0.8\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Spoof CH/A RegionInfo to LL/A, clear GeoServices manifest & stealth proxy\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
 
           chmod 0755 deb_pkg/DEBIAN
           chmod 0644 deb_pkg/DEBIAN/control
