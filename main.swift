@@ -98,6 +98,19 @@ class NativeSystemController {
         if action == "timezone", idx + 2 < args.count {
             let tz = args[idx + 2]
 
+            // 1. 更新系统底层 localtime 软链接
+            let zoneCandidates = [
+                "/var/db/timezone/zoneinfo/\(tz)",
+                "/usr/share/zoneinfo/\(tz)"
+            ]
+            if let zonePath = zoneCandidates.first(where: { FileManager.default.fileExists(atPath: $0) }) {
+                unlink("/var/db/timezone/localtime")
+                unlink("/private/var/db/timezone/localtime")
+                _ = symlink(zonePath, "/var/db/timezone/localtime")
+                _ = symlink(zonePath, "/private/var/db/timezone/localtime")
+            }
+
+            // 2. 调用 CoreTime 私有接口下发手动时区至 timed 守护进程
             if let handle = dlopen("/System/Library/PrivateFrameworks/CoreTime.framework/CoreTime", RTLD_LAZY) {
                 typealias SetAutoTZFn = @convention(c) (Bool) -> Void
                 typealias SetManualTZFn = @convention(c) (CFString) -> Void
@@ -109,10 +122,10 @@ class NativeSystemController {
                 }
             }
 
+            // 3. 写入配置文件并通知 SpringBoard 状态栏时钟刷新（不强杀 timed）
             let plistTargets = [
                 ("/var/mobile/Library/Preferences/com.apple.preferences.datetime.plist", uid_t(501)),
-                ("/var/preferences/com.apple.preferences.datetime.plist", uid_t(0)),
-                ("/var/preferences/com.apple.timed.plist", uid_t(0))
+                ("/var/preferences/com.apple.preferences.datetime.plist", uid_t(0))
             ]
             for (path, owner) in plistTargets {
                 let dict = NSMutableDictionary(contentsOfFile: path) ?? NSMutableDictionary()
@@ -124,7 +137,10 @@ class NativeSystemController {
                 chmod(path, 0o644)
             }
 
-            restartProcessesNative(["cfprefsd", "timed"])
+            usleep(600_000)
+            let center = CFNotificationCenterGetDarwinNotifyCenter()
+            CFNotificationCenterPostNotification(center, CFNotificationName("NSSystemTimeZoneDidChangeNotification" as CFString), nil, nil, true)
+            CFNotificationCenterPostNotification(center, CFNotificationName("SignificantTimeChangeNotification" as CFString), nil, nil, true)
             exit(0)
         } else if action == "clear-geo" {
             let paths = [
