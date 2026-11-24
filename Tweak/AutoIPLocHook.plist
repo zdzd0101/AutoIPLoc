@@ -8,8 +8,11 @@
         <array>
             <string>com.apple.UIKit</string>
             <string>com.apple.Maps</string>
-            <string>com.apple.geod</string>
-            <string>com.apple.GeoServices</string>
+        </array>
+        <key>Executables</key>
+        <array>
+            <string>geod</string>
+            <string>Maps</string>
         </array>
     </dict>
 </dict>
