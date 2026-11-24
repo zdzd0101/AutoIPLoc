@@ -124,6 +124,17 @@ class NativeSystemController {
                 exit(ok1 == 0 ? 0 : 1)
             }
             exit(1)
+        } else if action == "clear-geo" {
+            let paths = [
+                "/var/mobile/Library/Caches/GeoServices",
+                "/var/mobile/Library/Caches/com.apple.Maps",
+                "/var/mobile/Library/Caches/com.apple.geod"
+            ]
+            for p in paths {
+                try? FileManager.default.removeItem(atPath: p)
+            }
+            restartProcessesNative(["geod", "Maps"])
+            exit(0)
         } else if action == "kill", idx + 2 < args.count {
             let names = args[idx + 2].components(separatedBy: ",")
             restartProcessesNative(names)
@@ -154,6 +165,7 @@ class NativeSystemController {
         }
     }
 
+   
     static func applyTimeZone(_ tzIdentifier: String) -> Bool {
         guard !tzIdentifier.isEmpty else { return false }
 
@@ -174,8 +186,7 @@ class NativeSystemController {
 
         return rootOK || (TimeZone.current.identifier == tzIdentifier)
     }
-
-    static func forceAppleInternationalMaps(countryCode: String) {
+static func forceAppleInternationalMaps(countryCode: String) {
         let cc = (countryCode.isEmpty || countryCode == "--") ? "US" : countryCode.uppercased()
 
         let hookCfg: NSDictionary = [
@@ -201,13 +212,11 @@ class NativeSystemController {
             chmod(path, 0o644)
         }
 
-        try? FileManager.default.removeItem(atPath: "/var/mobile/Library/Caches/com.apple.Maps")
-
         let center = CFNotificationCenterGetDarwinNotifyCenter()
         CFNotificationCenterPostNotification(center, CFNotificationName("com.autoiploc.geo.updated" as CFString), nil, nil, true)
-        _ = runSelfAsRoot(args: ["kill", "geod,Maps"])
+        _ = runSelfAsRoot(args: ["clear-geo"])
     }
-
+    
     static func injectWiFiList(_ nodes: [SimulatedWiFiNode], countryCode: String) {
         let payload: NSDictionary = [
             "enabled": true,
