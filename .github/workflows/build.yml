@@ -7,6 +7,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install dpkg
+        run: HOMEBREW_NO_AUTO_UPDATE=1 brew install dpkg
+
       - name: Compile and Sign TIPA and DEB
         run: |
           set -e
@@ -30,20 +33,11 @@ jobs:
 
           zip -r AutoIPLoc.tipa Payload
 
-          # 2. 编译配套底层钩子插件 (.deb，使用系统原生 tar + ar 零依赖打包)
-          mkdir -p deb_control
-          mkdir -p deb_data/var/jb/Library/MobileSubstrate/DynamicLibraries
+          # 2. 编译标准 Debian 格式底层钩子插件 (.deb，供 RootHide Patcher 转换)
+          mkdir -p deb_pkg/DEBIAN
+          mkdir -p deb_pkg/Library/MobileSubstrate/DynamicLibraries
 
-          cat << 'EOF' > deb_control/control
-          Package: com.local.autoiploc.hook
-          Name: AutoIPLocHook
-          Version: 2.0.0
-          Architecture: iphoneos-arm64
-          Description: Force Apple International Maps & Wi-Fi SSID sync for AutoIPLoc
-          Maintainer: AutoIPLoc
-          Author: AutoIPLoc
-          Section: Tweaks
-          EOF
+          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 2.0.0\nArchitecture: iphoneos-arm\nDescription: Force Apple International Maps & Wi-Fi SSID sync for AutoIPLoc\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" > deb_pkg/DEBIAN/control
 
           clang -dynamiclib \
             -arch arm64 -arch arm64e \
@@ -52,17 +46,17 @@ jobs:
             -framework Foundation -framework SystemConfiguration \
             -fobjc-arc \
             Tweak/AutoIPLocHook.m \
-            -o deb_data/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
+            -o deb_pkg/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
 
-          ./ldid -S deb_data/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
-          cp Tweak/AutoIPLocHook.plist deb_data/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
+          ./ldid -S deb_pkg/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
+          cp Tweak/AutoIPLocHook.plist deb_pkg/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
 
-          # 组装标准 Debian 安装包 (禁用 macOS AppleDouble 隐藏文件)
-          printf "2.0\n" > debian-binary
-          COPYFILE_DISABLE=1 tar -czf control.tar.gz -C deb_control .
-          COPYFILE_DISABLE=1 tar -czf data.tar.gz -C deb_data .
-          ar -rc AutoIPLocHook.deb debian-binary control.tar.gz data.tar.gz
+          chmod 0755 deb_pkg/DEBIAN
+          chmod 0644 deb_pkg/DEBIAN/control
+          chmod 0755 deb_pkg/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
+          chmod 0644 deb_pkg/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
 
+          dpkg-deb -Zgzip -b deb_pkg AutoIPLocHook.deb
           ls -lh AutoIPLoc.tipa AutoIPLocHook.deb
 
       - name: Upload Artifacts
