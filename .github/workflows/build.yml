@@ -6,11 +6,13 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Compile and Sign TIPA and DEB
         run: |
+          set -e
           mkdir -p Payload/AutoIPLoc.app
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
-          
+
           # 1. 编译巨魔 App (.tipa)
           swiftc main.swift \
             -parse-as-library \
@@ -19,20 +21,20 @@ jobs:
             -target arm64-apple-ios15.0 \
             -framework SwiftUI -framework UIKit -framework CoreLocation -framework Network -framework AVFoundation \
             -o Payload/AutoIPLoc.app/AutoIPLoc
-            
+
           cp Info.plist Payload/AutoIPLoc.app/Info.plist
-          
-          curl -L https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_macosx_arm64 -o ldid
+
+          curl -fsSL https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_macosx_arm64 -o ldid
           chmod +x ldid
           ./ldid -Sentitlements.plist Payload/AutoIPLoc.app/AutoIPLoc
-          
+
           zip -r AutoIPLoc.tipa Payload
 
-          # 2. 编译配套底层钩子插件 (.deb，用于彻底去除高德水印与接管 Wi-Fi)
-          mkdir -p deb_pkg/DEBIAN
-          mkdir -p deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries
+          # 2. 编译配套底层钩子插件 (.deb，使用系统原生 tar + ar 零依赖打包)
+          mkdir -p deb_control
+          mkdir -p deb_data/var/jb/Library/MobileSubstrate/DynamicLibraries
 
-          cat << 'EOF' > deb_pkg/DEBIAN/control
+          cat << 'EOF' > deb_control/control
           Package: com.local.autoiploc.hook
           Name: AutoIPLocHook
           Version: 2.0.0
@@ -50,12 +52,18 @@ jobs:
             -framework Foundation -framework SystemConfiguration \
             -fobjc-arc \
             Tweak/AutoIPLocHook.m \
-            -o deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
+            -o deb_data/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
 
-          ./ldid -S deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
-          cp Tweak/AutoIPLocHook.plist deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
+          ./ldid -S deb_data/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
+          cp Tweak/AutoIPLocHook.plist deb_data/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
 
-          dpkg-deb -Zgzip -b deb_pkg AutoIPLocHook.deb
+          # 组装标准 Debian 安装包 (禁用 macOS AppleDouble 隐藏文件)
+          printf "2.0\n" > debian-binary
+          COPYFILE_DISABLE=1 tar -czf control.tar.gz -C deb_control .
+          COPYFILE_DISABLE=1 tar -czf data.tar.gz -C deb_data .
+          ar -rc AutoIPLocHook.deb debian-binary control.tar.gz data.tar.gz
+
+          ls -lh AutoIPLoc.tipa AutoIPLocHook.deb
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
