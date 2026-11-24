@@ -60,12 +60,11 @@ struct EgressIPResult {
     let isp: String
 }
 
-// MARK: - 3. 自举 UID 0 Root 底层修改器（不依赖 /bin/sh 或 /var/jb，100% 兼容 RootHide）
+// MARK: - 3. 自举 UID 0 Root 底层修改器（在 UIApplicationMain 前拦截执行）
 class NativeSystemController {
     static let geoSharedPath = "/var/mobile/Library/Preferences/com.autoiploc.geo.plist"
     static let wifiSharedPath = "/var/mobile/Library/Preferences/com.autoiploc.wifi.plist"
 
-    // 启动自身二进制以 UID 0 (root) 执行底层文件与进程操作
     @discardableResult
     static func runSelfAsRoot(args: [String]) -> Bool {
         guard let execPath = Bundle.main.executablePath else { return false }
@@ -94,7 +93,6 @@ class NativeSystemController {
         return false
     }
 
-    // Root 子进程执行入口
     static func handleRootWorkerIfNeeded() {
         let args = CommandLine.arguments
         guard let idx = args.firstIndex(of: "--root-worker"), idx + 1 < args.count else { return }
@@ -112,6 +110,16 @@ class NativeSystemController {
                 unlink("/private/var/db/timezone/localtime")
                 let ok1 = symlink(zonePath, "/var/db/timezone/localtime")
                 _ = symlink(zonePath, "/private/var/db/timezone/localtime")
+                chmod("/var/db/timezone/localtime", 0o755)
+
+                let dtPlist = "/var/mobile/Library/Preferences/com.apple.preferences.datetime.plist"
+                let dict = NSMutableDictionary(contentsOfFile: dtPlist) ?? NSMutableDictionary()
+                dict["AutomaticTimeZoneEnabled"] = false
+                dict["timezone"] = tz
+                dict.write(toFile: dtPlist, atomically: true)
+                chown(dtPlist, 501, 501)
+                chmod(dtPlist, 0o644)
+
                 restartProcessesNative(["timed"])
                 exit(ok1 == 0 ? 0 : 1)
             }
@@ -405,7 +413,6 @@ class LocationSyncEngine: NSObject {
                 return
             }
 
-            // 紧致住宅街道微偏移（约 100~180 米，严格锁定在同一邮编与街区内）
             let residentialLat = info.lat + Double.random(in: -0.0014...0.0014)
             let residentialLon = info.lon + Double.random(in: -0.0014...0.0014)
 
@@ -939,15 +946,26 @@ class MainViewController: UIViewController {
     }
 }
 
-// MARK: - 6. App 入口（优先拦截 Root 子进程任务）
-@main
 class AppDelegate: UIResponder, UIApplicationDelegate {
     var window: UIWindow?
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
-        NativeSystemController.handleRootWorkerIfNeeded()
         window = UIWindow(frame: UIScreen.main.bounds)
         window?.rootViewController = MainViewController()
         window?.makeKeyAndVisible()
         return true
+    }
+}
+
+// MARK: - 6. 进程主入口（在 UIApplicationMain 前优先处理 Root 子进程任务）
+@main
+struct AutoIPLocMain {
+    static func main() {
+        NativeSystemController.handleRootWorkerIfNeeded()
+        UIApplicationMain(
+            CommandLine.argc,
+            CommandLine.unsafeArgv,
+            nil,
+            NSStringFromClass(AppDelegate.self)
+        )
     }
 }
