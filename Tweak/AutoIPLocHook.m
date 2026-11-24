@@ -20,7 +20,6 @@ typedef void (*MSHookFunction_t)(void *symbol, void *replace, void **result);
 static NSString *const kGeoPrefPath = @"/var/mobile/Library/Preferences/com.autoiploc.geo.plist";
 static NSString *const kWifiPrefPath = @"/var/mobile/Library/Preferences/com.autoiploc.wifi.plist";
 
-// 直接扫描内存中的 Mach-O 符号表定位 _MSHookFunction（绕过 RootHide 路径隐藏）
 static MSHookFunction_t FindElleKitHookFunction(void) {
     void *sym = dlsym(RTLD_DEFAULT, "MSHookFunction");
     if (sym) return (MSHookFunction_t)sym;
@@ -67,15 +66,23 @@ static MSHookFunction_t FindElleKitHookFunction(void) {
     return NULL;
 }
 
-// 1. 接管 MobileGestalt 硬件区域码，解除国行 CH/A 强制锁定高德地图
+static NSString *GetTargetCountryCode(void) {
+    NSDictionary *cfg = [NSDictionary dictionaryWithContentsOfFile:kGeoPrefPath];
+    NSString *cc = cfg[@"countryCode"];
+    if (cc && cc.length == 2 && ![cc isEqualToString:@"--"]) {
+        return cc.uppercaseString;
+    }
+    return @"US";
+}
+
+// 1. 接管 MobileGestalt 硬件区域码
 static CFPropertyListRef (*orig_MGCopyAnswer)(CFStringRef prop);
 static CFPropertyListRef hook_MGCopyAnswer(CFStringRef prop) {
     if (prop != NULL) {
         NSDictionary *cfg = [NSDictionary dictionaryWithContentsOfFile:kGeoPrefPath];
         if ([cfg[@"forceAppleMaps"] boolValue]) {
             NSString *key = (__bridge NSString *)prop;
-            NSString *cc = cfg[@"countryCode"];
-            NSString *targetCC = (cc && cc.length == 2 && ![cc isEqualToString:@"--"]) ? cc : @"US";
+            NSString *targetCC = GetTargetCountryCode();
             if ([key isEqualToString:@"RegionCode"]) {
                 return (__bridge_retained CFPropertyListRef)targetCC;
             }
@@ -88,7 +95,26 @@ static CFPropertyListRef hook_MGCopyAnswer(CFStringRef prop) {
     return orig_MGCopyAnswer ? orig_MGCopyAnswer(prop) : NULL;
 }
 
-// 2. 仅对系统网络/WebKit 放行真实 SOCKS5 代理，对诊断与业务 App 隐藏显式代理
+// 2. 接管漫游基站 CTCarrier MCC/ISO（阻止境内漫游铁塔 460 触发高德地圖水印）
+static NSString *(*orig_mobileCountryCode)(id self, SEL _cmd);
+static NSString *hook_mobileCountryCode(id self, SEL _cmd) {
+    NSString *orig = orig_mobileCountryCode ? orig_mobileCountryCode(self, _cmd) : nil;
+    if (orig == nil || [orig isEqualToString:@"460"] || [orig isEqualToString:@"454"] || [orig isEqualToString:@"455"]) {
+        return @"310";
+    }
+    return orig;
+}
+
+static NSString *(*orig_isoCountryCode)(id self, SEL _cmd);
+static NSString *hook_isoCountryCode(id self, SEL _cmd) {
+    NSString *orig = orig_isoCountryCode ? orig_isoCountryCode(self, _cmd) : nil;
+    if (orig == nil || [orig.lowercaseString isEqualToString:@"cn"] || [orig.lowercaseString isEqualToString:@"hk"] || [orig.lowercaseString isEqualToString:@"mo"]) {
+        return GetTargetCountryCode().lowercaseString;
+    }
+    return orig;
+}
+
+// 3. 隐藏系统显式代理设置（仅放行系统网络框架）
 static BOOL IsSystemNetworkingCaller(void *retAddr) {
     if (!retAddr) return NO;
     Dl_info info;
@@ -131,7 +157,7 @@ static CFDictionaryRef hook_SCDynamicStoreCopyProxies(void *store) {
     return CreateCleanProxyDict();
 }
 
-// 3. 过滤本地 VPN/代理 虚拟隧道网卡 (utun / ipsec / ppp)
+// 4. 过滤本地 VPN/代理 虚拟隧道网卡
 static BOOL IsVirtualVPNInterface(const char *ifname) {
     if (!ifname) return NO;
     return (strncmp(ifname, "utun", 4) == 0 ||
@@ -160,7 +186,7 @@ static int hook_getifaddrs(struct ifaddrs **ifap) {
     return ret;
 }
 
-// 4. 屏蔽工具 URL Scheme 暴露 (apple-magnifier:// 等)
+// 5. 彻底屏蔽 URL Scheme 暴露 (包含 iOS 16 私有 _canOpenURL:publicURLsOnly:)
 static BOOL IsBlockedURLScheme(NSString *scheme) {
     if (scheme.length == 0) return NO;
     NSSet *blocked = [NSSet setWithArray:@[
@@ -176,29 +202,29 @@ static BOOL hook_canOpenURL(id self, SEL _cmd, NSURL *url) {
     return orig_canOpenURL ? orig_canOpenURL(self, _cmd, url) : NO;
 }
 
+static BOOL (*orig_privCanOpenURL)(id self, SEL _cmd, NSURL *url, BOOL publicOnly);
+static BOOL hook_privCanOpenURL(id self, SEL _cmd, NSURL *url, BOOL publicOnly) {
+    if (IsBlockedURLScheme(url.scheme)) return NO;
+    return orig_privCanOpenURL ? orig_privCanOpenURL(self, _cmd, url, publicOnly) : NO;
+}
+
 static NSArray *(*orig_appsForScheme)(id self, SEL _cmd, NSString *scheme);
 static NSArray *hook_appsForScheme(id self, SEL _cmd, NSString *scheme) {
     if (IsBlockedURLScheme(scheme)) return @[];
     return orig_appsForScheme ? orig_appsForScheme(self, _cmd, scheme) : @[];
 }
 
-// 5. 抹除软件模拟定位标记
+// 6. 抹除软件模拟定位标记
 static BOOL hook_returnNO(id self, SEL _cmd) {
     return NO;
 }
 
-// 6. 强制苹果国际原生地图国家码
-static NSString *(*orig_countryCode)(id self, SEL _cmd);
-static NSString *hook_countryCode(id self, SEL _cmd) {
-    NSDictionary *cfg = [NSDictionary dictionaryWithContentsOfFile:kGeoPrefPath];
-    NSString *cc = cfg[@"countryCode"];
-    if (cc && cc.length == 2 && ![cc isEqualToString:@"--"]) {
-        return cc;
-    }
-    return orig_countryCode ? orig_countryCode(self, _cmd) : @"US";
+// 7. 强制苹果国际原生地图国家码与版权来源
+static NSString *hook_targetCountryCode(id self, SEL _cmd) {
+    return GetTargetCountryCode();
 }
 
-// 7. 接管系统 Wi-Fi 信息返回模拟美国热点
+// 8. 接管系统 Wi-Fi 信息接口返回模拟美国热点
 static NSDictionary *GetActiveMockWiFi(void) {
     NSDictionary *wifiCfg = [NSDictionary dictionaryWithContentsOfFile:kWifiPrefPath];
     if ([wifiCfg[@"enabled"] boolValue]) {
@@ -222,8 +248,8 @@ static CFDictionaryRef (*orig_CNCopyCurrentNetworkInfo)(CFStringRef interfaceNam
 static CFDictionaryRef hook_CNCopyCurrentNetworkInfo(CFStringRef interfaceName) {
     NSDictionary *topAP = GetActiveMockWiFi();
     if (topAP != nil) {
-        NSString *ssid = topAP[@"SSID"] ?: @"TMOBILE-5G-4BAA";
-        NSString *bssid = topAP[@"BSSID"] ?: @"44:94:FC:C4:A3:C4";
+        NSString *ssid = topAP[@"SSID"] ?: @"SmithHomeWiFi";
+        NSString *bssid = topAP[@"BSSID"] ?: @"78:8A:20:04:64:FF";
         NSDictionary *result = @{
             (__bridge NSString *)kCNNetworkInfoKeySSID: ssid,
             (__bridge NSString *)kCNNetworkInfoKeyBSSID: bssid,
@@ -237,12 +263,18 @@ static CFDictionaryRef hook_CNCopyCurrentNetworkInfo(CFStringRef interfaceName) 
 __attribute__((constructor))
 static void AutoIPLocHookEntry(void) {
     @autoreleasepool {
+        // A. 全面拦截公开与私有 URL Scheme 探测
         Class appCls = objc_getClass("UIApplication");
         if (appCls) {
             Method mOpen = class_getInstanceMethod(appCls, @selector(canOpenURL:));
             if (mOpen) {
                 orig_canOpenURL = (void *)method_getImplementation(mOpen);
                 method_setImplementation(mOpen, (IMP)hook_canOpenURL);
+            }
+            Method mPrivOpen = class_getInstanceMethod(appCls, NSSelectorFromString(@"_canOpenURL:publicURLsOnly:"));
+            if (mPrivOpen) {
+                orig_privCanOpenURL = (void *)method_getImplementation(mPrivOpen);
+                method_setImplementation(mPrivOpen, (IMP)hook_privCanOpenURL);
             }
         }
         Class wsCls = objc_getClass("LSApplicationWorkspace");
@@ -254,6 +286,22 @@ static void AutoIPLocHookEntry(void) {
             }
         }
 
+        // B. 屏蔽漫游基站 460 国家码
+        Class carrierCls = objc_getClass("CTCarrier");
+        if (carrierCls) {
+            Method mMCC = class_getInstanceMethod(carrierCls, NSSelectorFromString(@"mobileCountryCode"));
+            if (mMCC) {
+                orig_mobileCountryCode = (void *)method_getImplementation(mMCC);
+                method_setImplementation(mMCC, (IMP)hook_mobileCountryCode);
+            }
+            Method mISO = class_getInstanceMethod(carrierCls, NSSelectorFromString(@"isoCountryCode"));
+            if (mISO) {
+                orig_isoCountryCode = (void *)method_getImplementation(mISO);
+                method_setImplementation(mISO, (IMP)hook_isoCountryCode);
+            }
+        }
+
+        // C. 抹除软件模拟定位标记
         Class srcInfoCls = objc_getClass("CLLocationSourceInformation");
         if (srcInfoCls) {
             Method mSim = class_getInstanceMethod(srcInfoCls, NSSelectorFromString(@"isSimulatedBySoftware"));
@@ -269,15 +317,14 @@ static void AutoIPLocHookEntry(void) {
             if (mLocPriv) method_setImplementation(mLocPriv, (IMP)hook_returnNO);
         }
 
+        // D. 强制苹果国际原生地图配置与版权来源
         Class geoCls = objc_getClass("GEOCountryConfiguration");
         if (geoCls) {
-            Method m1 = class_getInstanceMethod(geoCls, NSSelectorFromString(@"countryCode"));
-            if (m1) {
-                orig_countryCode = (void *)method_getImplementation(m1);
-                method_setImplementation(m1, (IMP)hook_countryCode);
+            NSArray *sels = @[@"countryCode", @"_countryCode", @"currentCountryCode", @"sourceCountryCode"];
+            for (NSString *selName in sels) {
+                Method m = class_getInstanceMethod(geoCls, NSSelectorFromString(selName));
+                if (m) method_setImplementation(m, (IMP)hook_targetCountryCode);
             }
-            Method m1b = class_getInstanceMethod(geoCls, NSSelectorFromString(@"_countryCode"));
-            if (m1b) method_setImplementation(m1b, (IMP)hook_countryCode);
         }
         Class platformCls = objc_getClass("GEOPlatform");
         if (platformCls) {
@@ -285,6 +332,7 @@ static void AutoIPLocHookEntry(void) {
             if (mChina) method_setImplementation(mChina, (IMP)hook_returnNO);
         }
 
+        // E. 接管系统级 C 函数
         MSHookFunction_t hookFn = FindElleKitHookFunction();
         if (hookFn) {
             dlopen("/usr/lib/libMobileGestalt.dylib", RTLD_LAZY);
