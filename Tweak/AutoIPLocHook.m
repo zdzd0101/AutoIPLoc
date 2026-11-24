@@ -20,7 +20,7 @@ typedef void (*MSHookFunction_t)(void *symbol, void *replace, void **result);
 static NSString *const kGeoPrefPath = @"/var/mobile/Library/Preferences/com.autoiploc.geo.plist";
 static NSString *const kWifiPrefPath = @"/var/mobile/Library/Preferences/com.autoiploc.wifi.plist";
 
-// 直接遍历进程加载的 Mach-O 镜像符号表定位 _MSHookFunction（绕过 RootHide 路径隐藏）
+// 直接扫描内存中的 Mach-O 符号表定位 _MSHookFunction（绕过 RootHide 路径隐藏）
 static MSHookFunction_t FindElleKitHookFunction(void) {
     void *sym = dlsym(RTLD_DEFAULT, "MSHookFunction");
     if (sym) return (MSHookFunction_t)sym;
@@ -67,7 +67,28 @@ static MSHookFunction_t FindElleKitHookFunction(void) {
     return NULL;
 }
 
-// 仅对系统网络/WebKit 放行真实 SOCKS5 代理，对诊断/业务 App 隐藏显式代理
+// 1. 接管 MobileGestalt 硬件区域码，解除国行 CH/A 强制锁定高德地图
+static CFPropertyListRef (*orig_MGCopyAnswer)(CFStringRef prop);
+static CFPropertyListRef hook_MGCopyAnswer(CFStringRef prop) {
+    if (prop != NULL) {
+        NSDictionary *cfg = [NSDictionary dictionaryWithContentsOfFile:kGeoPrefPath];
+        if ([cfg[@"forceAppleMaps"] boolValue]) {
+            NSString *key = (__bridge NSString *)prop;
+            NSString *cc = cfg[@"countryCode"];
+            NSString *targetCC = (cc && cc.length == 2 && ![cc isEqualToString:@"--"]) ? cc : @"US";
+            if ([key isEqualToString:@"RegionCode"]) {
+                return (__bridge_retained CFPropertyListRef)targetCC;
+            }
+            if ([key isEqualToString:@"RegionInfo"]) {
+                NSString *regionInfo = [targetCC isEqualToString:@"US"] ? @"LL/A" : [NSString stringWithFormat:@"%@/A", targetCC];
+                return (__bridge_retained CFPropertyListRef)regionInfo;
+            }
+        }
+    }
+    return orig_MGCopyAnswer ? orig_MGCopyAnswer(prop) : NULL;
+}
+
+// 2. 仅对系统网络/WebKit 放行真实 SOCKS5 代理，对诊断与业务 App 隐藏显式代理
 static BOOL IsSystemNetworkingCaller(void *retAddr) {
     if (!retAddr) return NO;
     Dl_info info;
@@ -110,7 +131,7 @@ static CFDictionaryRef hook_SCDynamicStoreCopyProxies(void *store) {
     return CreateCleanProxyDict();
 }
 
-// 过滤 Shadowrocket 等产生的 utun / ipsec / ppp 虚拟隧道网卡
+// 3. 过滤本地 VPN/代理 虚拟隧道网卡 (utun / ipsec / ppp)
 static BOOL IsVirtualVPNInterface(const char *ifname) {
     if (!ifname) return NO;
     return (strncmp(ifname, "utun", 4) == 0 ||
@@ -139,7 +160,7 @@ static int hook_getifaddrs(struct ifaddrs **ifap) {
     return ret;
 }
 
-// 屏蔽工具 URL Scheme 暴露 (apple-magnifier:// 等)
+// 4. 屏蔽工具 URL Scheme 暴露 (apple-magnifier:// 等)
 static BOOL IsBlockedURLScheme(NSString *scheme) {
     if (scheme.length == 0) return NO;
     NSSet *blocked = [NSSet setWithArray:@[
@@ -161,12 +182,12 @@ static NSArray *hook_appsForScheme(id self, SEL _cmd, NSString *scheme) {
     return orig_appsForScheme ? orig_appsForScheme(self, _cmd, scheme) : @[];
 }
 
-// 抹除软件模拟定位标记
+// 5. 抹除软件模拟定位标记
 static BOOL hook_returnNO(id self, SEL _cmd) {
     return NO;
 }
 
-// 强制苹果国际原生地图国家码
+// 6. 强制苹果国际原生地图国家码
 static NSString *(*orig_countryCode)(id self, SEL _cmd);
 static NSString *hook_countryCode(id self, SEL _cmd) {
     NSDictionary *cfg = [NSDictionary dictionaryWithContentsOfFile:kGeoPrefPath];
@@ -177,7 +198,7 @@ static NSString *hook_countryCode(id self, SEL _cmd) {
     return orig_countryCode ? orig_countryCode(self, _cmd) : @"US";
 }
 
-// 接管系统 Wi-Fi 信息返回模拟美国热点
+// 7. 接管系统 Wi-Fi 信息返回模拟美国热点
 static NSDictionary *GetActiveMockWiFi(void) {
     NSDictionary *wifiCfg = [NSDictionary dictionaryWithContentsOfFile:kWifiPrefPath];
     if ([wifiCfg[@"enabled"] boolValue]) {
@@ -266,6 +287,10 @@ static void AutoIPLocHookEntry(void) {
 
         MSHookFunction_t hookFn = FindElleKitHookFunction();
         if (hookFn) {
+            dlopen("/usr/lib/libMobileGestalt.dylib", RTLD_LAZY);
+            void *symMG = dlsym(RTLD_DEFAULT, "MGCopyAnswer");
+            if (symMG) hookFn(symMG, (void *)hook_MGCopyAnswer, (void **)&orig_MGCopyAnswer);
+
             void *symProxy = dlsym(RTLD_DEFAULT, "CFNetworkCopySystemProxySettings");
             if (symProxy) hookFn(symProxy, (void *)hook_CFNetworkCopySystemProxySettings, (void **)&orig_CFNetworkCopySystemProxySettings);
 
