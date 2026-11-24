@@ -33,11 +33,9 @@ jobs:
 
           zip -r AutoIPLoc.tipa Payload
 
-          # 2. 编译标准 Debian 格式底层钩子插件 (.deb，供 RootHide Patcher 转换)
+          # 2. 编译标准 Rootless (iphoneos-arm64e) 底层插件 (.deb)
           mkdir -p deb_pkg/DEBIAN
-          mkdir -p deb_pkg/Library/MobileSubstrate/DynamicLibraries
-
-          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 2.0.0\nArchitecture: iphoneos-arm\nDescription: Force Apple International Maps & Wi-Fi SSID sync for AutoIPLoc\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" > deb_pkg/DEBIAN/control
+          mkdir -p deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries
 
           clang -dynamiclib \
             -arch arm64 -arch arm64e \
@@ -46,15 +44,18 @@ jobs:
             -framework Foundation -framework SystemConfiguration \
             -fobjc-arc \
             Tweak/AutoIPLocHook.m \
-            -o deb_pkg/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
+            -o deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
 
-          ./ldid -S deb_pkg/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
-          cp Tweak/AutoIPLocHook.plist deb_pkg/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
+          ./ldid -S deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
+          cp Tweak/AutoIPLocHook.plist deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
+
+          INSTALLED_SIZE=$(du -sk deb_pkg/var | cut -f1)
+          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 2.0.1\nArchitecture: iphoneos-arm64e\nInstalled-Size: %s\nDescription: Force Apple International Maps & Wi-Fi SSID sync for AutoIPLoc\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
 
           chmod 0755 deb_pkg/DEBIAN
           chmod 0644 deb_pkg/DEBIAN/control
-          chmod 0755 deb_pkg/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
-          chmod 0644 deb_pkg/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
+          chmod 0755 deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
+          chmod 0644 deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
 
           dpkg-deb -Zgzip -b deb_pkg AutoIPLocHook.deb
           ls -lh AutoIPLoc.tipa AutoIPLocHook.deb
