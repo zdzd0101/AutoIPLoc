@@ -1,4 +1,4 @@
-name: Build TrollStore TIPA
+name: Build TrollStore TIPA and Tweak
 on: [push, workflow_dispatch]
 
 jobs:
@@ -6,12 +6,12 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Compile and Sign TIPA
+      - name: Compile and Sign TIPA and DEB
         run: |
           mkdir -p Payload/AutoIPLoc.app
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
           
-          # 直接调用 swiftc 编译 iOS arm64 二进制，无需繁琐的 xcodeproj 工程文件
+          # 1. 编译巨魔 App (.tipa)
           swiftc main.swift \
             -parse-as-library \
             -import-objc-header Bridge.h \
@@ -22,15 +22,45 @@ jobs:
             
           cp Info.plist Payload/AutoIPLoc.app/Info.plist
           
-          # 下载 ldid 并注入巨魔所需系统权限
           curl -L https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_macosx_arm64 -o ldid
           chmod +x ldid
           ./ldid -Sentitlements.plist Payload/AutoIPLoc.app/AutoIPLoc
           
-          # 打包为 .tipa
           zip -r AutoIPLoc.tipa Payload
-      - name: Upload TIPA
+
+          # 2. 编译配套底层钩子插件 (.deb，用于彻底去除高德水印与接管 Wi-Fi)
+          mkdir -p deb_pkg/DEBIAN
+          mkdir -p deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries
+
+          cat << 'EOF' > deb_pkg/DEBIAN/control
+          Package: com.local.autoiploc.hook
+          Name: AutoIPLocHook
+          Version: 2.0.0
+          Architecture: iphoneos-arm64
+          Description: Force Apple International Maps & Wi-Fi SSID sync for AutoIPLoc
+          Maintainer: AutoIPLoc
+          Author: AutoIPLoc
+          Section: Tweaks
+          EOF
+
+          clang -dynamiclib \
+            -arch arm64 -arch arm64e \
+            -isysroot "$SDK_PATH" \
+            -miphoneos-version-min=15.0 \
+            -framework Foundation -framework SystemConfiguration \
+            -fobjc-arc \
+            Tweak/AutoIPLocHook.m \
+            -o deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
+
+          ./ldid -S deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
+          cp Tweak/AutoIPLocHook.plist deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
+
+          dpkg-deb -Zgzip -b deb_pkg AutoIPLocHook.deb
+
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: AutoIPLoc-TrollStore
-          path: AutoIPLoc.tipa
+          name: AutoIPLoc-Release
+          path: |
+            AutoIPLoc.tipa
+            AutoIPLocHook.deb
