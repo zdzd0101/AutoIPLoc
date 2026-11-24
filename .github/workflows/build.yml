@@ -13,6 +13,7 @@ jobs:
       - name: Compile and Sign TIPA and DEB
         run: |
           set -e
+          unset SDKROOT
           mkdir -p Payload/AutoIPLoc.app
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
 
@@ -63,7 +64,7 @@ jobs:
           cp Tweak/AutoIPLocHook.plist deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
 
           INSTALLED_SIZE=$(du -sk deb_pkg/var | cut -f1)
-          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 2.0.5\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Hide system proxy, VPN interfaces, URL schemes & erase simulation flag\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
+          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 2.0.6\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Stealth SOCKS5 proxy, hide VPN interfaces, URL schemes & erase simulation flag\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
 
           chmod 0755 deb_pkg/DEBIAN
           chmod 0644 deb_pkg/DEBIAN/control
