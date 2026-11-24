@@ -34,19 +34,7 @@ jobs:
 
           zip -r AutoIPLoc.tipa Payload
 
-          # 2. 生成 Substrate 符号存根，供 RootHide Patcher 自动重绑定至 ElleKit
-          cat << 'EOF' > libsubstrate.tbd
-          --- !tapi-tbd
-          tbd-version:     4
-          targets:         [ arm64-ios, arm64e-ios ]
-          install-name:    '/usr/lib/libsubstrate.dylib'
-          exports:
-            - targets:         [ arm64-ios, arm64e-ios ]
-              symbols:         [ _MSHookFunction, _MSHookMessageEx ]
-          ...
-          EOF
-
-          # 3. 编译标准 Rootless 输入架构 (iphoneos-arm64) 插件 (.deb)
+          # 2. 编译零外部依赖 Rootless 插件 (.deb)
           mkdir -p deb_pkg/DEBIAN
           mkdir -p deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries
 
@@ -55,7 +43,6 @@ jobs:
             -isysroot "$SDK_PATH" \
             -miphoneos-version-min=15.0 \
             -framework Foundation -framework UIKit -framework CoreLocation -framework SystemConfiguration -framework CFNetwork \
-            -L. -lsubstrate \
             -fobjc-arc \
             Tweak/AutoIPLocHook.m \
             -o deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
@@ -64,7 +51,7 @@ jobs:
           cp Tweak/AutoIPLocHook.plist deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
 
           INSTALLED_SIZE=$(du -sk deb_pkg/var | cut -f1)
-          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 2.0.6\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Stealth SOCKS5 proxy, hide VPN interfaces, URL schemes & erase simulation flag\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
+          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 2.0.7\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Zero-dep RootHide hook for proxy stealth, simulation flag erase & timezone sync\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
 
           chmod 0755 deb_pkg/DEBIAN
           chmod 0644 deb_pkg/DEBIAN/control
