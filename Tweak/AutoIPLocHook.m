@@ -1,22 +1,34 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <CoreLocation/CoreLocation.h>
-#import <SystemConfiguration/SystemConfiguration.h>
 #import <SystemConfiguration/CaptiveNetwork.h>
 #import <CFNetwork/CFNetwork.h>
 #import <objc/runtime.h>
 #import <ifaddrs.h>
+#import <dlfcn.h>
 #import <string.h>
 
-// 声明由 libsubstrate.tbd 导出的底层钩子函数（RootHide Patcher 会自动重绑定至 ElleKit）
 extern void MSHookFunction(void *symbol, void *replace, void **result);
 
 static NSString *const kGeoPrefPath = @"/var/mobile/Library/Preferences/com.autoiploc.geo.plist";
 static NSString *const kWifiPrefPath = @"/var/mobile/Library/Preferences/com.autoiploc.wifi.plist";
 
-// 1. 接管 CFNetworkCopySystemProxySettings（返回无代理配置）
-static CFDictionaryRef (*orig_CFNetworkCopySystemProxySettings)(void);
-static CFDictionaryRef hook_CFNetworkCopySystemProxySettings(void) {
+// 判断调用方是否为系统网络/浏览器引擎（保证 SOCKS5 正常联网，仅对 App 风控探针隐藏代理）
+static BOOL IsSystemNetworkingCaller(void *retAddr) {
+    if (!retAddr) return NO;
+    Dl_info info;
+    if (dladdr(retAddr, &info) != 0 && info.dli_fname != NULL) {
+        if (strstr(info.dli_fname, "CFNetwork") != NULL ||
+            strstr(info.dli_fname, "WebKit") != NULL ||
+            strstr(info.dli_fname, "libnetwork") != NULL ||
+            strstr(info.dli_fname, "Network.framework") != NULL) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static CFDictionaryRef CreateCleanProxyDict(void) {
     NSDictionary *cleanProxy = @{
         @"HTTPEnable": @0,
         @"HTTPSEnable": @0,
@@ -28,17 +40,25 @@ static CFDictionaryRef hook_CFNetworkCopySystemProxySettings(void) {
     return (__bridge_retained CFDictionaryRef)cleanProxy;
 }
 
-// 2. 接管 SCDynamicStoreCopyProxies（彻底消除 [系统代理] 检测）
-static CFDictionaryRef (*orig_SCDynamicStoreCopyProxies)(SCDynamicStoreRef store);
-static CFDictionaryRef hook_SCDynamicStoreCopyProxies(SCDynamicStoreRef store) {
-    NSDictionary *cleanProxy = @{
-        @"FTPPassive": @1,
-        @"ExceptionsList": @[@"*.local", @"169.254/16"]
-    };
-    return (__bridge_retained CFDictionaryRef)cleanProxy;
+// 1. 接管 CFNetworkCopySystemProxySettings
+static CFDictionaryRef (*orig_CFNetworkCopySystemProxySettings)(void);
+static CFDictionaryRef hook_CFNetworkCopySystemProxySettings(void) {
+    if (IsSystemNetworkingCaller(__builtin_return_address(0)) && orig_CFNetworkCopySystemProxySettings) {
+        return orig_CFNetworkCopySystemProxySettings();
+    }
+    return CreateCleanProxyDict();
 }
 
-// 3. 过滤本地 VPN 虚拟隧道网卡 (utun / ipsec / ppp)
+// 2. 动态接管 SCDynamicStoreCopyProxies（避开 iOS SDK 编译期头限制）
+static CFDictionaryRef (*orig_SCDynamicStoreCopyProxies)(void *store);
+static CFDictionaryRef hook_SCDynamicStoreCopyProxies(void *store) {
+    if (IsSystemNetworkingCaller(__builtin_return_address(0)) && orig_SCDynamicStoreCopyProxies) {
+        return orig_SCDynamicStoreCopyProxies(store);
+    }
+    return CreateCleanProxyDict();
+}
+
+// 3. 过滤本地 VPN/代理 虚拟隧道网卡 (utun / ipsec / ppp)
 static BOOL IsVirtualVPNInterface(const char *ifname) {
     if (!ifname) return NO;
     return (strncmp(ifname, "utun", 4) == 0 ||
@@ -148,7 +168,6 @@ static CFDictionaryRef hook_CNCopyCurrentNetworkInfo(CFStringRef interfaceName) 
 __attribute__((constructor))
 static void AutoIPLocHookEntry(void) {
     @autoreleasepool {
-        // A. 屏蔽 URL Scheme 暴露
         Class appCls = objc_getClass("UIApplication");
         if (appCls) {
             Method mOpen = class_getInstanceMethod(appCls, @selector(canOpenURL:));
@@ -166,7 +185,6 @@ static void AutoIPLocHookEntry(void) {
             }
         }
 
-        // B. 抹除模拟定位标记
         Class srcInfoCls = objc_getClass("CLLocationSourceInformation");
         if (srcInfoCls) {
             Method mSim = class_getInstanceMethod(srcInfoCls, NSSelectorFromString(@"isSimulatedBySoftware"));
@@ -182,7 +200,6 @@ static void AutoIPLocHookEntry(void) {
             if (mLocPriv) method_setImplementation(mLocPriv, (IMP)hook_returnNO);
         }
 
-        // C. 强制苹果国际原生地图
         Class geoCls = objc_getClass("GEOCountryConfiguration");
         if (geoCls) {
             Method m1 = class_getInstanceMethod(geoCls, NSSelectorFromString(@"countryCode"));
@@ -199,9 +216,13 @@ static void AutoIPLocHookEntry(void) {
             if (mChina) method_setImplementation(mChina, (IMP)hook_returnNO);
         }
 
-        // D. 原生 MSHookFunction 接管系统代理、VPN 网卡与 Wi-Fi 接口
         MSHookFunction((void *)CFNetworkCopySystemProxySettings, (void *)hook_CFNetworkCopySystemProxySettings, (void **)&orig_CFNetworkCopySystemProxySettings);
-        MSHookFunction((void *)SCDynamicStoreCopyProxies, (void *)hook_SCDynamicStoreCopyProxies, (void **)&orig_SCDynamicStoreCopyProxies);
+
+        void *symSCDyn = dlsym(RTLD_DEFAULT, "SCDynamicStoreCopyProxies");
+        if (symSCDyn) {
+            MSHookFunction(symSCDyn, (void *)hook_SCDynamicStoreCopyProxies, (void **)&orig_SCDynamicStoreCopyProxies);
+        }
+
         MSHookFunction((void *)getifaddrs, (void *)hook_getifaddrs, (void **)&orig_getifaddrs);
         MSHookFunction((void *)CNCopyCurrentNetworkInfo, (void *)hook_CNCopyCurrentNetworkInfo, (void **)&orig_CNCopyCurrentNetworkInfo);
         MSHookFunction((void *)CNCopySupportedInterfaces, (void *)hook_CNCopySupportedInterfaces, (void **)&orig_CNCopySupportedInterfaces);
