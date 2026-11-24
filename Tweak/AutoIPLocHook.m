@@ -37,7 +37,7 @@ static NSString *GetTargetTimeZoneName(void) {
     return nil;
 }
 
-// 1. 隐藏内存中加载的插件与 RootHide 引导库镜像名（消除 [功能插件注入] 与 [RootHide底座]）
+// 1. 隐藏内存中加载的插件与 RootHide 引导库镜像名
 static const char *(*orig_dyld_get_image_name)(uint32_t image_index);
 static const char *hook_dyld_get_image_name(uint32_t image_index) {
     const char *name = orig_dyld_get_image_name ? orig_dyld_get_image_name(image_index) : NULL;
@@ -53,7 +53,7 @@ static const char *hook_dyld_get_image_name(uint32_t image_index) {
     return name;
 }
 
-// 2. 接管 NSTimeZone 与 CFTimeZone（消除 [时区冲突]）
+// 2. 接管 NSTimeZone 与 CFTimeZone
 static NSTimeZone *(*orig_systemTimeZone)(id self, SEL _cmd);
 static NSTimeZone *hook_systemTimeZone(id self, SEL _cmd) {
     NSString *tzName = GetTargetTimeZoneName();
@@ -224,9 +224,13 @@ static NSURL *hook_urlOverride(id self, SEL _cmd, NSURL *url) {
     return orig_urlOverride ? orig_urlOverride(self, _cmd, url) : nil;
 }
 
-// 7. 抹除软件模拟定位标记
+// 7. 抹除软件模拟定位标记与强制国际版地图国家码（纯 ObjC 接管，不闪退）
 static BOOL hook_returnNO(id self, SEL _cmd) {
     return NO;
+}
+
+static NSString *hook_targetCountryCode(id self, SEL _cmd) {
+    return GetTargetCountryCode();
 }
 
 // 8. 接管系统 Wi-Fi 信息接口返回模拟美国热点
@@ -371,7 +375,22 @@ static void AutoIPLocHookEntry(void) {
             }
         }
 
-        // F. 通过 RootHide Patcher 绑定的 MSHookFunction 接管系统底层 C 函数（100% 兼容 arm64e）
+        // F. 锁定国际地图国家码，阻断高德切换（保留 updateProvidersForCurrentCountry 正常拉取美国地图瓦片）
+        Class geoCls = objc_getClass("GEOCountryConfiguration");
+        if (geoCls) {
+            NSArray *sels = @[@"countryCode", @"_countryCode", @"currentCountryCode", @"sourceCountryCode"];
+            for (NSString *selName in sels) {
+                Method m = class_getInstanceMethod(geoCls, NSSelectorFromString(selName));
+                if (m) method_setImplementation(m, (IMP)hook_targetCountryCode);
+            }
+        }
+        Class platformCls = objc_getClass("GEOPlatform");
+        if (platformCls) {
+            Method mChina = class_getInstanceMethod(platformCls, NSSelectorFromString(@"isChina"));
+            if (mChina) method_setImplementation(mChina, (IMP)hook_returnNO);
+        }
+
+        // G. 通过 RootHide Patcher 绑定的 MSHookFunction 接管系统底层 C 函数
         MSHookFunction((void *)_dyld_get_image_name, (void *)hook_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
 
         void *symCFTimeZone = dlsym(RTLD_DEFAULT, "CFTimeZoneCopySystem");
