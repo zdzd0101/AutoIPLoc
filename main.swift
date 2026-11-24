@@ -56,6 +56,7 @@ struct EgressIPResult {
     let lon: Double
     let timezone: String
     let isp: String
+    let serverEpoch: TimeInterval
 }
 
 class NativeSystemController {
@@ -97,7 +98,18 @@ class NativeSystemController {
 
         if action == "timezone", idx + 2 < args.count {
             let tz = args[idx + 2]
+            let epochVal: TimeInterval = (idx + 3 < args.count) ? (Double(args[idx + 3]) ?? 0) : 0
 
+            // 1. 校准系统标准日期与时间戳（防止飞行模式下日期偏差）
+            if epochVal > 1_700_000_000 {
+                let now = Date().timeIntervalSince1970
+                if abs(now - epochVal) > 20.0 {
+                    var tv = timeval(tv_sec: Int(epochVal), tv_usec: 0)
+                    settimeofday(&tv, nil)
+                }
+            }
+
+            // 2. 更新系统底层 localtime 软链接
             let zoneCandidates = [
                 "/var/db/timezone/zoneinfo/\(tz)",
                 "/usr/share/zoneinfo/\(tz)"
@@ -109,6 +121,7 @@ class NativeSystemController {
                 _ = symlink(zonePath, "/private/var/db/timezone/localtime")
             }
 
+            // 3. 调用 CoreTime 私有接口下发手动时区至 timed 守护进程
             if let handle = dlopen("/System/Library/PrivateFrameworks/CoreTime.framework/CoreTime", RTLD_LAZY) {
                 typealias SetAutoTZFn = @convention(c) (Bool) -> Void
                 typealias SetManualTZFn = @convention(c) (CFString) -> Void
@@ -120,6 +133,7 @@ class NativeSystemController {
                 }
             }
 
+            // 4. 写入配置文件并通知 SpringBoard 刷新日期与时钟
             let plistTargets = [
                 ("/var/mobile/Library/Preferences/com.apple.preferences.datetime.plist", uid_t(501)),
                 ("/var/preferences/com.apple.preferences.datetime.plist", uid_t(0))
@@ -216,7 +230,7 @@ class NativeSystemController {
         chmod(geoSharedPath, 0o644)
     }
 
-    static func applyTimeZone(_ tzIdentifier: String, countryCode: String) -> Bool {
+    static func applyTimeZone(_ tzIdentifier: String, countryCode: String, serverEpoch: TimeInterval) -> Bool {
         guard !tzIdentifier.isEmpty else { return false }
 
         updateGeoSharedConfig(countryCode: countryCode, timezone: tzIdentifier)
@@ -226,7 +240,7 @@ class NativeSystemController {
         CFPreferencesSetValue("timezone" as CFString, tzIdentifier as CFString, dtDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
         CFPreferencesSynchronize(dtDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
 
-        _ = runSelfAsRoot(args: ["timezone", tzIdentifier])
+        _ = runSelfAsRoot(args: ["timezone", tzIdentifier, "\(serverEpoch)"])
 
         setenv("TZ", tzIdentifier, 1)
         tzset()
@@ -327,17 +341,59 @@ class LocationSyncEngine: NSObject {
         pathMonitor.start(queue: monitorQueue)
     }
 
-    // 优先使用上午秒连的 ip-api.com，不受 Cloudflare 住宅代理拦截影响
+    private static func parseServerDateHeader(_ response: URLResponse?) -> TimeInterval {
+        guard let http = response as? HTTPURLResponse,
+              let dateStr = http.allHeaderFields["Date"] as? String else { return 0 }
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "en_US_POSIX")
+        df.timeZone = TimeZone(abbreviation: "GMT")
+        df.dateFormat = "EEE, dd MMM yyyy HH:mm:ss z"
+        return df.date(from: dateStr)?.timeIntervalSince1970 ?? 0
+    }
+
+    // 优先使用 HTTPS 的 ipinfo.io（无 Cloudflare 拦截）+ 启用 ATS 后的 ip-api.com
     private func fetchEgressIPWithFallback(completion: @escaping (EgressIPResult?) -> Void) {
         let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 7.0
-        config.timeoutIntervalForResource = 10.0
+        config.timeoutIntervalForRequest = 8.0
+        config.timeoutIntervalForResource = 12.0
         config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         let session = URLSession(configuration: config)
 
         func trySource1() {
-            guard let url = URL(string: "http://ip-api.com/json/?fields=status,country,countryCode,regionName,city,zip,lat,lon,timezone,isp,query") else { trySource2(); return }
-            session.dataTask(with: url) { data, _, _ in
+            guard let url = URL(string: "https://ipinfo.io/json") else { trySource2(); return }
+            var req = URLRequest(url: url)
+            req.setValue("curl/8.4.0", forHTTPHeaderField: "User-Agent")
+            session.dataTask(with: req) { data, resp, _ in
+                if let data = data,
+                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let ip = json["ip"] as? String,
+                   let cc = json["country"] as? String,
+                   let locStr = json["loc"] as? String {
+                    let parts = locStr.split(separator: ",")
+                    if parts.count == 2, let lat = Double(parts[0]), let lon = Double(parts[1]) {
+                        completion(EgressIPResult(
+                            ip: ip,
+                            countryCode: cc.uppercased(),
+                            country: cc.uppercased() == "US" ? "United States" : cc,
+                            region: json["region"] as? String ?? "",
+                            city: json["city"] as? String ?? "",
+                            zip: json["postal"] as? String ?? "",
+                            lat: lat,
+                            lon: lon,
+                            timezone: json["timezone"] as? String ?? "America/Chicago",
+                            isp: json["org"] as? String ?? "Residential ISP",
+                            serverEpoch: Self.parseServerDateHeader(resp)
+                        ))
+                        return
+                    }
+                }
+                trySource2()
+            }.resume()
+        }
+
+        func trySource2() {
+            guard let url = URL(string: "http://ip-api.com/json/?fields=status,country,countryCode,regionName,city,zip,lat,lon,timezone,isp,query") else { trySource3(); return }
+            session.dataTask(with: url) { data, resp, _ in
                 if let data = data,
                    let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                    (json["status"] as? String) == "success",
@@ -355,37 +411,8 @@ class LocationSyncEngine: NSObject {
                         lat: lat,
                         lon: lon,
                         timezone: json["timezone"] as? String ?? "America/Chicago",
-                        isp: json["isp"] as? String ?? "Residential ISP"
-                    ))
-                } else {
-                    trySource2()
-                }
-            }.resume()
-        }
-
-        func trySource2() {
-            guard let url = URL(string: "https://ipwho.is/") else { trySource3(); return }
-            session.dataTask(with: url) { data, _, _ in
-                if let data = data,
-                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   (json["success"] as? Bool) == true,
-                   let ip = json["ip"] as? String,
-                   let cc = json["country_code"] as? String,
-                   let lat = json["latitude"] as? Double,
-                   let lon = json["longitude"] as? Double {
-                    let tzDict = json["timezone"] as? [String: Any]
-                    let connDict = json["connection"] as? [String: Any]
-                    completion(EgressIPResult(
-                        ip: ip,
-                        countryCode: cc.uppercased(),
-                        country: json["country"] as? String ?? cc,
-                        region: json["region"] as? String ?? "",
-                        city: json["city"] as? String ?? "",
-                        zip: json["postal"] as? String ?? "",
-                        lat: lat,
-                        lon: lon,
-                        timezone: tzDict?["id"] as? String ?? "America/Chicago",
-                        isp: connDict?["isp"] as? String ?? "Residential ISP"
+                        isp: json["isp"] as? String ?? "Residential ISP",
+                        serverEpoch: Self.parseServerDateHeader(resp)
                     ))
                 } else {
                     trySource3()
@@ -394,27 +421,28 @@ class LocationSyncEngine: NSObject {
         }
 
         func trySource3() {
-            guard let url = URL(string: "https://api.ip.sb/geoip") else { completion(nil); return }
+            guard let url = URL(string: "https://ifconfig.co/json") else { completion(nil); return }
             var req = URLRequest(url: url)
-            req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 16_2 like Mac OS X)", forHTTPHeaderField: "User-Agent")
-            session.dataTask(with: req) { data, _, _ in
+            req.setValue("curl/8.4.0", forHTTPHeaderField: "User-Agent")
+            session.dataTask(with: req) { data, resp, _ in
                 if let data = data,
                    let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                    let ip = json["ip"] as? String,
-                   let cc = json["country_code"] as? String,
+                   let cc = json["country_iso"] as? String,
                    let lat = json["latitude"] as? Double,
                    let lon = json["longitude"] as? Double {
                     completion(EgressIPResult(
                         ip: ip,
                         countryCode: cc.uppercased(),
                         country: json["country"] as? String ?? cc,
-                        region: json["region"] as? String ?? "",
+                        region: json["region_name"] as? String ?? "",
                         city: json["city"] as? String ?? "",
-                        zip: json["postal_code"] as? String ?? "",
+                        zip: json["zip_code"] as? String ?? "",
                         lat: lat,
                         lon: lon,
-                        timezone: json["timezone"] as? String ?? "America/Chicago",
-                        isp: (json["isp"] as? String) ?? (json["organization"] as? String) ?? "Residential ISP"
+                        timezone: json["time_zone"] as? String ?? "America/Chicago",
+                        isp: json["asn_org"] as? String ?? "Residential ISP",
+                        serverEpoch: Self.parseServerDateHeader(resp)
                     ))
                 } else {
                     completion(nil)
@@ -488,7 +516,11 @@ class LocationSyncEngine: NSObject {
                     self.exactAddress = resolvedAddress
                     self.exactZipCode = resolvedZip
 
-                    self.tzSyncedSuccess = NativeSystemController.applyTimeZone(info.timezone, countryCode: info.countryCode)
+                    self.tzSyncedSuccess = NativeSystemController.applyTimeZone(
+                        info.timezone,
+                        countryCode: info.countryCode,
+                        serverEpoch: info.serverEpoch
+                    )
 
                     let generatedWiFis = self.generateDynamicWiFis(isp: info.isp)
                     self.nearbyWiFis = generatedWiFis
