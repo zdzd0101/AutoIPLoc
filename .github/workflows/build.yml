@@ -44,7 +44,7 @@ jobs:
           mkdir -p deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries
 
           clang -dynamiclib \
-            -arch arm64 \
+            -arch arm64 -arch arm64e \
             -isysroot "$SDK_PATH" \
             -miphoneos-version-min=15.0 \
             -install_name /Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib \
@@ -62,24 +62,10 @@ jobs:
           <dict>
               <key>Filter</key>
               <dict>
-                  <key>Mode</key>
-                  <string>Any</string>
                   <key>Bundles</key>
                   <array>
-                      <string>com.apple.CoreFoundation</string>
                       <string>com.apple.Foundation</string>
                       <string>com.apple.UIKit</string>
-                      <string>com.local.audit.envauditor</string>
-                      <string>com.local.carriercheck</string>
-                      <string>com.amazon.Amazon</string>
-                      <string>com.squareup.cash</string>
-                      <string>com.fanduel.sportsbook</string>
-                  </array>
-                  <key>Executables</key>
-                  <array>
-                      <string>EnvAuditor</string>
-                      <string>CarrierCheck</string>
-                      <string>Amazon</string>
                   </array>
               </dict>
           </dict>
@@ -87,7 +73,7 @@ jobs:
           EOF
 
           INSTALLED_SIZE=$(du -sk deb_pkg/var | cut -f1)
-          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 3.0.0\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Zero-dep built-in fishhook + ObjC runtime RootHide stealth hook & 15s residential IP sync\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
+          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 3.1.0\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Fat arm64+arm64e PAC-safe ElleKit + fishhook RootHide stealth hook\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
 
           chmod 0755 deb_pkg/DEBIAN
           chmod 0644 deb_pkg/DEBIAN/control
