@@ -1,9 +1,13 @@
 name: Build TrollStore TIPA and Tweak
 on: [push, workflow_dispatch]
 
+concurrency:
+  group: build-autoiploc
+  cancel-in-progress: true
+
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
 
@@ -13,10 +17,10 @@ jobs:
       - name: Compile and Sign TIPA and DEB
         run: |
           set -e
+          unset SDKROOT
           mkdir -p Payload/AutoIPLoc.app
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
 
-          # 1. 编译巨魔 App (.tipa)
           swiftc main.swift \
             -parse-as-library \
             -import-objc-header Bridge.h \
@@ -26,14 +30,27 @@ jobs:
             -o Payload/AutoIPLoc.app/AutoIPLoc
 
           cp Info.plist Payload/AutoIPLoc.app/Info.plist
+          /usr/libexec/PlistBuddy -c "Delete :NSAppTransportSecurity" Payload/AutoIPLoc.app/Info.plist 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity dict" Payload/AutoIPLoc.app/Info.plist
+          /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSAllowsArbitraryLoads bool true" Payload/AutoIPLoc.app/Info.plist
 
-          curl -fsSL https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_macosx_arm64 -o ldid
+          curl -fsSL https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_macosx_x86_64 -o ldid
           chmod +x ldid
           ./ldid -Sentitlements.plist Payload/AutoIPLoc.app/AutoIPLoc
 
           zip -r AutoIPLoc.tipa Payload
 
-          # 2. 编译标准 Rootless 输入架构 (iphoneos-arm64) 插件 (.deb)
+          cat << 'EOF' > libsubstrate.tbd
+          --- !tapi-tbd
+          tbd-version:     4
+          targets:         [ arm64-ios, arm64e-ios ]
+          install-name:    '/usr/lib/libsubstrate.dylib'
+          exports:
+            - targets:         [ arm64-ios, arm64e-ios ]
+              symbols:         [ _MSHookFunction, _MSHookMessageEx ]
+          ...
+          EOF
+
           mkdir -p deb_pkg/DEBIAN
           mkdir -p deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries
 
@@ -41,7 +58,8 @@ jobs:
             -arch arm64 -arch arm64e \
             -isysroot "$SDK_PATH" \
             -miphoneos-version-min=15.0 \
-            -framework Foundation -framework CoreLocation -framework SystemConfiguration -framework NetworkExtension \
+            -framework Foundation -framework UIKit -framework CoreLocation -framework CoreTelephony -framework SystemConfiguration -framework CFNetwork \
+            -L. -lsubstrate \
             -fobjc-arc \
             Tweak/AutoIPLocHook.m \
             -o deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
@@ -50,7 +68,7 @@ jobs:
           cp Tweak/AutoIPLocHook.plist deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
 
           INSTALLED_SIZE=$(du -sk deb_pkg/var | cut -f1)
-          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 2.0.3\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Erase simulation flag, force Apple International Maps & inject Wi-Fi SSID\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
+          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 2.3.1\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Final stable RootHide arm64e hook with ipinfo/ATS & date/timezone sync\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
 
           chmod 0755 deb_pkg/DEBIAN
           chmod 0644 deb_pkg/DEBIAN/control
