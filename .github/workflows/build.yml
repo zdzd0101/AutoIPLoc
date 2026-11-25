@@ -68,7 +68,7 @@ jobs:
           cp Tweak/AutoIPLocHook.plist deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
 
           INSTALLED_SIZE=$(du -sk deb_pkg/var | cut -f1)
-          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 2.4.2\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Safe app-whitelisted RootHide arm64e hook with LTE baseband, US Wi-Fi AP & proxy/NIC hiding\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
+          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 2.4.3\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Safe app-whitelisted RootHide arm64e hook with LTE baseband, US Wi-Fi AP & proxy/NIC hiding\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
 
           chmod 0755 deb_pkg/DEBIAN
           chmod 0644 deb_pkg/DEBIAN/control
