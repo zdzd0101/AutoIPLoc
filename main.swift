@@ -21,6 +21,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     static let shared = LocationEngine()
 
     @Published var isSimulating = false
+    @Published var isSyncing = false
     @Published var statusError: String? = nil
     @Published var exitIP = "未获取 [--]"
     @Published var timezoneName = "- (待同步)"
@@ -37,7 +38,6 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     private let pathMonitor = NWPathMonitor()
     private let monitorQueue = DispatchQueue(label: "com.autoiploc.netmonitor")
     private var lastPathStatus: NWPath.Status?
-    private var isFetching = false
     private var lockedProfile: GeoProfile?
 
     override init() {
@@ -95,61 +95,68 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     }
 
     func syncEnvironment(forceReanchor: Bool = true) {
-        guard !isFetching else { return }
-        isFetching = true
+        guard !isSyncing else { return }
+        isSyncing = true
         statusError = nil
 
         let endpoints = [
             "http://ip-api.com/json/?fields=status,countryCode,regionName,city,zip,lat,lon,timezone,isp,query",
-            "https://freeipapi.com/api/json",
-            "https://api.ipapi.is/",
             "https://ipwho.is/",
-            "https://ipinfo.io/json",
-            "https://api.ipify.org?format=json"
+            "https://freeipapi.com/api/json",
+            "https://ipinfo.io/json"
         ]
 
-        probeSequential(urls: endpoints, index: 0, forceReanchor: forceReanchor, lastErr: "")
-    }
+        let lock = NSLock()
+        var settled = false
+        var completedCount = 0
+        var lastErrorMsg = "超时"
 
-    private func probeSequential(urls: [String], index: Int, forceReanchor: Bool, lastErr: String) {
-        guard index < urls.count else {
-            DispatchQueue.main.async {
-                self.isFetching = false
-                self.statusError = "当前节点无法连接 IP 探测接口（\(lastErr)），请切换节点后重试。"
-            }
-            return
-        }
+        for urlStr in endpoints {
+            guard let url = URL(string: urlStr) else { continue }
+            var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 6.0)
+            req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 16_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.2 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
+            req.setValue("application/json", forHTTPHeaderField: "Accept")
 
-        guard let url = URL(string: urls[index]) else {
-            probeSequential(urls: urls, index: index + 1, forceReanchor: forceReanchor, lastErr: lastErr)
-            return
-        }
+            URLSession.shared.dataTask(with: req) { [weak self] data, response, error in
+                guard let self = self else { return }
 
-        let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 6.0
-        config.timeoutIntervalForResource = 8.0
-        config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        config.httpAdditionalHeaders = [
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.2 Mobile/15E148 Safari/604.1",
-            "Accept": "application/json",
-            "Connection": "close"
-        ]
-
-        let session = URLSession(configuration: config)
-        session.dataTask(with: url) { [weak self] data, response, error in
-            guard let self = self else { return }
-            defer { session.finishTasksAndInvalidate() }
-
-            if let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
-               let data = data, let parsed = self.parseGeoJSON(data: data) {
-                DispatchQueue.main.async {
-                    self.applyDetectedProfile(parsed, forceReanchor: forceReanchor)
+                var parsedProfile: GeoProfile? = nil
+                if let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
+                   let data = data {
+                    parsedProfile = self.parseGeoJSON(data: data)
                 }
-            } else {
+
+                lock.lock()
+                if settled {
+                    lock.unlock()
+                    return
+                }
+                if let valid = parsedProfile {
+                    settled = true
+                    lock.unlock()
+                    DispatchQueue.main.async {
+                        self.applyDetectedProfile(valid, forceReanchor: forceReanchor)
+                    }
+                    return
+                }
+
+                completedCount += 1
                 let code = (response as? HTTPURLResponse)?.statusCode ?? (error as NSError?)?.code ?? -1
-                self.probeSequential(urls: urls, index: index + 1, forceReanchor: forceReanchor, lastErr: "code:\(code)")
-            }
-        }.resume()
+                lastErrorMsg = "code:\(code)"
+                let allFailed = (completedCount >= endpoints.count)
+                if allFailed {
+                    settled = true
+                }
+                lock.unlock()
+
+                if allFailed {
+                    DispatchQueue.main.async {
+                        self.isSyncing = false
+                        self.statusError = "当前节点无法连接 IP 探测接口（\(lastErrorMsg)），请切换节点后重试。"
+                    }
+                }
+            }.resume()
+        }
     }
 
     private func parseGeoJSON(data: Data) -> GeoProfile? {
@@ -166,28 +173,22 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         let cc = ((json["countryCode"] as? String)
             ?? (json["country_code"] as? String)
             ?? (json["country"] as? String)
-            ?? ((json["location"] as? [String: Any])?["country_code"] as? String)
             ?? "US").uppercased()
         if cc == "CN" || cc == "HK" || cc == "MO" { return nil }
 
-        let locObj = json["location"] as? [String: Any]
         let region = (json["regionName"] as? String)
             ?? (json["region"] as? String)
-            ?? (locObj?["state"] as? String)
             ?? ""
         let city = (json["city"] as? String)
             ?? (json["cityName"] as? String)
-            ?? (locObj?["city"] as? String)
             ?? ""
         let isp = (json["isp"] as? String)
             ?? ((json["connection"] as? [String: Any])?["isp"] as? String)
-            ?? ((json["asn"] as? [String: Any])?["org"] as? String)
             ?? (json["org"] as? String)
             ?? "Residential Broadband"
         let zip = (json["zip"] as? String)
             ?? (json["postal"] as? String)
             ?? (json["zipCode"] as? String)
-            ?? (locObj?["zip"] as? String)
             ?? ""
 
         var tz = "America/New_York"
@@ -195,19 +196,15 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             tz = tzId
         } else if let tzStr = json["timezone"] as? String, !tzStr.isEmpty {
             tz = tzStr
-        } else if let locTz = locObj?["timezone"] as? String, !locTz.isEmpty {
-            tz = locTz
         } else if let tzArr = json["timeZones"] as? [String], let firstTz = tzArr.first, !firstTz.isEmpty {
             tz = firstTz
         }
 
         var lat = (json["lat"] as? Double)
             ?? (json["latitude"] as? Double)
-            ?? (locObj?["latitude"] as? Double)
             ?? 0.0
         var lon = (json["lon"] as? Double)
             ?? (json["longitude"] as? Double)
-            ?? (locObj?["longitude"] as? Double)
             ?? 0.0
         if (lat == 0.0 || lon == 0.0), let locStr = json["loc"] as? String {
             let parts = locStr.split(separator: ",")
@@ -232,7 +229,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         if lockSessionGeo, isSimulating, let locked = lockedProfile,
            locked.countryCode == raw.countryCode, locked.timezone == raw.timezone, !forceReanchor {
             self.exitIP = "\(raw.ip) [\(raw.countryCode)]"
-            self.isFetching = false
+            self.isSyncing = false
             return
         }
 
@@ -243,50 +240,37 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         let fallbackStreet = "\(Int.random(in: 112...4890)) Oakridge Ave, \(raw.city.isEmpty ? "Austin" : raw.city), \(raw.region.isEmpty ? "TX" : raw.region)"
         let fallbackZip = raw.zip.isEmpty ? String(Int.random(in: 10001...98199)) : raw.zip
 
+        let finalized = GeoProfile(
+            ip: raw.ip, countryCode: raw.countryCode, region: raw.region,
+            city: raw.city, timezone: raw.timezone,
+            latitude: jitterLat, longitude: jitterLon,
+            street: fallbackStreet, zip: fallbackZip, isp: raw.isp
+        )
+        self.commitSimulation(finalized)
+
         CLGeocoder().reverseGeocodeLocation(loc) { [weak self] placemarks, _ in
-            guard let self = self else { return }
-            var finalStreet = fallbackStreet
-            var finalZip = fallbackZip
-
-            if let pm = placemarks?.first {
-                let num = pm.subThoroughfare ?? "\(Int.random(in: 105...3980))"
-                let road = pm.thoroughfare ?? "Maple Creek Dr"
-                let c = pm.locality ?? (raw.city.isEmpty ? "Dallas" : raw.city)
-                let st = pm.administrativeArea ?? (raw.region.isEmpty ? "TX" : raw.region)
-                finalStreet = "\(num) \(road), \(c), \(st)"
-                if let pZip = pm.postalCode, !pZip.isEmpty {
-                    finalZip = pZip
-                }
-            }
-
-            let finalized = GeoProfile(
-                ip: raw.ip, countryCode: raw.countryCode, region: raw.region,
-                city: raw.city, timezone: raw.timezone,
-                latitude: jitterLat, longitude: jitterLon,
-                street: finalStreet, zip: finalZip, isp: raw.isp
-            )
+            guard let self = self, let pm = placemarks?.first else { return }
+            let num = pm.subThoroughfare ?? "\(Int.random(in: 105...3980))"
+            let road = pm.thoroughfare ?? "Maple Creek Dr"
+            let c = pm.locality ?? (raw.city.isEmpty ? "Dallas" : raw.city)
+            let st = pm.administrativeArea ?? (raw.region.isEmpty ? "TX" : raw.region)
+            let resolvedStreet = "\(num) \(road), \(c), \(st)"
+            let resolvedZip = (pm.postalCode?.isEmpty == false) ? pm.postalCode! : fallbackZip
 
             DispatchQueue.main.async {
-                self.commitSimulation(finalized)
+                self.streetAddress = resolvedStreet
+                self.zipCode = resolvedZip
+                if var current = self.lockedProfile {
+                    current.street = resolvedStreet
+                    current.zip = resolvedZip
+                    self.lockedProfile = current
+                    self.writeGeoPlist(current)
+                }
             }
         }
     }
 
-    private func commitSimulation(_ profile: GeoProfile) {
-        self.lockedProfile = profile
-        self.isSimulating = true
-        self.isFetching = false
-        self.statusError = nil
-        self.exitIP = "\(profile.ip) [\(profile.countryCode)]"
-        self.timezoneName = profile.timezone
-        self.coordText = String(format: "%.5f, %.5f", profile.latitude, profile.longitude)
-        self.streetAddress = profile.street
-        self.zipCode = profile.zip
-
-        if self.wifiList.isEmpty {
-            regenerateWiFiList(save: false)
-        }
-
+    private func writeGeoPlist(_ profile: GeoProfile) {
         let geoDict: [String: Any] = [
             "enabled": true,
             "ip": profile.ip,
@@ -301,6 +285,24 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             "isp": profile.isp
         ]
         (geoDict as NSDictionary).write(toFile: geoPlistPath, atomically: true)
+    }
+
+    private func commitSimulation(_ profile: GeoProfile) {
+        self.lockedProfile = profile
+        self.isSimulating = true
+        self.isSyncing = false
+        self.statusError = nil
+        self.exitIP = "\(profile.ip) [\(profile.countryCode)]"
+        self.timezoneName = profile.timezone
+        self.coordText = String(format: "%.5f, %.5f", profile.latitude, profile.longitude)
+        self.streetAddress = profile.street
+        self.zipCode = profile.zip
+
+        if self.wifiList.isEmpty {
+            regenerateWiFiList(save: false)
+        }
+
+        writeGeoPlist(profile)
         saveWiFiPlist(enabled: true)
 
         let simLocation = CLLocation(
@@ -450,14 +452,21 @@ struct ContentView: View {
                     .cornerRadius(14)
 
                     Button(action: { engine.syncEnvironment(forceReanchor: true) }) {
-                        Text("立即同步当前 IP 定位与全局环境")
-                            .font(.headline)
-                            .foregroundColor(.white)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 14)
-                            .background(Color.blue)
-                            .cornerRadius(12)
+                        HStack(spacing: 8) {
+                            if engine.isSyncing {
+                                ProgressView()
+                                    .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                            }
+                            Text(engine.isSyncing ? "正在探测当前美国出口 IP..." : "立即同步当前 IP 定位与全局环境")
+                                .font(.headline)
+                        }
+                        .foregroundColor(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .background(engine.isSyncing ? Color.blue.opacity(0.75) : Color.blue)
+                        .cornerRadius(12)
                     }
+                    .disabled(engine.isSyncing)
 
                     Button(action: { engine.resetAppleMapsCache() }) {
                         Text("重置并恢复苹果国际原生地图（清除高德缓存）")
