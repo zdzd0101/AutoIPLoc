@@ -22,7 +22,6 @@ static MSHookMessageEx_t g_MSHookMessageEx = NULL;
 static NSString *const kGeoPrefPath = @"/var/mobile/Library/Preferences/com.autoiploc.geo.plist";
 static NSString *const kWifiPrefPath = @"/var/mobile/Library/Preferences/com.autoiploc.wifi.plist";
 
-// 关键修复：从当前动态库自身的磁盘路径反推出 RootHide 的随机 .jbroot 目录，直接加载 libellekit.dylib
 static void ResolveElleKitFromSelfPath(void *selfSymbolAddr) {
     g_MSHookFunction = (MSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
     g_MSHookMessageEx = (MSHookMessageEx_t)dlsym(RTLD_DEFAULT, "MSHookMessageEx");
@@ -106,7 +105,6 @@ static NSString *GetTargetTimeZoneName(void) {
     return nil;
 }
 
-// 1. 彻底抹除内存中所有插件与 RootHide 底座动态库路径特征（消除 [功能插件注入] 与 [RootHide底座]）
 static BOOL IsSensitiveDylibPath(const char *path) {
     if (!path) return NO;
     return (strstr(path, "DynamicLibraries") != NULL ||
@@ -146,7 +144,6 @@ static int hook_dladdr(const void *addr, Dl_info *info) {
     return ret;
 }
 
-// 2. 接管 NSTimeZone 与 CFTimeZone
 static NSTimeZone *(*orig_systemTimeZone)(id self, SEL _cmd);
 static NSTimeZone *hook_systemTimeZone(id self, SEL _cmd) {
     NSString *tzName = GetTargetTimeZoneName();
@@ -187,7 +184,6 @@ static CFTimeZoneRef hook_CFTimeZoneCopySystem(void) {
     return orig_CFTimeZoneCopySystem ? orig_CFTimeZoneCopySystem() : CFTimeZoneCopySystem();
 }
 
-// 3. 补全双卡槽基带与蜂窝网络特征（统一修正为美国 T-Mobile 310/260 LTE，消除 [基带特征]）
 static NSString *(*orig_carrierName)(id self, SEL _cmd);
 static NSString *hook_carrierName(id self, SEL _cmd) {
     NSString *orig = orig_carrierName ? orig_carrierName(self, _cmd) : nil;
@@ -245,7 +241,6 @@ static BOOL hook_returnYES(id self, SEL _cmd) {
     return YES;
 }
 
-// 4. 隐藏系统 HTTP/HTTPS/SOCKS5/PAC 显式代理（仅对系统底层网络库放行联网）
 static BOOL IsSystemNetworkingCaller(void *retAddr) {
     if (!retAddr) return NO;
     Dl_info info;
@@ -296,7 +291,6 @@ static NSDictionary *hook_connectionProxyDictionary(id self, SEL _cmd) {
     return @{};
 }
 
-// 5. 过滤 Shadowrocket 产生的 utun / ipsec / ppp 虚拟隧道网卡
 static BOOL IsVirtualVPNInterface(const char *ifname) {
     if (!ifname) return NO;
     return (strncmp(ifname, "utun", 4) == 0 ||
@@ -327,7 +321,6 @@ static int hook_getifaddrs(struct ifaddrs **ifap) {
     return ret;
 }
 
-// 6. 屏蔽工具类 URL Scheme 暴露 (apple-magnifier://, sileo://, zbra:// 等)
 static BOOL IsBlockedURLScheme(NSString *scheme) {
     if (scheme.length == 0) return NO;
     NSSet *blocked = [NSSet setWithArray:@[
@@ -362,7 +355,6 @@ static NSURL *hook_urlOverride(id self, SEL _cmd, NSURL *url) {
     return orig_urlOverride ? orig_urlOverride(self, _cmd, url) : nil;
 }
 
-// 7. 彻底抹除软件模拟定位标记 (isSimulatedBySoftware = NO) 与锁定国际地图国家码
 static BOOL hook_returnNO(id self, SEL _cmd) {
     return NO;
 }
@@ -393,7 +385,6 @@ static NSString *hook_targetCountryCode(id self, SEL _cmd) {
     return GetTargetCountryCode();
 }
 
-// 8. 注入当前关联 US Wi-Fi（主热点 + 周边热点）
 static NSArray<NSDictionary *> *GetMockWiFiList(void) {
     NSDictionary *wifiCfg = [NSDictionary dictionaryWithContentsOfFile:kWifiPrefPath];
     if ([wifiCfg[@"enabled"] boolValue]) {
@@ -439,7 +430,6 @@ static CFDictionaryRef hook_CNCopyCurrentNetworkInfo(CFStringRef interfaceName) 
 __attribute__((constructor))
 static void AutoIPLocHookEntry(void) {
     @autoreleasepool {
-        // 第一道防线：按内核进程名精确跳过系统桌面、守护进程与控制工具，100% 杜绝黑屏
         const char *prog = getprogname();
         if (!prog) return;
         if (strcmp(prog, "SpringBoard") == 0 ||
@@ -454,19 +444,16 @@ static void AutoIPLocHookEntry(void) {
             return;
         }
 
-        // 第二道防线：仅在包含 .app/ 的前台应用包中执行
         char execBuf[1024] = {0};
         uint32_t execSize = sizeof(execBuf);
         if (_NSGetExecutablePath(execBuf, &execSize) != 0) return;
         if (strstr(execBuf, ".app/") == NULL) return;
 
-        // 显式加载目标系统框架并提取 ElleKit 底层符号
         dlopen("/System/Library/Frameworks/CoreLocation.framework/CoreLocation", RTLD_NOW);
         dlopen("/System/Library/Frameworks/CoreTelephony.framework/CoreTelephony", RTLD_NOW);
         dlopen("/System/Library/PrivateFrameworks/GeoServices.framework/GeoServices", RTLD_NOW);
         ResolveElleKitFromSelfPath((void *)&AutoIPLocHookEntry);
 
-        // A. 接管时区
         NSString *initTZ = GetTargetTimeZoneName();
         if (initTZ) {
             setenv("TZ", initTZ.UTF8String, 1);
@@ -480,7 +467,6 @@ static void AutoIPLocHookEntry(void) {
             SafeHookObjC(tzMeta, @selector(localTimeZone), (IMP)hook_localTimeZone, (IMP *)&orig_localTimeZone);
         }
 
-        // B. 拦截 URL Scheme 暴露
         Class appCls = objc_getClass("UIApplication");
         if (appCls) {
             SafeHookObjC(appCls, @selector(canOpenURL:), (IMP)hook_canOpenURL, (IMP *)&orig_canOpenURL);
@@ -492,13 +478,11 @@ static void AutoIPLocHookEntry(void) {
             SafeHookObjC(wsCls, NSSelectorFromString(@"URLOverrideForURL:"), (IMP)hook_urlOverride, (IMP *)&orig_urlOverride);
         }
 
-        // C. 隐藏 NSURLSessionConfiguration 代理字典
         Class sessionCfgCls = objc_getClass("NSURLSessionConfiguration");
         if (sessionCfgCls) {
             SafeHookObjC(sessionCfgCls, @selector(connectionProxyDictionary), (IMP)hook_connectionProxyDictionary, (IMP *)&orig_connectionProxyDictionary);
         }
 
-        // D. 补全双卡槽基带与蜂窝运营商参数
         Class carrierCls = objc_getClass("CTCarrier");
         if (carrierCls) {
             SafeHookObjC(carrierCls, NSSelectorFromString(@"carrierName"), (IMP)hook_carrierName, (IMP *)&orig_carrierName);
@@ -513,7 +497,6 @@ static void AutoIPLocHookEntry(void) {
             SafeHookObjC(netInfoCls, NSSelectorFromString(@"currentRadioAccessTechnology"), (IMP)hook_currentRadioTech, (IMP *)&orig_currentRadioTech);
         }
 
-        // E. 彻底抹除模拟定位标记 (isSimulatedBySoftware = NO)
         Class srcInfoCls = objc_getClass("CLLocationSourceInformation");
         if (srcInfoCls) {
             SafeHookObjC(srcInfoCls, NSSelectorFromString(@"isSimulatedBySoftware"), (IMP)hook_returnNO, NULL);
@@ -527,7 +510,6 @@ static void AutoIPLocHookEntry(void) {
             SafeHookObjC(locCls, NSSelectorFromString(@"sourceInformation"), (IMP)hook_sourceInformation, (IMP *)&orig_sourceInformation);
         }
 
-        // F. 锁定国际地图国家码，阻断高德切换
         Class geoCls = objc_getClass("GEOCountryConfiguration");
         if (geoCls) {
             NSArray *sels = @[@"countryCode", @"_countryCode", @"currentCountryCode", @"sourceCountryCode"];
@@ -540,7 +522,6 @@ static void AutoIPLocHookEntry(void) {
             SafeHookObjC(platformCls, NSSelectorFromString(@"isChina"), (IMP)hook_returnNO, NULL);
         }
 
-        // G. 接管系统底层 C 函数（100% 由 ElleKit 执行）
         if (g_MSHookFunction) {
             g_MSHookFunction((void *)_dyld_get_image_name, (void *)hook_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
             g_MSHookFunction((void *)dladdr, (void *)hook_dladdr, (void **)&orig_dladdr);
