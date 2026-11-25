@@ -103,8 +103,15 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             "http://ip-api.com/json/?fields=status,countryCode,regionName,city,zip,lat,lon,timezone,isp,query",
             "https://ipwho.is/",
             "https://freeipapi.com/api/json",
-            "https://ipinfo.io/json"
+            "https://ipinfo.io/json",
+            "https://api.ip.sb/geoip"
         ]
+
+        let cfg = URLSessionConfiguration.default
+        cfg.timeoutIntervalForRequest = 15.0
+        cfg.timeoutIntervalForResource = 20.0
+        cfg.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        let session = URLSession(configuration: cfg)
 
         let lock = NSLock()
         var settled = false
@@ -113,11 +120,11 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
 
         for urlStr in endpoints {
             guard let url = URL(string: urlStr) else { continue }
-            var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 6.0)
+            var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 15.0)
             req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 16_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.2 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
             req.setValue("application/json", forHTTPHeaderField: "Accept")
 
-            URLSession.shared.dataTask(with: req) { [weak self] data, response, error in
+            session.dataTask(with: req) { [weak self] data, response, error in
                 guard let self = self else { return }
 
                 var parsedProfile: GeoProfile? = nil
@@ -134,6 +141,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
                 if let valid = parsedProfile {
                     settled = true
                     lock.unlock()
+                    session.invalidateAndCancel()
                     DispatchQueue.main.async {
                         self.applyDetectedProfile(valid, forceReanchor: forceReanchor)
                     }
@@ -150,6 +158,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
                 lock.unlock()
 
                 if allFailed {
+                    session.finishTasksAndInvalidate()
                     DispatchQueue.main.async {
                         self.isSyncing = false
                         self.statusError = "当前节点无法连接 IP 探测接口（\(lastErrorMsg)），请切换节点后重试。"
