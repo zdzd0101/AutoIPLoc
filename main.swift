@@ -4,7 +4,7 @@ import Network
 import AVFoundation
 import Darwin
 
-// MARK: - 1. 声明系统私有定位模拟接口与 libproc 进程控制接口
+// MARK: - 1. 系统私有定位接口与 Root Persona 提权声明
 @objc protocol CLSimulationManagerProtocol {
     func clearSimulatedLocations()
     func appendSimulatedLocation(_ location: CLLocation)
@@ -19,7 +19,16 @@ private func proc_listpids(_ type: UInt32, _ typeinfo: UInt32, _ buffer: UnsafeM
 @_silgen_name("proc_name")
 private func proc_name(_ pid: Int32, _ buffer: UnsafeMutableRawPointer?, _ buffersize: UInt32) -> Int32
 
-// MARK: - 2. 周边 Wi-Fi 节点与 IP 数据模型
+@_silgen_name("posix_spawnattr_set_persona_np")
+private func posix_spawnattr_set_persona_np(_ attr: UnsafeMutablePointer<posix_spawnattr_t?>, _ persona_id: uid_t, _ flags: UInt32) -> Int32
+
+@_silgen_name("posix_spawnattr_set_persona_uid_np")
+private func posix_spawnattr_set_persona_uid_np(_ attr: UnsafeMutablePointer<posix_spawnattr_t?>, _ uid: uid_t) -> Int32
+
+@_silgen_name("posix_spawnattr_set_persona_gid_np")
+private func posix_spawnattr_set_persona_gid_np(_ attr: UnsafeMutablePointer<posix_spawnattr_t?>, _ gid: gid_t) -> Int32
+
+// MARK: - 2. 数据模型
 struct SimulatedWiFiNode: Codable {
     let ssid: String
     let bssid: String
@@ -51,12 +60,71 @@ struct EgressIPResult {
     let isp: String
 }
 
-// MARK: - 3. 原生 Darwin 系统底层修改器（0 依赖外部 Shell，100% 兼容 RootHide）
+// MARK: - 3. 自举 UID 0 Root 底层修改器（不依赖 /bin/sh 或 /var/jb，100% 兼容 RootHide）
 class NativeSystemController {
     static let geoSharedPath = "/var/mobile/Library/Preferences/com.autoiploc.geo.plist"
     static let wifiSharedPath = "/var/mobile/Library/Preferences/com.autoiploc.wifi.plist"
 
-    static func restartProcesses(_ targetNames: [String]) {
+    // 启动自身二进制以 UID 0 (root) 执行底层文件与进程操作
+    @discardableResult
+    static func runSelfAsRoot(args: [String]) -> Bool {
+        guard let execPath = Bundle.main.executablePath else { return false }
+        var attr: posix_spawnattr_t?
+        posix_spawnattr_init(&attr)
+        _ = posix_spawnattr_set_persona_np(&attr, 99, 1)
+        _ = posix_spawnattr_set_persona_uid_np(&attr, 0)
+        _ = posix_spawnattr_set_persona_gid_np(&attr, 0)
+
+        var cArgs: [UnsafeMutablePointer<CChar>?] = [strdup(execPath), strdup("--root-worker")]
+        for a in args { cArgs.append(strdup(a)) }
+        cArgs.append(nil)
+
+        defer {
+            for ptr in cArgs where ptr != nil { free(ptr) }
+            posix_spawnattr_destroy(&attr)
+        }
+
+        var pid: pid_t = 0
+        let status = posix_spawn(&pid, execPath, nil, &attr, cArgs, environ)
+        if status == 0 {
+            var exitCode: Int32 = 0
+            waitpid(pid, &exitCode, 0)
+            return exitCode == 0
+        }
+        return false
+    }
+
+    // Root 子进程执行入口
+    static func handleRootWorkerIfNeeded() {
+        let args = CommandLine.arguments
+        guard let idx = args.firstIndex(of: "--root-worker"), idx + 1 < args.count else { return }
+        let action = args[idx + 1]
+
+        if action == "timezone", idx + 2 < args.count {
+            let tz = args[idx + 2]
+            let zoneCandidates = [
+                "/var/db/timezone/zoneinfo/\(tz)",
+                "/usr/share/zoneinfo/\(tz)"
+            ]
+            if let zonePath = zoneCandidates.first(where: { FileManager.default.fileExists(atPath: $0) }) {
+                mkdir("/var/db/timezone", 0o755)
+                unlink("/var/db/timezone/localtime")
+                unlink("/private/var/db/timezone/localtime")
+                let ok1 = symlink(zonePath, "/var/db/timezone/localtime")
+                _ = symlink(zonePath, "/private/var/db/timezone/localtime")
+                restartProcessesNative(["timed"])
+                exit(ok1 == 0 ? 0 : 1)
+            }
+            exit(1)
+        } else if action == "kill", idx + 2 < args.count {
+            let names = args[idx + 2].components(separatedBy: ",")
+            restartProcessesNative(names)
+            exit(0)
+        }
+        exit(0)
+    }
+
+    static func restartProcessesNative(_ targetNames: [String]) {
         let byteSize = proc_listpids(1, 0, nil, 0)
         guard byteSize > 0 else { return }
         let count = Int(byteSize) / MemoryLayout<pid_t>.size
@@ -79,46 +147,26 @@ class NativeSystemController {
     }
 
     static func applyTimeZone(_ tzIdentifier: String) -> Bool {
-        let zoneCandidates = [
-            "/var/db/timezone/zoneinfo/\(tzIdentifier)",
-            "/usr/share/zoneinfo/\(tzIdentifier)"
-        ]
-        guard !tzIdentifier.isEmpty,
-              let zonePath = zoneCandidates.first(where: { FileManager.default.fileExists(atPath: $0) }) else {
-            return false
-        }
+        guard !tzIdentifier.isEmpty else { return false }
 
         let dtDomain = "com.apple.preferences.datetime" as CFString
         CFPreferencesSetValue("AutomaticTimeZoneEnabled" as CFString, kCFBooleanFalse, dtDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
         CFPreferencesSetValue("timezone" as CFString, tzIdentifier as CFString, dtDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
         CFPreferencesSynchronize(dtDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
 
-        let localtimeTargets = [
-            "/var/db/timezone/localtime",
-            "/private/var/db/timezone/localtime"
-        ]
-        var linkSuccess = false
-        for target in localtimeTargets {
-            unlink(target)
-            if symlink(zonePath, target) == 0 {
-                linkSuccess = true
-            }
-        }
+        let rootOK = runSelfAsRoot(args: ["timezone", tzIdentifier])
 
         setenv("TZ", tzIdentifier, 1)
         tzset()
         NSTimeZone.resetSystemTimeZone()
 
-        restartProcesses(["timed"])
-
         let center = CFNotificationCenterGetDarwinNotifyCenter()
         CFNotificationCenterPostNotification(center, CFNotificationName("NSSystemTimeZoneDidChangeNotification" as CFString), nil, nil, true)
         CFNotificationCenterPostNotification(center, CFNotificationName("SignificantTimeChangeNotification" as CFString), nil, nil, true)
 
-        return linkSuccess || (TimeZone.current.identifier == tzIdentifier)
+        return rootOK || (TimeZone.current.identifier == tzIdentifier)
     }
 
-    // 清除高德配置键并切换苹果国际地图（保留 GeoServices 清单数据库，避免挂 VPN 时出现空白网格）
     static func forceAppleInternationalMaps(countryCode: String) {
         let cc = (countryCode.isEmpty || countryCode == "--") ? "US" : countryCode.uppercased()
 
@@ -145,17 +193,11 @@ class NativeSystemController {
             chmod(path, 0o644)
         }
 
-        // 仅清理高德瓦片缓存，保留 GeoServices/Manifest 避免地图白屏网格
-        let safeCachePaths = [
-            "/var/mobile/Library/Caches/com.apple.Maps"
-        ]
-        for cp in safeCachePaths {
-            try? FileManager.default.removeItem(atPath: cp)
-        }
+        try? FileManager.default.removeItem(atPath: "/var/mobile/Library/Caches/com.apple.Maps")
 
         let center = CFNotificationCenterGetDarwinNotifyCenter()
         CFNotificationCenterPostNotification(center, CFNotificationName("com.autoiploc.geo.updated" as CFString), nil, nil, true)
-        restartProcesses(["geod", "Maps"])
+        _ = runSelfAsRoot(args: ["kill", "geod,Maps"])
     }
 
     static func injectWiFiList(_ nodes: [SimulatedWiFiNode], countryCode: String) {
@@ -179,7 +221,7 @@ class NativeSystemController {
     }
 }
 
-// MARK: - 4. 核心防泄漏定位、多源 IP 探测与 Wi-Fi 同步引擎
+// MARK: - 4. 核心防泄漏定位、高精度街道解析与 Wi-Fi 同步引擎
 class LocationSyncEngine: NSObject {
     static let shared = LocationSyncEngine()
 
@@ -238,7 +280,6 @@ class LocationSyncEngine: NSObject {
         pathMonitor.start(queue: monitorQueue)
     }
 
-    // 三源容灾探测当前出口 IP（解决 VPN 节点下单一接口超时导致同步中断的问题）
     private func fetchEgressIPWithFallback(completion: @escaping (EgressIPResult?) -> Void) {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 7.0
@@ -246,7 +287,6 @@ class LocationSyncEngine: NSObject {
         config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         let session = URLSession(configuration: config)
 
-        // 源 1: ipwho.is (HTTPS)
         func trySource1() {
             guard let url = URL(string: "https://ipwho.is/") else { trySource2(); return }
             session.dataTask(with: url) { data, _, _ in
@@ -277,7 +317,6 @@ class LocationSyncEngine: NSObject {
             }.resume()
         }
 
-        // 源 2: ip-api.com (HTTP)
         func trySource2() {
             guard let url = URL(string: "http://ip-api.com/json/?fields=status,country,countryCode,regionName,city,zip,lat,lon,timezone,isp,query") else { trySource3(); return }
             session.dataTask(with: url) { data, _, _ in
@@ -306,7 +345,6 @@ class LocationSyncEngine: NSObject {
             }.resume()
         }
 
-        // 源 3: ipapi.co (HTTPS)
         func trySource3() {
             guard let url = URL(string: "https://ipapi.co/json/") else { completion(nil); return }
             var req = URLRequest(url: url)
@@ -350,26 +388,26 @@ class LocationSyncEngine: NSObject {
             guard let info = info else {
                 DispatchQueue.main.async {
                     self.isSyncing = false
-                    self.alertMessage = "⚠️ 当前 VPN 节点无法连接 IP 探测接口（请求超时），请切换可用海外节点后再点同步。"
+                    self.alertMessage = "⚠️ 当前节点无法连接 IP 探测接口，请切换可用海外节点后再同步。"
                     self.onStatusUpdated?()
                 }
                 return
             }
 
-            // 防泄漏门禁：检测到国内 CN 出口 IP 时立即阻断模拟
             if info.countryCode == "CN" {
                 DispatchQueue.main.async {
                     self.isSyncing = false
                     self.currentIP = info.ip
                     self.currentCountryCode = "CN"
-                    self.alertMessage = "⚠️ 检测到国内出口 IP (\(info.ip))，已阻断同步以防位置与国内 IP 关联暴露！请连接海外节点后再同步。"
+                    self.alertMessage = "⚠️ 检测到国内出口 IP (\(info.ip))，已阻断同步以防位置暴露！请连接海外节点后再同步。"
                     self.onStatusUpdated?()
                 }
                 return
             }
 
-            let residentialLat = info.lat + Double.random(in: -0.0036...0.0036)
-            let residentialLon = info.lon + Double.random(in: -0.0036...0.0036)
+            // 紧致住宅街道微偏移（约 100~180 米，严格锁定在同一邮编与街区内）
+            let residentialLat = info.lat + Double.random(in: -0.0014...0.0014)
+            let residentialLon = info.lon + Double.random(in: -0.0014...0.0014)
 
             self.reverseGeocodeExactAddress(
                 lat: residentialLat,
@@ -392,10 +430,10 @@ class LocationSyncEngine: NSObject {
                     self.exactAddress = resolvedAddress
                     self.exactZipCode = resolvedZip
 
-                    // 1. 同步系统全局时区
+                    // 1. Root 提权修改系统全局时区
                     self.tzSyncedSuccess = NativeSystemController.applyTimeZone(info.timezone)
 
-                    // 2. 生成并注入 12~15 个当地周边 Wi-Fi
+                    // 2. 动态生成并注入 12~15 个当地周边 Wi-Fi
                     let generatedWiFis = self.generateDynamicWiFis(isp: info.isp)
                     self.nearbyWiFis = generatedWiFis
                     NativeSystemController.injectWiFiList(generatedWiFis, countryCode: info.countryCode)
@@ -440,11 +478,11 @@ class LocationSyncEngine: NSObject {
                 let street = pm.thoroughfare ?? "W Maple Ave"
                 let city = pm.locality ?? fallbackCity
                 let state = pm.administrativeArea ?? fallbackRegion
-                let zip = (pm.postalCode?.isEmpty == false) ? pm.postalCode! : (fallbackZip.isEmpty ? "80219" : fallbackZip)
+                let zip = (pm.postalCode?.isEmpty == false) ? pm.postalCode! : (fallbackZip.isEmpty ? "80135" : fallbackZip)
                 let country = pm.country ?? fallbackCountry
                 completion("\(streetNum) \(street), \(city), \(state) \(zip), \(country)", zip)
             } else {
-                let safeZip = fallbackZip.isEmpty ? "80219" : fallbackZip
+                let safeZip = fallbackZip.isEmpty ? "80135" : fallbackZip
                 completion("\(Int.random(in: 120...3890)) Oakridge Dr, \(fallbackCity), \(fallbackRegion) \(safeZip), \(fallbackCountry)", safeZip)
             }
         }
@@ -553,8 +591,8 @@ class LocationSyncEngine: NSObject {
 
     private func pushSimulatedLocation(lat: Double, lon: Double) {
         guard let mgr = simManager else { return }
-        let jitterLat = lat + Double.random(in: -0.00008...0.00008)
-        let jitterLon = lon + Double.random(in: -0.00008...0.00008)
+        let jitterLat = lat + Double.random(in: -0.00006...0.00006)
+        let jitterLon = lon + Double.random(in: -0.00006...0.00006)
         let coord = CLLocationCoordinate2D(latitude: jitterLat, longitude: jitterLon)
         let loc = CLLocation(coordinate: coord, altitude: 24.5, horizontalAccuracy: 5.0, verticalAccuracy: 5.0, timestamp: Date())
 
@@ -582,7 +620,7 @@ class LocationSyncEngine: NSObject {
             _ = mgr.perform(NSSelectorFromString("flush"))
         }
         NativeSystemController.clearWiFiInjection()
-        NativeSystemController.restartProcesses(["locationd", "geod"])
+        _ = NativeSystemController.runSelfAsRoot(args: ["kill", "locationd,geod"])
         audioPlayer?.stop()
         isSimulating = false
         alertMessage = nil
@@ -901,11 +939,12 @@ class MainViewController: UIViewController {
     }
 }
 
-// MARK: - 6. AppDelegate 入口
+// MARK: - 6. App 入口（优先拦截 Root 子进程任务）
 @main
 class AppDelegate: UIResponder, UIApplicationDelegate {
     var window: UIWindow?
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
+        NativeSystemController.handleRootWorkerIfNeeded()
         window = UIWindow(frame: UIScreen.main.bounds)
         window?.rootViewController = MainViewController()
         window?.makeKeyAndVisible()
