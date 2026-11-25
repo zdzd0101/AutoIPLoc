@@ -40,10 +40,11 @@ static NSString *GetTargetTimeZoneName(void) {
     return nil;
 }
 
-// 1. 隐藏内存中加载的所有插件与 RootHide 底座动态库特征（消除 [功能插件注入] 与 [RootHide底座]）
+// 1. 抹除内存中加载的所有插件与 RootHide 底座动态库路径特征（消除 [功能插件注入] 与 [RootHide底座]）
 static BOOL IsSensitiveDylibPath(const char *path) {
     if (!path) return NO;
-    return (strstr(path, "AutoIPLocHook") != NULL ||
+    return (strstr(path, "DynamicLibraries") != NULL ||
+            strstr(path, "AutoIPLocHook") != NULL ||
             strstr(path, "ellekit") != NULL ||
             strstr(path, "TweakInject") != NULL ||
             strstr(path, "MobileSubstrate") != NULL ||
@@ -320,8 +321,8 @@ static CFDictionaryRef hook_CNCopyCurrentNetworkInfo(CFStringRef interfaceName) 
     NSArray<NSDictionary *> *nets = GetMockWiFiList();
     if (nets.count > 0) {
         NSDictionary *topAP = nets[0];
-        NSString *ssid = topAP[@"SSID"] ?: @"Johnson_5G";
-        NSString *bssid = topAP[@"BSSID"] ?: @"00:26:F2:CD:D6:55";
+        NSString *ssid = topAP[@"SSID"] ?: @"Xfinity-BA7A-5G";
+        NSString *bssid = topAP[@"BSSID"] ?: @"20:4E:7F:C4:3F:A4";
         NSMutableDictionary *result = [@{
             (__bridge NSString *)kCNNetworkInfoKeySSID: ssid,
             (__bridge NSString *)kCNNetworkInfoKeyBSSID: bssid,
@@ -367,7 +368,7 @@ static void AutoIPLocHookEntry(void) {
         dlopen("/System/Library/Frameworks/CoreTelephony.framework/CoreTelephony", RTLD_NOW);
         dlopen("/System/Library/PrivateFrameworks/GeoServices.framework/GeoServices", RTLD_NOW);
 
-        // A. 使用 MSHookMessageEx 接管时区（兼容 iOS 16 arm64e 共享缓存相对方法表）
+        // A. 接管时区
         NSString *initTZ = GetTargetTimeZoneName();
         if (initTZ) {
             setenv("TZ", initTZ.UTF8String, 1);
