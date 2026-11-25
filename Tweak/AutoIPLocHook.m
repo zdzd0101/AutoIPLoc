@@ -304,8 +304,8 @@ static CFDictionaryRef hook_CNCopyCurrentNetworkInfo(CFStringRef interfaceName) 
     NSArray<NSDictionary *> *nets = GetMockWiFiList();
     if (nets.count > 0) {
         NSDictionary *topAP = nets[0];
-        NSString *ssid = topAP[@"SSID"] ?: @"Xfinity-3C26-5G";
-        NSString *bssid = topAP[@"BSSID"] ?: @"88:DC:96:8A:4D:A8";
+        NSString *ssid = topAP[@"SSID"] ?: @"Miller_Family_5G";
+        NSString *bssid = topAP[@"BSSID"] ?: @"B0:BE:76:93:ED:5D";
         NSMutableDictionary *result = [@{
             (__bridge NSString *)kCNNetworkInfoKeySSID: ssid,
             (__bridge NSString *)kCNNetworkInfoKeyBSSID: bssid,
@@ -325,21 +325,22 @@ static CFDictionaryRef hook_CNCopyCurrentNetworkInfo(CFStringRef interfaceName) 
 __attribute__((constructor))
 static void AutoIPLocHookEntry(void) {
     @autoreleasepool {
-        // 使用内核级主镜像路径判定：100% 匹配用户 App（包括巨魔 App 与 Maps），同时 100% 跳过系统守护进程
-        const char *execPath = _dyld_get_image_name(0);
-        if (!execPath) return;
+        // 使用内核真实可执行路径判定：不受 RootHide 镜像序号偏移影响，100% 匹配用户 App 并跳过系统守护进程
+        char execBuf[1024] = {0};
+        uint32_t execSize = sizeof(execBuf);
+        if (_NSGetExecutablePath(execBuf, &execSize) != 0) return;
 
-        BOOL isUserApp = (strstr(execPath, "/Bundle/Application/") != NULL ||
-                          strstr(execPath, "/Maps.app/") != NULL);
+        BOOL isUserApp = (strstr(execBuf, "/Bundle/Application/") != NULL ||
+                          strstr(execBuf, "/Maps.app/") != NULL);
         if (!isUserApp) return;
 
         // 排除自身控制端与越狱工具 App
-        if (strstr(execPath, "/AutoIPLoc.app/") != NULL ||
-            strstr(execPath, "/Shadowrocket.app/") != NULL ||
-            strstr(execPath, "/Dopamine.app/") != NULL ||
-            strstr(execPath, "/Sileo.app/") != NULL ||
-            strstr(execPath, "/TrollStore.app/") != NULL ||
-            strstr(execPath, "/Filza.app/") != NULL) {
+        if (strstr(execBuf, "/AutoIPLoc.app/") != NULL ||
+            strstr(execBuf, "/Shadowrocket.app/") != NULL ||
+            strstr(execBuf, "/Dopamine.app/") != NULL ||
+            strstr(execBuf, "/Sileo.app/") != NULL ||
+            strstr(execBuf, "/TrollStore.app/") != NULL ||
+            strstr(execBuf, "/Filza.app/") != NULL) {
             return;
         }
 
