@@ -38,7 +38,7 @@ static NSString *GetTargetTimeZoneName(void) {
     return nil;
 }
 
-// 1. 隐藏内存中加载的插件与 RootHide 底座动态库特征（消除 [功能插件注入] 与 [RootHide底座]）
+// 1. 隐藏内存中加载的所有插件与 RootHide 底座动态库特征
 static BOOL IsSensitiveDylibPath(const char *path) {
     if (!path) return NO;
     return (strstr(path, "AutoIPLocHook") != NULL ||
@@ -51,6 +51,7 @@ static BOOL IsSensitiveDylibPath(const char *path) {
             strstr(path, "Crane") != NULL ||
             strstr(path, "AntiLocDetect") != NULL ||
             strstr(path, "Choicy") != NULL ||
+            strstr(path, "Safari18Stealth") != NULL ||
             strstr(path, "amg") != NULL);
 }
 
@@ -104,7 +105,7 @@ static CFTimeZoneRef hook_CFTimeZoneCopySystem(void) {
     return orig_CFTimeZoneCopySystem ? orig_CFTimeZoneCopySystem() : CFTimeZoneCopySystem();
 }
 
-// 3. 补全基带与蜂窝网络特征（飞行模式下依然保持 T-Mobile 310/260 LTE 参数，消除 [基带特征]）
+// 3. 补全基带与蜂窝网络特征（飞行模式下依然保持 T-Mobile 310/260 LTE 参数）
 static NSString *(*orig_carrierName)(id self, SEL _cmd);
 static NSString *hook_carrierName(id self, SEL _cmd) {
     NSString *orig = orig_carrierName ? orig_carrierName(self, _cmd) : nil;
@@ -304,8 +305,8 @@ static CFDictionaryRef hook_CNCopyCurrentNetworkInfo(CFStringRef interfaceName) 
     NSArray<NSDictionary *> *nets = GetMockWiFiList();
     if (nets.count > 0) {
         NSDictionary *topAP = nets[0];
-        NSString *ssid = topAP[@"SSID"] ?: @"GoogleFiber-B2C3";
-        NSString *bssid = topAP[@"BSSID"] ?: @"00:1E:58:EF:67:A6";
+        NSString *ssid = topAP[@"SSID"] ?: @"Johnson_5G";
+        NSString *bssid = topAP[@"BSSID"] ?: @"44:94:FC:CA:B5:BB";
         NSMutableDictionary *result = [@{
             (__bridge NSString *)kCNNetworkInfoKeySSID: ssid,
             (__bridge NSString *)kCNNetworkInfoKeyBSSID: bssid,
@@ -325,14 +326,14 @@ static CFDictionaryRef hook_CNCopyCurrentNetworkInfo(CFStringRef interfaceName) 
 __attribute__((constructor))
 static void AutoIPLocHookEntry(void) {
     @autoreleasepool {
-        // 匹配所有包含 .app/ 的前台应用（含 Sileo/RootHide 安装在 jbroot/Applications/*.app 的 App），100% 跳过系统守护进程
         char execBuf[1024] = {0};
         uint32_t execSize = sizeof(execBuf);
         if (_NSGetExecutablePath(execBuf, &execSize) != 0) return;
 
+        // 匹配所有包含 .app/ 的前台 App（覆盖 jbroot/Applications/*.app 下的 EnvAuditor、CarrierCheck 及商店 App），100% 跳过系统后台守护进程
         if (strstr(execBuf, ".app/") == NULL) return;
 
-        // 排除桌面、控制端与越狱管理 App，杜绝重启黑屏
+        // 严格排除桌面、设置、控制端与越狱工具 App，杜绝重启黑屏
         if (strstr(execBuf, "/SpringBoard.app/") != NULL ||
             strstr(execBuf, "/Preferences.app/") != NULL ||
             strstr(execBuf, "/AutoIPLoc.app/") != NULL ||
