@@ -40,27 +40,15 @@ jobs:
 
           zip -r AutoIPLoc.tipa Payload
 
-          mkdir -p CydiaSubstrate.framework
-          cat << 'EOF' > CydiaSubstrate.framework/CydiaSubstrate.tbd
-          --- !tapi-tbd
-          tbd-version:     4
-          targets:         [ arm64-ios, arm64e-ios ]
-          install-name:    '/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate'
-          exports:
-            - targets:         [ arm64-ios, arm64e-ios ]
-              symbols:         [ _MSHookFunction, _MSHookMessageEx ]
-          ...
-          EOF
-
           mkdir -p deb_pkg/DEBIAN
           mkdir -p deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries
 
           clang -dynamiclib \
-            -arch arm64 -arch arm64e \
+            -arch arm64 \
             -isysroot "$SDK_PATH" \
             -miphoneos-version-min=15.0 \
-            -F. \
-            -framework Foundation -framework UIKit -framework CoreLocation -framework CoreTelephony -framework SystemConfiguration -framework CFNetwork -framework CydiaSubstrate \
+            -install_name /Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib \
+            -framework Foundation -framework UIKit -framework CoreLocation -framework CoreTelephony -framework SystemConfiguration -framework CFNetwork \
             -fobjc-arc \
             Tweak/AutoIPLocHook.m \
             -o deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
@@ -74,10 +62,24 @@ jobs:
           <dict>
               <key>Filter</key>
               <dict>
+                  <key>Mode</key>
+                  <string>Any</string>
                   <key>Bundles</key>
                   <array>
-                      <string>com.apple.UIKit</string>
+                      <string>com.apple.CoreFoundation</string>
                       <string>com.apple.Foundation</string>
+                      <string>com.apple.UIKit</string>
+                      <string>com.local.audit.envauditor</string>
+                      <string>com.local.carriercheck</string>
+                      <string>com.amazon.Amazon</string>
+                      <string>com.squareup.cash</string>
+                      <string>com.fanduel.sportsbook</string>
+                  </array>
+                  <key>Executables</key>
+                  <array>
+                      <string>EnvAuditor</string>
+                      <string>CarrierCheck</string>
+                      <string>Amazon</string>
                   </array>
               </dict>
           </dict>
@@ -85,7 +87,7 @@ jobs:
           EOF
 
           INSTALLED_SIZE=$(du -sk deb_pkg/var | cut -f1)
-          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 2.9.1\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: RootHide var-jb redirected CydiaSubstrate-linked stealth hook with dylib whitelist, dual T-Mobile LTE & GPS scrub\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
+          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 3.0.0\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Zero-dep built-in fishhook + ObjC runtime RootHide stealth hook & 15s residential IP sync\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
 
           chmod 0755 deb_pkg/DEBIAN
           chmod 0644 deb_pkg/DEBIAN/control
