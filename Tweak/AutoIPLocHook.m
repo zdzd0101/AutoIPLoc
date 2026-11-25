@@ -2,18 +2,77 @@
 #import <UIKit/UIKit.h>
 #import <CoreLocation/CoreLocation.h>
 #import <CoreTelephony/CTCarrier.h>
+#import <CoreTelephony/CTTelephonyNetworkInfo.h>
 #import <SystemConfiguration/CaptiveNetwork.h>
 #import <CFNetwork/CFNetwork.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+#import <mach-o/nlist.h>
 #import <ifaddrs.h>
 #import <dlfcn.h>
+#import <sys/stat.h>
+#import <unistd.h>
+#import <errno.h>
 #import <string.h>
 
+#if __has_include(<ptrauth.h>)
+#include <ptrauth.h>
+#endif
+
 extern void MSHookFunction(void *symbol, void *replace, void **result);
+typedef void (*MSHookFunction_t)(void *symbol, void *replace, void **result);
 
 static NSString *const kGeoPrefPath = @"/var/mobile/Library/Preferences/com.autoiploc.geo.plist";
 static NSString *const kWifiPrefPath = @"/var/mobile/Library/Preferences/com.autoiploc.wifi.plist";
+
+// 扫描内存 Mach-O 符号表解析 ElleKit MSHookFunction（支持 arm64e PAC 签名）
+static MSHookFunction_t ResolvePACSafeHookFunction(void) {
+    void *sym = dlsym(RTLD_DEFAULT, "MSHookFunction");
+    if (sym) return (MSHookFunction_t)sym;
+
+    uint32_t imgCount = _dyld_image_count();
+    for (uint32_t i = 1; i < imgCount; i++) {
+        const char *imgPath = _dyld_get_image_name(i);
+        if (!imgPath || strstr(imgPath, "AutoIPLocHook") != NULL) continue;
+
+        const struct mach_header_64 *hdr = (const struct mach_header_64 *)_dyld_get_image_header(i);
+        if (!hdr || hdr->magic != MH_MAGIC_64) continue;
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+
+        struct segment_command_64 *linkedit = NULL;
+        struct symtab_command *symtab_cmd = NULL;
+        uintptr_t cur = (uintptr_t)hdr + sizeof(struct mach_header_64);
+        for (uint32_t j = 0; j < hdr->ncmds; j++) {
+            struct load_command *lc = (struct load_command *)cur;
+            if (lc->cmd == LC_SEGMENT_64) {
+                struct segment_command_64 *seg = (struct segment_command_64 *)lc;
+                if (strcmp(seg->segname, "__LINKEDIT") == 0) linkedit = seg;
+            } else if (lc->cmd == LC_SYMTAB) {
+                symtab_cmd = (struct symtab_command *)lc;
+            }
+            cur += lc->cmdsize;
+        }
+
+        if (!linkedit || !symtab_cmd) continue;
+        uintptr_t linkedit_base = (uintptr_t)slide + linkedit->vmaddr - linkedit->fileoff;
+        struct nlist_64 *syms = (struct nlist_64 *)(linkedit_base + symtab_cmd->symoff);
+        char *strs = (char *)(linkedit_base + symtab_cmd->stroff);
+
+        for (uint32_t k = 0; k < symtab_cmd->nsyms; k++) {
+            if ((syms[k].n_type & N_TYPE) != N_SECT || syms[k].n_value == 0) continue;
+            const char *sname = strs + syms[k].n_un.n_strx;
+            if (strcmp(sname, "_MSHookFunction") == 0) {
+                void *fnPtr = (void *)((uintptr_t)slide + syms[k].n_value);
+#ifdef __arm64e__
+                fnPtr = ptrauth_sign_unauthenticated(fnPtr, ptrauth_key_function_pointer, 0);
+#endif
+                return (MSHookFunction_t)fnPtr;
+            }
+        }
+    }
+    return (MSHookFunction_t)MSHookFunction;
+}
 
 static NSDictionary *LoadGeoConfig(void) {
     return [NSDictionary dictionaryWithContentsOfFile:kGeoPrefPath];
@@ -37,23 +96,83 @@ static NSString *GetTargetTimeZoneName(void) {
     return nil;
 }
 
-// 1. 隐藏内存中加载的插件与 RootHide 引导库镜像名
+// 1. 彻底隐藏所有插件与 RootHide 底座镜像特征（消除 [功能插件注入] 与 [RootHide底座]）
+static BOOL IsSensitiveDylibPath(const char *path) {
+    if (!path) return NO;
+    return (strstr(path, "AutoIPLocHook") != NULL ||
+            strstr(path, "ellekit") != NULL ||
+            strstr(path, "TweakInject") != NULL ||
+            strstr(path, "MobileSubstrate") != NULL ||
+            strstr(path, "roothide") != NULL ||
+            strstr(path, "jbroot") != NULL ||
+            strstr(path, "/var/jb") != NULL ||
+            strstr(path, "Crane") != NULL ||
+            strstr(path, "AntiLocDetect") != NULL ||
+            strstr(path, "amg") != NULL);
+}
+
 static const char *(*orig_dyld_get_image_name)(uint32_t image_index);
 static const char *hook_dyld_get_image_name(uint32_t image_index) {
     const char *name = orig_dyld_get_image_name ? orig_dyld_get_image_name(image_index) : NULL;
-    if (name && (strstr(name, "AutoIPLocHook") != NULL ||
-                 strstr(name, "ellekit") != NULL ||
-                 strstr(name, "TweakInject") != NULL ||
-                 strstr(name, "MobileSubstrate") != NULL ||
-                 strstr(name, "roothide") != NULL ||
-                 strstr(name, "jbroot") != NULL ||
-                 strstr(name, "/var/jb") != NULL)) {
+    if (IsSensitiveDylibPath(name)) {
         return "/usr/lib/libobjc.A.dylib";
     }
     return name;
 }
 
-// 2. 接管 NSTimeZone 与 CFTimeZone
+static int (*orig_dladdr)(const void *addr, Dl_info *info);
+static int hook_dladdr(const void *addr, Dl_info *info) {
+    int res = orig_dladdr ? orig_dladdr(addr, info) : 0;
+    if (res != 0 && info && IsSensitiveDylibPath(info->dli_fname)) {
+        info->dli_fname = "/usr/lib/libobjc.A.dylib";
+        info->dli_sname = "objc_msgSend";
+    }
+    return res;
+}
+
+// 2. 屏蔽文件与目录探测（消除越狱/插件路径检测）
+static BOOL IsRestrictedJailbreakPath(const char *path) {
+    if (!path) return NO;
+    if (strstr(path, "com.autoiploc") != NULL) return NO;
+    return (strstr(path, "/var/jb") != NULL ||
+            strstr(path, "jbroot") != NULL ||
+            strstr(path, "roothide") != NULL ||
+            strstr(path, "ellekit") != NULL ||
+            strstr(path, "MobileSubstrate") != NULL ||
+            strstr(path, "/Applications/Sileo.app") != NULL ||
+            strstr(path, "/Applications/TrollStore.app") != NULL ||
+            strstr(path, "/Applications/Filza.app") != NULL ||
+            strstr(path, "/Applications/Dopamine.app") != NULL);
+}
+
+static int (*orig_access)(const char *path, int amode);
+static int hook_access(const char *path, int amode) {
+    if (IsRestrictedJailbreakPath(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    return orig_access ? orig_access(path, amode) : -1;
+}
+
+static int (*orig_stat)(const char *path, struct stat *buf);
+static int hook_stat(const char *path, struct stat *buf) {
+    if (IsRestrictedJailbreakPath(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    return orig_stat ? orig_stat(path, buf) : -1;
+}
+
+static int (*orig_lstat)(const char *path, struct stat *buf);
+static int hook_lstat(const char *path, struct stat *buf) {
+    if (IsRestrictedJailbreakPath(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    return orig_lstat ? orig_lstat(path, buf) : -1;
+}
+
+// 3. 接管 NSTimeZone 与 CFTimeZone
 static NSTimeZone *(*orig_systemTimeZone)(id self, SEL _cmd);
 static NSTimeZone *hook_systemTimeZone(id self, SEL _cmd) {
     NSString *tzName = GetTargetTimeZoneName();
@@ -61,7 +180,7 @@ static NSTimeZone *hook_systemTimeZone(id self, SEL _cmd) {
         NSTimeZone *tz = [NSTimeZone timeZoneWithName:tzName];
         if (tz) return tz;
     }
-    return orig_systemTimeZone ? orig_systemTimeZone(self, _cmd) : [NSTimeZone timeZoneWithName:@"America/Chicago"];
+    return orig_systemTimeZone ? orig_systemTimeZone(self, _cmd) : [NSTimeZone timeZoneWithName:@"America/New_York"];
 }
 
 static NSTimeZone *(*orig_defaultTimeZone)(id self, SEL _cmd);
@@ -71,7 +190,7 @@ static NSTimeZone *hook_defaultTimeZone(id self, SEL _cmd) {
         NSTimeZone *tz = [NSTimeZone timeZoneWithName:tzName];
         if (tz) return tz;
     }
-    return orig_defaultTimeZone ? orig_defaultTimeZone(self, _cmd) : [NSTimeZone timeZoneWithName:@"America/Chicago"];
+    return orig_defaultTimeZone ? orig_defaultTimeZone(self, _cmd) : [NSTimeZone timeZoneWithName:@"America/New_York"];
 }
 
 static NSTimeZone *(*orig_localTimeZone)(id self, SEL _cmd);
@@ -81,7 +200,7 @@ static NSTimeZone *hook_localTimeZone(id self, SEL _cmd) {
         NSTimeZone *tz = [NSTimeZone timeZoneWithName:tzName];
         if (tz) return tz;
     }
-    return orig_localTimeZone ? orig_localTimeZone(self, _cmd) : [NSTimeZone timeZoneWithName:@"America/Chicago"];
+    return orig_localTimeZone ? orig_localTimeZone(self, _cmd) : [NSTimeZone timeZoneWithName:@"America/New_York"];
 }
 
 static CFTimeZoneRef (*orig_CFTimeZoneCopySystem)(void);
@@ -94,12 +213,30 @@ static CFTimeZoneRef hook_CFTimeZoneCopySystem(void) {
     return orig_CFTimeZoneCopySystem ? orig_CFTimeZoneCopySystem() : CFTimeZoneCopySystem();
 }
 
-// 3. 接管运营商国家码参数
+// 4. 补全基带与蜂窝网络特征（飞行模式下依然输出 T-Mobile LTE 参数，消除 [基带特征] 告警）
+static NSString *(*orig_carrierName)(id self, SEL _cmd);
+static NSString *hook_carrierName(id self, SEL _cmd) {
+    NSString *orig = orig_carrierName ? orig_carrierName(self, _cmd) : nil;
+    if (orig.length == 0 || [orig isEqualToString:@"--"] || [orig isEqualToString:@"Carrier"]) {
+        return @"T-Mobile";
+    }
+    return orig;
+}
+
 static NSString *(*orig_mobileCountryCode)(id self, SEL _cmd);
 static NSString *hook_mobileCountryCode(id self, SEL _cmd) {
     NSString *orig = orig_mobileCountryCode ? orig_mobileCountryCode(self, _cmd) : nil;
-    if (orig == nil || [orig isEqualToString:@"460"] || [orig isEqualToString:@"454"] || [orig isEqualToString:@"455"]) {
+    if (orig.length == 0 || [orig isEqualToString:@"460"] || [orig isEqualToString:@"454"] || [orig isEqualToString:@"455"]) {
         return @"310";
+    }
+    return orig;
+}
+
+static NSString *(*orig_mobileNetworkCode)(id self, SEL _cmd);
+static NSString *hook_mobileNetworkCode(id self, SEL _cmd) {
+    NSString *orig = orig_mobileNetworkCode ? orig_mobileNetworkCode(self, _cmd) : nil;
+    if (orig.length == 0 || [orig isEqualToString:@"65535"]) {
+        return @"260";
     }
     return orig;
 }
@@ -107,17 +244,34 @@ static NSString *hook_mobileCountryCode(id self, SEL _cmd) {
 static NSString *(*orig_isoCountryCode)(id self, SEL _cmd);
 static NSString *hook_isoCountryCode(id self, SEL _cmd) {
     NSString *orig = orig_isoCountryCode ? orig_isoCountryCode(self, _cmd) : nil;
-    if (orig == nil || [orig.lowercaseString isEqualToString:@"cn"] || [orig.lowercaseString isEqualToString:@"hk"] || [orig.lowercaseString isEqualToString:@"mo"]) {
+    if (orig.length == 0 || [orig.lowercaseString isEqualToString:@"cn"] || [orig.lowercaseString isEqualToString:@"hk"] || [orig.lowercaseString isEqualToString:@"mo"]) {
         return GetTargetCountryCode().lowercaseString;
     }
     return orig;
 }
 
-// 4. 隐藏系统 HTTP/HTTPS/SOCKS5/PAC 显式代理（仅放行系统网络框架正常联网）
+static NSDictionary<NSString *, NSString *> *(*orig_serviceRadioTech)(id self, SEL _cmd);
+static NSDictionary<NSString *, NSString *> *hook_serviceRadioTech(id self, SEL _cmd) {
+    NSDictionary<NSString *, NSString *> *orig = orig_serviceRadioTech ? orig_serviceRadioTech(self, _cmd) : nil;
+    if (orig.count > 0) return orig;
+    return @{
+        @"0000000100000001": @"CTRadioAccessTechnologyLTE",
+        @"0000000100000002": @"CTRadioAccessTechnologyLTE"
+    };
+}
+
+static NSString *(*orig_currentRadioTech)(id self, SEL _cmd);
+static NSString *hook_currentRadioTech(id self, SEL _cmd) {
+    NSString *orig = orig_currentRadioTech ? orig_currentRadioTech(self, _cmd) : nil;
+    if (orig.length > 0) return orig;
+    return @"CTRadioAccessTechnologyLTE";
+}
+
+// 5. 隐藏系统 HTTP/HTTPS/SOCKS5/PAC 显式代理（消除 [系统代理] 告警并保持正常联网）
 static BOOL IsSystemNetworkingCaller(void *retAddr) {
     if (!retAddr) return NO;
     Dl_info info;
-    if (dladdr(retAddr, &info) != 0 && info.dli_fname != NULL) {
+    if (orig_dladdr && orig_dladdr(retAddr, &info) != 0 && info.dli_fname != NULL) {
         if (strstr(info.dli_fname, "CFNetwork") != NULL ||
             strstr(info.dli_fname, "WebKit") != NULL ||
             strstr(info.dli_fname, "libnetwork") != NULL ||
@@ -161,7 +315,7 @@ static NSDictionary *hook_connectionProxyDictionary(id self, SEL _cmd) {
     return @{};
 }
 
-// 5. 过滤 Shadowrocket 产生的 utun / ipsec / ppp 虚拟隧道网卡
+// 6. 过滤 Shadowrocket 产生的 utun / ipsec / ppp 虚拟隧道网卡（消除 [VPN网卡] 告警）
 static BOOL IsVirtualVPNInterface(const char *ifname) {
     if (!ifname) return NO;
     return (strncmp(ifname, "utun", 4) == 0 ||
@@ -190,12 +344,13 @@ static int hook_getifaddrs(struct ifaddrs **ifap) {
     return ret;
 }
 
-// 6. 彻底屏蔽 URL Scheme 暴露 (apple-magnifier://, sileo://, zbra:// 等)
+// 7. 彻底屏蔽 URL Scheme 暴露 (apple-magnifier://, sileo://, zbra:// 等)
 static BOOL IsBlockedURLScheme(NSString *scheme) {
     if (scheme.length == 0) return NO;
     NSSet *blocked = [NSSet setWithArray:@[
         @"apple-magnifier", @"sileo", @"zbra", @"cydia",
-        @"filza", @"santander", @"trollstore", @"dopamine", @"roothide"
+        @"filza", @"santander", @"trollstore", @"dopamine", @"roothide",
+        @"shadowrocket", @"quantumult", @"surge", @"loon", @"stash"
     ]];
     return [blocked containsObject:scheme.lowercaseString];
 }
@@ -224,7 +379,7 @@ static NSURL *hook_urlOverride(id self, SEL _cmd, NSURL *url) {
     return orig_urlOverride ? orig_urlOverride(self, _cmd, url) : nil;
 }
 
-// 7. 抹除软件模拟定位标记与强制国际版地图国家码（纯 ObjC 接管，不闪退）
+// 8. 抹除软件模拟定位标记与强制国际版地图国家码
 static BOOL hook_returnNO(id self, SEL _cmd) {
     return NO;
 }
@@ -233,13 +388,13 @@ static NSString *hook_targetCountryCode(id self, SEL _cmd) {
     return GetTargetCountryCode();
 }
 
-// 8. 接管系统 Wi-Fi 信息接口返回模拟美国热点
-static NSDictionary *GetActiveMockWiFi(void) {
+// 9. 将 IP 周边模拟 US Wi-Fi（主热点 + 周边热点特征）直接写入系统网络信息接口
+static NSArray<NSDictionary *> *GetMockWiFiList(void) {
     NSDictionary *wifiCfg = [NSDictionary dictionaryWithContentsOfFile:kWifiPrefPath];
     if ([wifiCfg[@"enabled"] boolValue]) {
         NSArray *nets = wifiCfg[@"networks"];
         if ([nets isKindOfClass:[NSArray class]] && nets.count > 0) {
-            return nets[0];
+            return nets;
         }
     }
     return nil;
@@ -247,7 +402,7 @@ static NSDictionary *GetActiveMockWiFi(void) {
 
 static CFArrayRef (*orig_CNCopySupportedInterfaces)(void);
 static CFArrayRef hook_CNCopySupportedInterfaces(void) {
-    if (GetActiveMockWiFi() != nil) {
+    if (GetMockWiFiList() != nil) {
         return (__bridge_retained CFArrayRef)@[@"en0"];
     }
     return orig_CNCopySupportedInterfaces ? orig_CNCopySupportedInterfaces() : (__bridge_retained CFArrayRef)@[@"en0"];
@@ -255,15 +410,22 @@ static CFArrayRef hook_CNCopySupportedInterfaces(void) {
 
 static CFDictionaryRef (*orig_CNCopyCurrentNetworkInfo)(CFStringRef interfaceName);
 static CFDictionaryRef hook_CNCopyCurrentNetworkInfo(CFStringRef interfaceName) {
-    NSDictionary *topAP = GetActiveMockWiFi();
-    if (topAP != nil) {
-        NSString *ssid = topAP[@"SSID"] ?: @"eero-Home-777";
-        NSString *bssid = topAP[@"BSSID"] ?: @"B0:BE:76:0B:DF:F8";
-        NSDictionary *result = @{
+    NSArray<NSDictionary *> *nets = GetMockWiFiList();
+    if (nets.count > 0) {
+        NSDictionary *topAP = nets[0];
+        NSString *ssid = topAP[@"SSID"] ?: @"ATTP354G7";
+        NSString *bssid = topAP[@"BSSID"] ?: @"3C:37:86:08:4E:D3";
+        NSMutableDictionary *result = [@{
             (__bridge NSString *)kCNNetworkInfoKeySSID: ssid,
             (__bridge NSString *)kCNNetworkInfoKeyBSSID: bssid,
             (__bridge NSString *)kCNNetworkInfoKeySSIDData: [ssid dataUsingEncoding:NSUTF8StringEncoding]
-        };
+        } mutableCopy];
+        if (nets.count > 1) {
+            result[@"NearbyAP1"] = [NSString stringWithFormat:@"%@ (%@)", nets[1][@"SSID"] ?: @"", nets[1][@"BSSID"] ?: @""];
+        }
+        if (nets.count > 2) {
+            result[@"NearbyAP2"] = [NSString stringWithFormat:@"%@ (%@)", nets[2][@"SSID"] ?: @"", nets[2][@"BSSID"] ?: @""];
+        }
         return (__bridge_retained CFDictionaryRef)result;
     }
     return orig_CNCopyCurrentNetworkInfo ? orig_CNCopyCurrentNetworkInfo(interfaceName) : NULL;
@@ -336,18 +498,41 @@ static void AutoIPLocHookEntry(void) {
             }
         }
 
-        // D. 接管运营商国家码参数
+        // D. 补全基带与蜂窝运营商参数（飞行模式下依然保持美国 LTE 基带特征）
         Class carrierCls = objc_getClass("CTCarrier");
         if (carrierCls) {
+            Method mName = class_getInstanceMethod(carrierCls, NSSelectorFromString(@"carrierName"));
+            if (mName) {
+                orig_carrierName = (void *)method_getImplementation(mName);
+                method_setImplementation(mName, (IMP)hook_carrierName);
+            }
             Method mMCC = class_getInstanceMethod(carrierCls, NSSelectorFromString(@"mobileCountryCode"));
             if (mMCC) {
                 orig_mobileCountryCode = (void *)method_getImplementation(mMCC);
                 method_setImplementation(mMCC, (IMP)hook_mobileCountryCode);
             }
+            Method mMNC = class_getInstanceMethod(carrierCls, NSSelectorFromString(@"mobileNetworkCode"));
+            if (mMNC) {
+                orig_mobileNetworkCode = (void *)method_getImplementation(mMNC);
+                method_setImplementation(mMNC, (IMP)hook_mobileNetworkCode);
+            }
             Method mISO = class_getInstanceMethod(carrierCls, NSSelectorFromString(@"isoCountryCode"));
             if (mISO) {
                 orig_isoCountryCode = (void *)method_getImplementation(mISO);
                 method_setImplementation(mISO, (IMP)hook_isoCountryCode);
+            }
+        }
+        Class netInfoCls = objc_getClass("CTTelephonyNetworkInfo");
+        if (netInfoCls) {
+            Method mSvcRadio = class_getInstanceMethod(netInfoCls, NSSelectorFromString(@"serviceCurrentRadioAccessTechnology"));
+            if (mSvcRadio) {
+                orig_serviceRadioTech = (void *)method_getImplementation(mSvcRadio);
+                method_setImplementation(mSvcRadio, (IMP)hook_serviceRadioTech);
+            }
+            Method mCurRadio = class_getInstanceMethod(netInfoCls, NSSelectorFromString(@"currentRadioAccessTechnology"));
+            if (mCurRadio) {
+                orig_currentRadioTech = (void *)method_getImplementation(mCurRadio);
+                method_setImplementation(mCurRadio, (IMP)hook_currentRadioTech);
             }
         }
 
@@ -375,7 +560,7 @@ static void AutoIPLocHookEntry(void) {
             }
         }
 
-        // F. 锁定国际地图国家码，阻断高德切换（保留 updateProvidersForCurrentCountry 正常拉取美国地图瓦片）
+        // F. 锁定国际地图国家码，阻断高德切换
         Class geoCls = objc_getClass("GEOCountryConfiguration");
         if (geoCls) {
             NSArray *sels = @[@"countryCode", @"_countryCode", @"currentCountryCode", @"sourceCountryCode"];
@@ -390,19 +575,26 @@ static void AutoIPLocHookEntry(void) {
             if (mChina) method_setImplementation(mChina, (IMP)hook_returnNO);
         }
 
-        // G. 通过 RootHide Patcher 绑定的 MSHookFunction 接管系统底层 C 函数
-        MSHookFunction((void *)_dyld_get_image_name, (void *)hook_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
+        // G. PAC 安全接管底层 C 函数
+        MSHookFunction_t hookFn = ResolvePACSafeHookFunction();
+        if (hookFn) {
+            hookFn((void *)_dyld_get_image_name, (void *)hook_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
+            hookFn((void *)dladdr, (void *)hook_dladdr, (void **)&orig_dladdr);
+            hookFn((void *)access, (void *)hook_access, (void **)&orig_access);
+            hookFn((void *)stat, (void *)hook_stat, (void **)&orig_stat);
+            hookFn((void *)lstat, (void *)hook_lstat, (void **)&orig_lstat);
 
-        void *symCFTimeZone = dlsym(RTLD_DEFAULT, "CFTimeZoneCopySystem");
-        if (symCFTimeZone) MSHookFunction(symCFTimeZone, (void *)hook_CFTimeZoneCopySystem, (void **)&orig_CFTimeZoneCopySystem);
+            void *symCFTimeZone = dlsym(RTLD_DEFAULT, "CFTimeZoneCopySystem");
+            if (symCFTimeZone) hookFn(symCFTimeZone, (void *)hook_CFTimeZoneCopySystem, (void **)&orig_CFTimeZoneCopySystem);
 
-        MSHookFunction((void *)CFNetworkCopySystemProxySettings, (void *)hook_CFNetworkCopySystemProxySettings, (void **)&orig_CFNetworkCopySystemProxySettings);
+            hookFn((void *)CFNetworkCopySystemProxySettings, (void *)hook_CFNetworkCopySystemProxySettings, (void **)&orig_CFNetworkCopySystemProxySettings);
 
-        void *symSCDyn = dlsym(RTLD_DEFAULT, "SCDynamicStoreCopyProxies");
-        if (symSCDyn) MSHookFunction(symSCDyn, (void *)hook_SCDynamicStoreCopyProxies, (void **)&orig_SCDynamicStoreCopyProxies);
+            void *symSCDyn = dlsym(RTLD_DEFAULT, "SCDynamicStoreCopyProxies");
+            if (symSCDyn) hookFn(symSCDyn, (void *)hook_SCDynamicStoreCopyProxies, (void **)&orig_SCDynamicStoreCopyProxies);
 
-        MSHookFunction((void *)getifaddrs, (void *)hook_getifaddrs, (void **)&orig_getifaddrs);
-        MSHookFunction((void *)CNCopyCurrentNetworkInfo, (void *)hook_CNCopyCurrentNetworkInfo, (void **)&orig_CNCopyCurrentNetworkInfo);
-        MSHookFunction((void *)CNCopySupportedInterfaces, (void *)hook_CNCopySupportedInterfaces, (void **)&orig_CNCopySupportedInterfaces);
+            hookFn((void *)getifaddrs, (void *)hook_getifaddrs, (void **)&orig_getifaddrs);
+            hookFn((void *)CNCopyCurrentNetworkInfo, (void *)hook_CNCopyCurrentNetworkInfo, (void **)&orig_CNCopyCurrentNetworkInfo);
+            hookFn((void *)CNCopySupportedInterfaces, (void *)hook_CNCopySupportedInterfaces, (void **)&orig_CNCopySupportedInterfaces);
+        }
     }
 }
