@@ -100,26 +100,28 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         statusError = nil
 
         let endpoints = [
+            "http://ip-api.com/json/?fields=status,countryCode,regionName,city,zip,lat,lon,timezone,isp,query",
+            "https://freeipapi.com/api/json",
+            "https://api.ipapi.is/",
             "https://ipwho.is/",
-            "https://ipapi.co/json/",
             "https://ipinfo.io/json",
-            "https://api.ip.sb/geoip"
+            "https://api.ipify.org?format=json"
         ]
 
-        probeSequentialHTTPS(urls: endpoints, index: 0, forceReanchor: forceReanchor)
+        probeSequential(urls: endpoints, index: 0, forceReanchor: forceReanchor, lastErr: "")
     }
 
-    private func probeSequentialHTTPS(urls: [String], index: Int, forceReanchor: Bool) {
+    private func probeSequential(urls: [String], index: Int, forceReanchor: Bool, lastErr: String) {
         guard index < urls.count else {
             DispatchQueue.main.async {
                 self.isFetching = false
-                self.statusError = "当前节点无法连接 IP 探测接口，请切换可用海外节点后再同步。"
+                self.statusError = "当前节点无法连接 IP 探测接口（\(lastErr)），请切换节点后重试。"
             }
             return
         }
 
         guard let url = URL(string: urls[index]) else {
-            probeSequentialHTTPS(urls: urls, index: index + 1, forceReanchor: forceReanchor)
+            probeSequential(urls: urls, index: index + 1, forceReanchor: forceReanchor, lastErr: lastErr)
             return
         }
 
@@ -144,36 +146,69 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
                     self.applyDetectedProfile(parsed, forceReanchor: forceReanchor)
                 }
             } else {
-                self.probeSequentialHTTPS(urls: urls, index: index + 1, forceReanchor: forceReanchor)
+                let code = (response as? HTTPURLResponse)?.statusCode ?? (error as NSError?)?.code ?? -1
+                self.probeSequential(urls: urls, index: index + 1, forceReanchor: forceReanchor, lastErr: "code:\(code)")
             }
         }.resume()
     }
 
     private func parseGeoJSON(data: Data) -> GeoProfile? {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        if let status = json["status"] as? String, status.lowercased() == "fail" { return nil }
         if let success = json["success"] as? Bool, !success { return nil }
 
-        guard let ip = json["ip"] as? String, !ip.isEmpty else { return nil }
-        let cc = ((json["country_code"] as? String) ?? (json["country"] as? String) ?? "US").uppercased()
+        let ip = (json["query"] as? String)
+            ?? (json["ip"] as? String)
+            ?? (json["ipAddress"] as? String)
+            ?? ""
+        guard !ip.isEmpty else { return nil }
+
+        let cc = ((json["countryCode"] as? String)
+            ?? (json["country_code"] as? String)
+            ?? (json["country"] as? String)
+            ?? ((json["location"] as? [String: Any])?["country_code"] as? String)
+            ?? "US").uppercased()
         if cc == "CN" || cc == "HK" || cc == "MO" { return nil }
 
-        let region = (json["region"] as? String) ?? (json["regionName"] as? String) ?? ""
-        let city = (json["city"] as? String) ?? ""
-        let isp = ((json["connection"] as? [String: Any])?["isp"] as? String)
-            ?? (json["isp"] as? String)
+        let locObj = json["location"] as? [String: Any]
+        let region = (json["regionName"] as? String)
+            ?? (json["region"] as? String)
+            ?? (locObj?["state"] as? String)
+            ?? ""
+        let city = (json["city"] as? String)
+            ?? (json["cityName"] as? String)
+            ?? (locObj?["city"] as? String)
+            ?? ""
+        let isp = (json["isp"] as? String)
+            ?? ((json["connection"] as? [String: Any])?["isp"] as? String)
+            ?? ((json["asn"] as? [String: Any])?["org"] as? String)
             ?? (json["org"] as? String)
             ?? "Residential Broadband"
-        let zip = (json["postal"] as? String) ?? (json["postal_code"] as? String) ?? (json["zip"] as? String) ?? ""
+        let zip = (json["zip"] as? String)
+            ?? (json["postal"] as? String)
+            ?? (json["zipCode"] as? String)
+            ?? (locObj?["zip"] as? String)
+            ?? ""
 
         var tz = "America/New_York"
         if let tzDict = json["timezone"] as? [String: Any], let tzId = tzDict["id"] as? String, !tzId.isEmpty {
             tz = tzId
         } else if let tzStr = json["timezone"] as? String, !tzStr.isEmpty {
             tz = tzStr
+        } else if let locTz = locObj?["timezone"] as? String, !locTz.isEmpty {
+            tz = locTz
+        } else if let tzArr = json["timeZones"] as? [String], let firstTz = tzArr.first, !firstTz.isEmpty {
+            tz = firstTz
         }
 
-        var lat = (json["latitude"] as? Double) ?? (json["lat"] as? Double) ?? 0.0
-        var lon = (json["longitude"] as? Double) ?? (json["lon"] as? Double) ?? 0.0
+        var lat = (json["lat"] as? Double)
+            ?? (json["latitude"] as? Double)
+            ?? (locObj?["latitude"] as? Double)
+            ?? 0.0
+        var lon = (json["lon"] as? Double)
+            ?? (json["longitude"] as? Double)
+            ?? (locObj?["longitude"] as? Double)
+            ?? 0.0
         if (lat == 0.0 || lon == 0.0), let locStr = json["loc"] as? String {
             let parts = locStr.split(separator: ",")
             if parts.count == 2, let la = Double(parts[0]), let lo = Double(parts[1]) {
@@ -194,7 +229,6 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     }
 
     private func applyDetectedProfile(_ raw: GeoProfile, forceReanchor: Bool) {
-        // 防旋转 IP 跳变：如果已开启会话锁定且同属一个国家与时区，则仅刷新出口 IP 显示，保持原街道坐标与 Wi-Fi 不跳变
         if lockSessionGeo, isSimulating, let locked = lockedProfile,
            locked.countryCode == raw.countryCode, locked.timezone == raw.timezone, !forceReanchor {
             self.exitIP = "\(raw.ip) [\(raw.countryCode)]"
@@ -202,7 +236,6 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             return
         }
 
-        // 在 IP 中心点 300~900 米范围内生成真实住宅微偏坐标
         let jitterLat = raw.latitude + Double.random(in: -0.0065...0.0065)
         let jitterLon = raw.longitude + Double.random(in: -0.0065...0.0065)
         let loc = CLLocation(latitude: jitterLat, longitude: jitterLon)
