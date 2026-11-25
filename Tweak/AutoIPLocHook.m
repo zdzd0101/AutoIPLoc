@@ -12,11 +12,54 @@
 #import <stdlib.h>
 #import <string.h>
 
-extern void MSHookFunction(void *symbol, void *replace, void **result);
-extern void MSHookMessageEx(Class _class, SEL message, IMP hook, IMP *old);
+typedef void (*MSHookFunction_t)(void *symbol, void *replace, void **result);
+typedef void (*MSHookMessageEx_t)(Class _class, SEL message, IMP hook, IMP *old);
+
+static MSHookFunction_t g_MSHookFunction = NULL;
+static MSHookMessageEx_t g_MSHookMessageEx = NULL;
 
 static NSString *const kGeoPrefPath = @"/var/mobile/Library/Preferences/com.autoiploc.geo.plist";
 static NSString *const kWifiPrefPath = @"/var/mobile/Library/Preferences/com.autoiploc.wifi.plist";
+
+// 零外部链接依赖：直接从进程已加载的 ElleKit 镜像中动态提取底层 Hook 函数
+static void ResolveSubstrateSymbols(void) {
+    g_MSHookFunction = (MSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
+    g_MSHookMessageEx = (MSHookMessageEx_t)dlsym(RTLD_DEFAULT, "MSHookMessageEx");
+    if (g_MSHookFunction && g_MSHookMessageEx) return;
+
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 1; i < count; i++) {
+        const char *img = _dyld_get_image_name(i);
+        if (!img) continue;
+        if (strstr(img, "ellekit") != NULL ||
+            strstr(img, "TweakInject") != NULL ||
+            strstr(img, "substrate") != NULL ||
+            strstr(img, "Substrate") != NULL) {
+            void *handle = dlopen(img, RTLD_NOLOAD | RTLD_LAZY);
+            if (handle) {
+                if (!g_MSHookFunction) {
+                    g_MSHookFunction = (MSHookFunction_t)dlsym(handle, "MSHookFunction");
+                }
+                if (!g_MSHookMessageEx) {
+                    g_MSHookMessageEx = (MSHookMessageEx_t)dlsym(handle, "MSHookMessageEx");
+                }
+                if (g_MSHookFunction && g_MSHookMessageEx) return;
+            }
+        }
+    }
+}
+
+static void SafeHookObjC(Class cls, SEL sel, IMP newImp, IMP *oldImp) {
+    if (!cls || !sel || !newImp) return;
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return;
+    if (g_MSHookMessageEx) {
+        g_MSHookMessageEx(cls, sel, newImp, oldImp);
+    } else {
+        IMP prev = method_setImplementation(m, newImp);
+        if (oldImp) *oldImp = prev;
+    }
+}
 
 static NSDictionary *LoadGeoConfig(void) {
     return [NSDictionary dictionaryWithContentsOfFile:kGeoPrefPath];
@@ -40,7 +83,7 @@ static NSString *GetTargetTimeZoneName(void) {
     return nil;
 }
 
-// 1. 抹除内存中加载的所有插件与 RootHide 底座动态库路径特征（消除 [功能插件注入] 与 [RootHide底座]）
+// 1. 抹除内存中加载的所有插件与 RootHide 底座动态库特征（消除 [功能插件注入] 与 [RootHide底座]）
 static BOOL IsSensitiveDylibPath(const char *path) {
     if (!path) return NO;
     return (strstr(path, "DynamicLibraries") != NULL ||
@@ -112,11 +155,11 @@ static CFTimeZoneRef hook_CFTimeZoneCopySystem(void) {
     return orig_CFTimeZoneCopySystem ? orig_CFTimeZoneCopySystem() : CFTimeZoneCopySystem();
 }
 
-// 3. 补全基带与蜂窝网络特征（飞行模式下依然保持 T-Mobile 310/260 LTE 参数，消除 [基带特征]）
+// 3. 补全双卡槽基带与蜂窝网络特征（统一修正为美国 T-Mobile 310/260 LTE 参数，消除 [基带特征]）
 static NSString *(*orig_carrierName)(id self, SEL _cmd);
 static NSString *hook_carrierName(id self, SEL _cmd) {
     NSString *orig = orig_carrierName ? orig_carrierName(self, _cmd) : nil;
-    if (orig.length == 0 || [orig isEqualToString:@"--"] || [orig isEqualToString:@"Carrier"]) {
+    if (orig.length == 0 || [orig isEqualToString:@"--"] || [orig isEqualToString:@"Carrier"] || [orig isEqualToString:@"EE"]) {
         return @"T-Mobile";
     }
     return orig;
@@ -125,7 +168,7 @@ static NSString *hook_carrierName(id self, SEL _cmd) {
 static NSString *(*orig_mobileCountryCode)(id self, SEL _cmd);
 static NSString *hook_mobileCountryCode(id self, SEL _cmd) {
     NSString *orig = orig_mobileCountryCode ? orig_mobileCountryCode(self, _cmd) : nil;
-    if (orig.length == 0 || [orig isEqualToString:@"460"] || [orig isEqualToString:@"454"] || [orig isEqualToString:@"455"]) {
+    if (orig.length == 0 || [orig isEqualToString:@"460"] || [orig isEqualToString:@"454"] || [orig isEqualToString:@"455"] || [orig isEqualToString:@"234"]) {
         return @"310";
     }
     return orig;
@@ -134,7 +177,7 @@ static NSString *hook_mobileCountryCode(id self, SEL _cmd) {
 static NSString *(*orig_mobileNetworkCode)(id self, SEL _cmd);
 static NSString *hook_mobileNetworkCode(id self, SEL _cmd) {
     NSString *orig = orig_mobileNetworkCode ? orig_mobileNetworkCode(self, _cmd) : nil;
-    if (orig.length == 0 || [orig isEqualToString:@"65535"]) {
+    if (orig.length == 0 || [orig isEqualToString:@"65535"] || [orig isEqualToString:@"30"]) {
         return @"260";
     }
     return orig;
@@ -143,7 +186,7 @@ static NSString *hook_mobileNetworkCode(id self, SEL _cmd) {
 static NSString *(*orig_isoCountryCode)(id self, SEL _cmd);
 static NSString *hook_isoCountryCode(id self, SEL _cmd) {
     NSString *orig = orig_isoCountryCode ? orig_isoCountryCode(self, _cmd) : nil;
-    if (orig.length == 0 || [orig.lowercaseString isEqualToString:@"cn"] || [orig.lowercaseString isEqualToString:@"hk"] || [orig.lowercaseString isEqualToString:@"mo"]) {
+    if (orig.length == 0 || [orig.lowercaseString isEqualToString:@"cn"] || [orig.lowercaseString isEqualToString:@"hk"] || [orig.lowercaseString isEqualToString:@"mo"] || [orig.lowercaseString isEqualToString:@"gb"]) {
         return GetTargetCountryCode().lowercaseString;
     }
     return orig;
@@ -278,7 +321,7 @@ static NSURL *hook_urlOverride(id self, SEL _cmd, NSURL *url) {
     return orig_urlOverride ? orig_urlOverride(self, _cmd, url) : nil;
 }
 
-// 7. 抹除软件模拟定位标记与强制国际版地图国家码
+// 7. 彻底抹除软件模拟定位标记 (isSimulatedBySoftware = NO) 与锁定国际地图国家码
 static BOOL hook_returnNO(id self, SEL _cmd) {
     return NO;
 }
@@ -363,10 +406,11 @@ static void AutoIPLocHookEntry(void) {
         if (_NSGetExecutablePath(execBuf, &execSize) != 0) return;
         if (strstr(execBuf, ".app/") == NULL) return;
 
-        // 显式加载目标系统框架，确保所有 Objective-C 类在 Hook 前已完成注册
+        // 显式加载目标系统框架并提取 ElleKit 符号
         dlopen("/System/Library/Frameworks/CoreLocation.framework/CoreLocation", RTLD_NOW);
         dlopen("/System/Library/Frameworks/CoreTelephony.framework/CoreTelephony", RTLD_NOW);
         dlopen("/System/Library/PrivateFrameworks/GeoServices.framework/GeoServices", RTLD_NOW);
+        ResolveSubstrateSymbols();
 
         // A. 接管时区
         NSString *initTZ = GetTargetTimeZoneName();
@@ -377,84 +421,54 @@ static void AutoIPLocHookEntry(void) {
         }
         Class tzMeta = objc_getMetaClass("NSTimeZone");
         if (tzMeta) {
-            MSHookMessageEx(tzMeta, @selector(systemTimeZone), (IMP)hook_systemTimeZone, (IMP *)&orig_systemTimeZone);
-            MSHookMessageEx(tzMeta, @selector(defaultTimeZone), (IMP)hook_defaultTimeZone, (IMP *)&orig_defaultTimeZone);
-            MSHookMessageEx(tzMeta, @selector(localTimeZone), (IMP)hook_localTimeZone, (IMP *)&orig_localTimeZone);
+            SafeHookObjC(tzMeta, @selector(systemTimeZone), (IMP)hook_systemTimeZone, (IMP *)&orig_systemTimeZone);
+            SafeHookObjC(tzMeta, @selector(defaultTimeZone), (IMP)hook_defaultTimeZone, (IMP *)&orig_defaultTimeZone);
+            SafeHookObjC(tzMeta, @selector(localTimeZone), (IMP)hook_localTimeZone, (IMP *)&orig_localTimeZone);
         }
 
         // B. 拦截 URL Scheme 暴露
         Class appCls = objc_getClass("UIApplication");
         if (appCls) {
-            MSHookMessageEx(appCls, @selector(canOpenURL:), (IMP)hook_canOpenURL, (IMP *)&orig_canOpenURL);
-            SEL privOpenSel = NSSelectorFromString(@"_canOpenURL:publicURLsOnly:");
-            if (class_getInstanceMethod(appCls, privOpenSel)) {
-                MSHookMessageEx(appCls, privOpenSel, (IMP)hook_privCanOpenURL, (IMP *)&orig_privCanOpenURL);
-            }
+            SafeHookObjC(appCls, @selector(canOpenURL:), (IMP)hook_canOpenURL, (IMP *)&orig_canOpenURL);
+            SafeHookObjC(appCls, NSSelectorFromString(@"_canOpenURL:publicURLsOnly:"), (IMP)hook_privCanOpenURL, (IMP *)&orig_privCanOpenURL);
         }
         Class wsCls = objc_getClass("LSApplicationWorkspace");
         if (wsCls) {
-            SEL wsSel = NSSelectorFromString(@"applicationsAvailableForHandlingURLScheme:");
-            if (class_getInstanceMethod(wsCls, wsSel)) {
-                MSHookMessageEx(wsCls, wsSel, (IMP)hook_appsForScheme, (IMP *)&orig_appsForScheme);
-            }
-            SEL ovSel = NSSelectorFromString(@"URLOverrideForURL:");
-            if (class_getInstanceMethod(wsCls, ovSel)) {
-                MSHookMessageEx(wsCls, ovSel, (IMP)hook_urlOverride, (IMP *)&orig_urlOverride);
-            }
+            SafeHookObjC(wsCls, NSSelectorFromString(@"applicationsAvailableForHandlingURLScheme:"), (IMP)hook_appsForScheme, (IMP *)&orig_appsForScheme);
+            SafeHookObjC(wsCls, NSSelectorFromString(@"URLOverrideForURL:"), (IMP)hook_urlOverride, (IMP *)&orig_urlOverride);
         }
 
         // C. 隐藏 NSURLSessionConfiguration 代理字典
         Class sessionCfgCls = objc_getClass("NSURLSessionConfiguration");
         if (sessionCfgCls) {
-            MSHookMessageEx(sessionCfgCls, @selector(connectionProxyDictionary), (IMP)hook_connectionProxyDictionary, (IMP *)&orig_connectionProxyDictionary);
+            SafeHookObjC(sessionCfgCls, @selector(connectionProxyDictionary), (IMP)hook_connectionProxyDictionary, (IMP *)&orig_connectionProxyDictionary);
         }
 
-        // D. 补全基带与蜂窝运营商参数（飞行模式下依然保持 T-Mobile 310/260 LTE 特征）
+        // D. 补全双卡槽基带与蜂窝运营商参数
         Class carrierCls = objc_getClass("CTCarrier");
         if (carrierCls) {
-            MSHookMessageEx(carrierCls, NSSelectorFromString(@"carrierName"), (IMP)hook_carrierName, (IMP *)&orig_carrierName);
-            MSHookMessageEx(carrierCls, NSSelectorFromString(@"mobileCountryCode"), (IMP)hook_mobileCountryCode, (IMP *)&orig_mobileCountryCode);
-            MSHookMessageEx(carrierCls, NSSelectorFromString(@"mobileNetworkCode"), (IMP)hook_mobileNetworkCode, (IMP *)&orig_mobileNetworkCode);
-            MSHookMessageEx(carrierCls, NSSelectorFromString(@"isoCountryCode"), (IMP)hook_isoCountryCode, (IMP *)&orig_isoCountryCode);
+            SafeHookObjC(carrierCls, NSSelectorFromString(@"carrierName"), (IMP)hook_carrierName, (IMP *)&orig_carrierName);
+            SafeHookObjC(carrierCls, NSSelectorFromString(@"mobileCountryCode"), (IMP)hook_mobileCountryCode, (IMP *)&orig_mobileCountryCode);
+            SafeHookObjC(carrierCls, NSSelectorFromString(@"mobileNetworkCode"), (IMP)hook_mobileNetworkCode, (IMP *)&orig_mobileNetworkCode);
+            SafeHookObjC(carrierCls, NSSelectorFromString(@"isoCountryCode"), (IMP)hook_isoCountryCode, (IMP *)&orig_isoCountryCode);
         }
         Class netInfoCls = objc_getClass("CTTelephonyNetworkInfo");
         if (netInfoCls) {
-            SEL svcSel = NSSelectorFromString(@"serviceCurrentRadioAccessTechnology");
-            if (class_getInstanceMethod(netInfoCls, svcSel)) {
-                MSHookMessageEx(netInfoCls, svcSel, (IMP)hook_serviceRadioTech, (IMP *)&orig_serviceRadioTech);
-            }
-            SEL curSel = NSSelectorFromString(@"currentRadioAccessTechnology");
-            if (class_getInstanceMethod(netInfoCls, curSel)) {
-                MSHookMessageEx(netInfoCls, curSel, (IMP)hook_currentRadioTech, (IMP *)&orig_currentRadioTech);
-            }
+            SafeHookObjC(netInfoCls, NSSelectorFromString(@"serviceCurrentRadioAccessTechnology"), (IMP)hook_serviceRadioTech, (IMP *)&orig_serviceRadioTech);
+            SafeHookObjC(netInfoCls, NSSelectorFromString(@"currentRadioAccessTechnology"), (IMP)hook_currentRadioTech, (IMP *)&orig_currentRadioTech);
         }
 
-        // E. 抹除模拟定位标记 (isSimulatedBySoftware = NO)
+        // E. 彻底抹除模拟定位标记 (isSimulatedBySoftware = NO)
         Class srcInfoCls = objc_getClass("CLLocationSourceInformation");
         if (srcInfoCls) {
-            SEL simSel = NSSelectorFromString(@"isSimulatedBySoftware");
-            if (class_getInstanceMethod(srcInfoCls, simSel)) {
-                MSHookMessageEx(srcInfoCls, simSel, (IMP)hook_returnNO, NULL);
-            }
-            SEL accSel = NSSelectorFromString(@"isProducedByAccessory");
-            if (class_getInstanceMethod(srcInfoCls, accSel)) {
-                MSHookMessageEx(srcInfoCls, accSel, (IMP)hook_returnNO, NULL);
-            }
+            SafeHookObjC(srcInfoCls, NSSelectorFromString(@"isSimulatedBySoftware"), (IMP)hook_returnNO, NULL);
+            SafeHookObjC(srcInfoCls, NSSelectorFromString(@"isProducedByAccessory"), (IMP)hook_returnNO, NULL);
         }
         Class locCls = objc_getClass("CLLocation");
         if (locCls) {
-            SEL locSimSel = NSSelectorFromString(@"isSimulatedBySoftware");
-            if (class_getInstanceMethod(locCls, locSimSel)) {
-                MSHookMessageEx(locCls, locSimSel, (IMP)hook_returnNO, NULL);
-            }
-            SEL locPrivSel = NSSelectorFromString(@"_isSimulated");
-            if (class_getInstanceMethod(locCls, locPrivSel)) {
-                MSHookMessageEx(locCls, locPrivSel, (IMP)hook_returnNO, NULL);
-            }
-            SEL srcSel = NSSelectorFromString(@"sourceInformation");
-            if (class_getInstanceMethod(locCls, srcSel)) {
-                MSHookMessageEx(locCls, srcSel, (IMP)hook_sourceInformation, (IMP *)&orig_sourceInformation);
-            }
+            SafeHookObjC(locCls, NSSelectorFromString(@"isSimulatedBySoftware"), (IMP)hook_returnNO, NULL);
+            SafeHookObjC(locCls, NSSelectorFromString(@"_isSimulated"), (IMP)hook_returnNO, NULL);
+            SafeHookObjC(locCls, NSSelectorFromString(@"sourceInformation"), (IMP)hook_sourceInformation, (IMP *)&orig_sourceInformation);
         }
 
         // F. 锁定国际地图国家码，阻断高德切换
@@ -462,33 +476,29 @@ static void AutoIPLocHookEntry(void) {
         if (geoCls) {
             NSArray *sels = @[@"countryCode", @"_countryCode", @"currentCountryCode", @"sourceCountryCode"];
             for (NSString *selName in sels) {
-                SEL s = NSSelectorFromString(selName);
-                if (class_getInstanceMethod(geoCls, s)) {
-                    MSHookMessageEx(geoCls, s, (IMP)hook_targetCountryCode, NULL);
-                }
+                SafeHookObjC(geoCls, NSSelectorFromString(selName), (IMP)hook_targetCountryCode, NULL);
             }
         }
         Class platformCls = objc_getClass("GEOPlatform");
         if (platformCls) {
-            SEL chinaSel = NSSelectorFromString(@"isChina");
-            if (class_getInstanceMethod(platformCls, chinaSel)) {
-                MSHookMessageEx(platformCls, chinaSel, (IMP)hook_returnNO, NULL);
-            }
+            SafeHookObjC(platformCls, NSSelectorFromString(@"isChina"), (IMP)hook_returnNO, NULL);
         }
 
-        // G. 接管系统底层 C 函数（由 RootHide Patcher 自动绑定至 libellekit）
-        MSHookFunction((void *)_dyld_get_image_name, (void *)hook_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
+        // G. 接管系统底层 C 函数
+        if (g_MSHookFunction) {
+            g_MSHookFunction((void *)_dyld_get_image_name, (void *)hook_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
 
-        void *symCFTimeZone = dlsym(RTLD_DEFAULT, "CFTimeZoneCopySystem");
-        if (symCFTimeZone) MSHookFunction(symCFTimeZone, (void *)hook_CFTimeZoneCopySystem, (void **)&orig_CFTimeZoneCopySystem);
+            void *symCFTimeZone = dlsym(RTLD_DEFAULT, "CFTimeZoneCopySystem");
+            if (symCFTimeZone) g_MSHookFunction(symCFTimeZone, (void *)hook_CFTimeZoneCopySystem, (void **)&orig_CFTimeZoneCopySystem);
 
-        MSHookFunction((void *)CFNetworkCopySystemProxySettings, (void *)hook_CFNetworkCopySystemProxySettings, (void **)&orig_CFNetworkCopySystemProxySettings);
+            g_MSHookFunction((void *)CFNetworkCopySystemProxySettings, (void *)hook_CFNetworkCopySystemProxySettings, (void **)&orig_CFNetworkCopySystemProxySettings);
 
-        void *symSCDyn = dlsym(RTLD_DEFAULT, "SCDynamicStoreCopyProxies");
-        if (symSCDyn) MSHookFunction(symSCDyn, (void *)hook_SCDynamicStoreCopyProxies, (void **)&orig_SCDynamicStoreCopyProxies);
+            void *symSCDyn = dlsym(RTLD_DEFAULT, "SCDynamicStoreCopyProxies");
+            if (symSCDyn) g_MSHookFunction(symSCDyn, (void *)hook_SCDynamicStoreCopyProxies, (void **)&orig_SCDynamicStoreCopyProxies);
 
-        MSHookFunction((void *)getifaddrs, (void *)hook_getifaddrs, (void **)&orig_getifaddrs);
-        MSHookFunction((void *)CNCopyCurrentNetworkInfo, (void *)hook_CNCopyCurrentNetworkInfo, (void **)&orig_CNCopyCurrentNetworkInfo);
-        MSHookFunction((void *)CNCopySupportedInterfaces, (void *)hook_CNCopySupportedInterfaces, (void **)&orig_CNCopySupportedInterfaces);
+            g_MSHookFunction((void *)getifaddrs, (void *)hook_getifaddrs, (void **)&orig_getifaddrs);
+            g_MSHookFunction((void *)CNCopyCurrentNetworkInfo, (void *)hook_CNCopyCurrentNetworkInfo, (void **)&orig_CNCopyCurrentNetworkInfo);
+            g_MSHookFunction((void *)CNCopySupportedInterfaces, (void *)hook_CNCopySupportedInterfaces, (void **)&orig_CNCopySupportedInterfaces);
+        }
     }
 }
