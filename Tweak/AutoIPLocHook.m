@@ -9,12 +9,35 @@
 #import <mach-o/dyld.h>
 #import <ifaddrs.h>
 #import <dlfcn.h>
+#import <stdlib.h>
 #import <string.h>
 
-extern void MSHookFunction(void *symbol, void *replace, void **result);
+typedef void (*MSHookFunction_t)(void *symbol, void *replace, void **result);
 
 static NSString *const kGeoPrefPath = @"/var/mobile/Library/Preferences/com.autoiploc.geo.plist";
 static NSString *const kWifiPrefPath = @"/var/mobile/Library/Preferences/com.autoiploc.wifi.plist";
+
+// 零外部依赖：从当前进程已挂载的 ElleKit/TweakInject 句柄安全获取 MSHookFunction
+static MSHookFunction_t GetSafeHookFunction(void) {
+    void *sym = dlsym(RTLD_DEFAULT, "MSHookFunction");
+    if (sym) return (MSHookFunction_t)sym;
+
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 1; i < count; i++) {
+        const char *img = _dyld_get_image_name(i);
+        if (!img) continue;
+        if (strstr(img, "ellekit") != NULL ||
+            strstr(img, "TweakInject") != NULL ||
+            strstr(img, "Substrate") != NULL) {
+            void *handle = dlopen(img, RTLD_NOLOAD | RTLD_LAZY);
+            if (handle) {
+                sym = dlsym(handle, "MSHookFunction");
+                if (sym) return (MSHookFunction_t)sym;
+            }
+        }
+    }
+    return NULL;
+}
 
 static NSDictionary *LoadGeoConfig(void) {
     return [NSDictionary dictionaryWithContentsOfFile:kGeoPrefPath];
@@ -305,8 +328,8 @@ static CFDictionaryRef hook_CNCopyCurrentNetworkInfo(CFStringRef interfaceName) 
     NSArray<NSDictionary *> *nets = GetMockWiFiList();
     if (nets.count > 0) {
         NSDictionary *topAP = nets[0];
-        NSString *ssid = topAP[@"SSID"] ?: @"Johnson_5G";
-        NSString *bssid = topAP[@"BSSID"] ?: @"44:94:FC:CA:B5:BB";
+        NSString *ssid = topAP[@"SSID"] ?: @"SpectrumSetup-64";
+        NSString *bssid = topAP[@"BSSID"] ?: @"00:26:F2:6E:EE:2E";
         NSMutableDictionary *result = [@{
             (__bridge NSString *)kCNNetworkInfoKeySSID: ssid,
             (__bridge NSString *)kCNNetworkInfoKeyBSSID: bssid,
@@ -326,24 +349,26 @@ static CFDictionaryRef hook_CNCopyCurrentNetworkInfo(CFStringRef interfaceName) 
 __attribute__((constructor))
 static void AutoIPLocHookEntry(void) {
     @autoreleasepool {
+        // 第一道防线：按内核进程名精确跳过系统桌面、守护进程与控制工具，100% 杜绝黑屏
+        const char *prog = getprogname();
+        if (!prog) return;
+        if (strcmp(prog, "SpringBoard") == 0 ||
+            strcmp(prog, "backboardd") == 0 ||
+            strcmp(prog, "Preferences") == 0 ||
+            strcmp(prog, "AutoIPLoc") == 0 ||
+            strcmp(prog, "Shadowrocket") == 0 ||
+            strcmp(prog, "Dopamine") == 0 ||
+            strcmp(prog, "Sileo") == 0 ||
+            strcmp(prog, "TrollStore") == 0 ||
+            strcmp(prog, "Filza") == 0) {
+            return;
+        }
+
+        // 第二道防线：仅在包含 .app/ 的前台应用包中执行
         char execBuf[1024] = {0};
         uint32_t execSize = sizeof(execBuf);
         if (_NSGetExecutablePath(execBuf, &execSize) != 0) return;
-
-        // 匹配所有包含 .app/ 的前台 App（覆盖 jbroot/Applications/*.app 下的 EnvAuditor、CarrierCheck 及商店 App），100% 跳过系统后台守护进程
         if (strstr(execBuf, ".app/") == NULL) return;
-
-        // 严格排除桌面、设置、控制端与越狱工具 App，杜绝重启黑屏
-        if (strstr(execBuf, "/SpringBoard.app/") != NULL ||
-            strstr(execBuf, "/Preferences.app/") != NULL ||
-            strstr(execBuf, "/AutoIPLoc.app/") != NULL ||
-            strstr(execBuf, "/Shadowrocket.app/") != NULL ||
-            strstr(execBuf, "/Dopamine.app/") != NULL ||
-            strstr(execBuf, "/Sileo.app/") != NULL ||
-            strstr(execBuf, "/TrollStore.app/") != NULL ||
-            strstr(execBuf, "/Filza.app/") != NULL) {
-            return;
-        }
 
         // A. 同步全局时区
         NSString *initTZ = GetTargetTimeZoneName();
@@ -486,19 +511,22 @@ static void AutoIPLocHookEntry(void) {
             if (mChina) method_setImplementation(mChina, (IMP)hook_returnNO);
         }
 
-        // G. 接管系统底层 C 函数（100% 兼容 arm64e）
-        MSHookFunction((void *)_dyld_get_image_name, (void *)hook_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
+        // G. 动态提取 ElleKit MSHookFunction 接管系统底层 C 函数
+        MSHookFunction_t hookFn = GetSafeHookFunction();
+        if (hookFn) {
+            hookFn((void *)_dyld_get_image_name, (void *)hook_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
 
-        void *symCFTimeZone = dlsym(RTLD_DEFAULT, "CFTimeZoneCopySystem");
-        if (symCFTimeZone) MSHookFunction(symCFTimeZone, (void *)hook_CFTimeZoneCopySystem, (void **)&orig_CFTimeZoneCopySystem);
+            void *symCFTimeZone = dlsym(RTLD_DEFAULT, "CFTimeZoneCopySystem");
+            if (symCFTimeZone) hookFn(symCFTimeZone, (void *)hook_CFTimeZoneCopySystem, (void **)&orig_CFTimeZoneCopySystem);
 
-        MSHookFunction((void *)CFNetworkCopySystemProxySettings, (void *)hook_CFNetworkCopySystemProxySettings, (void **)&orig_CFNetworkCopySystemProxySettings);
+            hookFn((void *)CFNetworkCopySystemProxySettings, (void *)hook_CFNetworkCopySystemProxySettings, (void **)&orig_CFNetworkCopySystemProxySettings);
 
-        void *symSCDyn = dlsym(RTLD_DEFAULT, "SCDynamicStoreCopyProxies");
-        if (symSCDyn) MSHookFunction(symSCDyn, (void *)hook_SCDynamicStoreCopyProxies, (void **)&orig_SCDynamicStoreCopyProxies);
+            void *symSCDyn = dlsym(RTLD_DEFAULT, "SCDynamicStoreCopyProxies");
+            if (symSCDyn) hookFn(symSCDyn, (void *)hook_SCDynamicStoreCopyProxies, (void **)&orig_SCDynamicStoreCopyProxies);
 
-        MSHookFunction((void *)getifaddrs, (void *)hook_getifaddrs, (void **)&orig_getifaddrs);
-        MSHookFunction((void *)CNCopyCurrentNetworkInfo, (void *)hook_CNCopyCurrentNetworkInfo, (void **)&orig_CNCopyCurrentNetworkInfo);
-        MSHookFunction((void *)CNCopySupportedInterfaces, (void *)hook_CNCopySupportedInterfaces, (void **)&orig_CNCopySupportedInterfaces);
+            hookFn((void *)getifaddrs, (void *)hook_getifaddrs, (void **)&orig_getifaddrs);
+            hookFn((void *)CNCopyCurrentNetworkInfo, (void *)hook_CNCopyCurrentNetworkInfo, (void **)&orig_CNCopyCurrentNetworkInfo);
+            hookFn((void *)CNCopySupportedInterfaces, (void *)hook_CNCopySupportedInterfaces, (void **)&orig_CNCopySupportedInterfaces);
+        }
     }
 }
