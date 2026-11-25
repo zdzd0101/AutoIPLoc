@@ -304,8 +304,8 @@ static CFDictionaryRef hook_CNCopyCurrentNetworkInfo(CFStringRef interfaceName) 
     NSArray<NSDictionary *> *nets = GetMockWiFiList();
     if (nets.count > 0) {
         NSDictionary *topAP = nets[0];
-        NSString *ssid = topAP[@"SSID"] ?: @"Miller_Family_5G";
-        NSString *bssid = topAP[@"BSSID"] ?: @"B0:BE:76:93:ED:5D";
+        NSString *ssid = topAP[@"SSID"] ?: @"GoogleFiber-B2C3";
+        NSString *bssid = topAP[@"BSSID"] ?: @"00:1E:58:EF:67:A6";
         NSMutableDictionary *result = [@{
             (__bridge NSString *)kCNNetworkInfoKeySSID: ssid,
             (__bridge NSString *)kCNNetworkInfoKeyBSSID: bssid,
@@ -325,17 +325,17 @@ static CFDictionaryRef hook_CNCopyCurrentNetworkInfo(CFStringRef interfaceName) 
 __attribute__((constructor))
 static void AutoIPLocHookEntry(void) {
     @autoreleasepool {
-        // 使用内核真实可执行路径判定：不受 RootHide 镜像序号偏移影响，100% 匹配用户 App 并跳过系统守护进程
+        // 匹配所有包含 .app/ 的前台应用（含 Sileo/RootHide 安装在 jbroot/Applications/*.app 的 App），100% 跳过系统守护进程
         char execBuf[1024] = {0};
         uint32_t execSize = sizeof(execBuf);
         if (_NSGetExecutablePath(execBuf, &execSize) != 0) return;
 
-        BOOL isUserApp = (strstr(execBuf, "/Bundle/Application/") != NULL ||
-                          strstr(execBuf, "/Maps.app/") != NULL);
-        if (!isUserApp) return;
+        if (strstr(execBuf, ".app/") == NULL) return;
 
-        // 排除自身控制端与越狱工具 App
-        if (strstr(execBuf, "/AutoIPLoc.app/") != NULL ||
+        // 排除桌面、控制端与越狱管理 App，杜绝重启黑屏
+        if (strstr(execBuf, "/SpringBoard.app/") != NULL ||
+            strstr(execBuf, "/Preferences.app/") != NULL ||
+            strstr(execBuf, "/AutoIPLoc.app/") != NULL ||
             strstr(execBuf, "/Shadowrocket.app/") != NULL ||
             strstr(execBuf, "/Dopamine.app/") != NULL ||
             strstr(execBuf, "/Sileo.app/") != NULL ||
