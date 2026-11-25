@@ -40,11 +40,12 @@ jobs:
 
           zip -r AutoIPLoc.tipa Payload
 
-          cat << 'EOF' > libsubstrate.tbd
+          mkdir -p CydiaSubstrate.framework
+          cat << 'EOF' > CydiaSubstrate.framework/CydiaSubstrate.tbd
           --- !tapi-tbd
           tbd-version:     4
           targets:         [ arm64-ios, arm64e-ios ]
-          install-name:    '/usr/lib/libsubstrate.dylib'
+          install-name:    '/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate'
           exports:
             - targets:         [ arm64-ios, arm64e-ios ]
               symbols:         [ _MSHookFunction, _MSHookMessageEx ]
@@ -58,8 +59,8 @@ jobs:
             -arch arm64 -arch arm64e \
             -isysroot "$SDK_PATH" \
             -miphoneos-version-min=15.0 \
-            -framework Foundation -framework UIKit -framework CoreLocation -framework CoreTelephony -framework SystemConfiguration -framework CFNetwork \
-            -L. -lsubstrate \
+            -F. \
+            -framework Foundation -framework UIKit -framework CoreLocation -framework CoreTelephony -framework SystemConfiguration -framework CFNetwork -framework CydiaSubstrate \
             -fobjc-arc \
             Tweak/AutoIPLocHook.m \
             -o deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
@@ -68,7 +69,7 @@ jobs:
           cp Tweak/AutoIPLocHook.plist deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
 
           INSTALLED_SIZE=$(du -sk deb_pkg/var | cut -f1)
-          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 2.4.7\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: RootHide-bound safe hook with LTE baseband, US Wi-Fi AP & zero-trace anti-detection\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
+          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 2.4.8\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: arm64e MSHookMessageEx RootHide-native stealth hook with LTE baseband, US Wi-Fi AP & zero-trace anti-detection\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
 
           chmod 0755 deb_pkg/DEBIAN
           chmod 0644 deb_pkg/DEBIAN/control
