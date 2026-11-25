@@ -40,22 +40,34 @@ jobs:
 
           zip -r AutoIPLoc.tipa Payload
 
+          mkdir -p CydiaSubstrate.framework
+          cat << 'EOF' > CydiaSubstrate.framework/CydiaSubstrate.tbd
+          --- !tapi-tbd
+          tbd-version:     4
+          targets:         [ arm64-ios, arm64e-ios ]
+          install-name:    '/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate'
+          exports:
+            - targets:         [ arm64-ios, arm64e-ios ]
+              symbols:         [ _MSHookFunction, _MSHookMessageEx ]
+          ...
+          EOF
+
           mkdir -p deb_pkg/DEBIAN
-          mkdir -p deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries
+          mkdir -p deb_pkg/Library/MobileSubstrate/DynamicLibraries
 
           clang -dynamiclib \
-            -arch arm64 \
+            -arch arm64 -arch arm64e \
             -isysroot "$SDK_PATH" \
             -miphoneos-version-min=15.0 \
-            -install_name /Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib \
-            -framework Foundation -framework UIKit -framework CoreLocation -framework CoreTelephony -framework SystemConfiguration -framework CFNetwork \
+            -F. \
+            -framework Foundation -framework UIKit -framework CoreLocation -framework CoreTelephony -framework SystemConfiguration -framework CFNetwork -framework CydiaSubstrate \
             -fobjc-arc \
             Tweak/AutoIPLocHook.m \
-            -o deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
+            -o deb_pkg/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
 
-          ./ldid -S deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
+          ./ldid -S deb_pkg/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
 
-          cat << 'EOF' > deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
+          cat << 'EOF' > deb_pkg/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
@@ -72,13 +84,13 @@ jobs:
           </plist>
           EOF
 
-          INSTALLED_SIZE=$(du -sk deb_pkg/var | cut -f1)
-          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 2.8.0\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: iOS 16.2 arm64-compatible RootHide stealth hook + parallel fast URLSession.shared IP probe\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
+          INSTALLED_SIZE=$(du -sk deb_pkg/Library | cut -f1)
+          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 2.9.0\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: RootHide-proper standard Library path stealth hook with dylib whitelist, dual T-Mobile LTE & GPS scrub\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
 
           chmod 0755 deb_pkg/DEBIAN
           chmod 0644 deb_pkg/DEBIAN/control
-          chmod 0755 deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
-          chmod 0644 deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
+          chmod 0755 deb_pkg/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
+          chmod 0644 deb_pkg/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
 
           dpkg-deb -Zgzip -b deb_pkg AutoIPLocHook.deb
           ls -lh AutoIPLoc.tipa AutoIPLocHook.deb
