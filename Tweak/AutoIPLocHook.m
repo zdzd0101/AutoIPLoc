@@ -38,7 +38,7 @@ static NSString *GetTargetTimeZoneName(void) {
     return nil;
 }
 
-// 1. 隐藏内存中加载的插件与 RootHide 底座动态库特征
+// 1. 隐藏内存中加载的插件与 RootHide 底座动态库特征（消除 [功能插件注入] 与 [RootHide底座]）
 static BOOL IsSensitiveDylibPath(const char *path) {
     if (!path) return NO;
     return (strstr(path, "AutoIPLocHook") != NULL ||
@@ -104,7 +104,7 @@ static CFTimeZoneRef hook_CFTimeZoneCopySystem(void) {
     return orig_CFTimeZoneCopySystem ? orig_CFTimeZoneCopySystem() : CFTimeZoneCopySystem();
 }
 
-// 3. 补全基带与蜂窝网络特征（飞行模式下依然保持 T-Mobile 310/260 LTE 参数）
+// 3. 补全基带与蜂窝网络特征（飞行模式下依然保持 T-Mobile 310/260 LTE 参数，消除 [基带特征]）
 static NSString *(*orig_carrierName)(id self, SEL _cmd);
 static NSString *hook_carrierName(id self, SEL _cmd) {
     NSString *orig = orig_carrierName ? orig_carrierName(self, _cmd) : nil;
@@ -235,7 +235,7 @@ static int hook_getifaddrs(struct ifaddrs **ifap) {
     return ret;
 }
 
-// 6. 屏蔽工具类 URL Scheme 暴露
+// 6. 屏蔽工具类 URL Scheme 暴露 (apple-magnifier://, sileo://, zbra:// 等)
 static BOOL IsBlockedURLScheme(NSString *scheme) {
     if (scheme.length == 0) return NO;
     NSSet *blocked = [NSSet setWithArray:@[
@@ -304,8 +304,8 @@ static CFDictionaryRef hook_CNCopyCurrentNetworkInfo(CFStringRef interfaceName) 
     NSArray<NSDictionary *> *nets = GetMockWiFiList();
     if (nets.count > 0) {
         NSDictionary *topAP = nets[0];
-        NSString *ssid = topAP[@"SSID"] ?: @"GoogleFiber-DFF8";
-        NSString *bssid = topAP[@"BSSID"] ?: @"20:4E:7F:90:C0:27";
+        NSString *ssid = topAP[@"SSID"] ?: @"Xfinity-3C26-5G";
+        NSString *bssid = topAP[@"BSSID"] ?: @"88:DC:96:8A:4D:A8";
         NSMutableDictionary *result = [@{
             (__bridge NSString *)kCNNetworkInfoKeySSID: ssid,
             (__bridge NSString *)kCNNetworkInfoKeyBSSID: bssid,
@@ -325,22 +325,21 @@ static CFDictionaryRef hook_CNCopyCurrentNetworkInfo(CFStringRef interfaceName) 
 __attribute__((constructor))
 static void AutoIPLocHookEntry(void) {
     @autoreleasepool {
-        // 严格白名单守卫：仅允许用户态目标 App 加载，100% 跳过 SpringBoard 与所有系统守护进程，杜绝重启黑屏
-        NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
-        if (bid.length == 0) return;
+        // 使用内核级主镜像路径判定：100% 匹配用户 App（包括巨魔 App 与 Maps），同时 100% 跳过系统守护进程
+        const char *execPath = _dyld_get_image_name(0);
+        if (!execPath) return;
 
-        BOOL isAllowedTarget =
-            [bid isEqualToString:@"com.apple.Maps"] ||
-            [bid isEqualToString:@"com.local.audit.envauditor"] ||
-            [bid isEqualToString:@"com.local.carriercheck"] ||
-            (![bid hasPrefix:@"com.apple."] &&
-             ![bid isEqualToString:@"com.local.autoiploc"] &&
-             ![bid hasPrefix:@"com.liguangming."] &&
-             ![bid hasPrefix:@"com.opa334."] &&
-             ![bid hasPrefix:@"org.coolstar."] &&
-             ![bid hasPrefix:@"com.tigisoftware."]);
+        BOOL isUserApp = (strstr(execPath, "/Bundle/Application/") != NULL ||
+                          strstr(execPath, "/Maps.app/") != NULL);
+        if (!isUserApp) return;
 
-        if (!isAllowedTarget) {
+        // 排除自身控制端与越狱工具 App
+        if (strstr(execPath, "/AutoIPLoc.app/") != NULL ||
+            strstr(execPath, "/Shadowrocket.app/") != NULL ||
+            strstr(execPath, "/Dopamine.app/") != NULL ||
+            strstr(execPath, "/Sileo.app/") != NULL ||
+            strstr(execPath, "/TrollStore.app/") != NULL ||
+            strstr(execPath, "/Filza.app/") != NULL) {
             return;
         }
 
@@ -408,7 +407,7 @@ static void AutoIPLocHookEntry(void) {
             }
         }
 
-        // D. 补全基带与蜂窝运营商参数
+        // D. 补全基带与蜂窝运营商参数（飞行模式下依然保持 T-Mobile 310/260 LTE 特征）
         Class carrierCls = objc_getClass("CTCarrier");
         if (carrierCls) {
             Method mName = class_getInstanceMethod(carrierCls, NSSelectorFromString(@"carrierName"));
@@ -485,7 +484,7 @@ static void AutoIPLocHookEntry(void) {
             if (mChina) method_setImplementation(mChina, (IMP)hook_returnNO);
         }
 
-        // G. 通过 RootHide Patcher 绑定的 MSHookFunction 接管系统底层 C 函数（100% 稳定兼容 arm64e）
+        // G. 接管系统底层 C 函数（100% 兼容 arm64e）
         MSHookFunction((void *)_dyld_get_image_name, (void *)hook_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
 
         void *symCFTimeZone = dlsym(RTLD_DEFAULT, "CFTimeZoneCopySystem");
