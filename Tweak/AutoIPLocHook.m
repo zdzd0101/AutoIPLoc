@@ -20,18 +20,34 @@
 #include <ptrauth.h>
 #endif
 
-extern void MSHookFunction(void *symbol, void *replace, void **result);
 typedef void (*MSHookFunction_t)(void *symbol, void *replace, void **result);
 
 static NSString *const kGeoPrefPath = @"/var/mobile/Library/Preferences/com.autoiploc.geo.plist";
 static NSString *const kWifiPrefPath = @"/var/mobile/Library/Preferences/com.autoiploc.wifi.plist";
 
-// 扫描内存 Mach-O 符号表解析 ElleKit MSHookFunction（支持 arm64e PAC 签名）
+// 零外部依赖：直接从进程已加载的 ElleKit/TweakInject 句柄动态获取 PAC 安全的 MSHookFunction
 static MSHookFunction_t ResolvePACSafeHookFunction(void) {
     void *sym = dlsym(RTLD_DEFAULT, "MSHookFunction");
     if (sym) return (MSHookFunction_t)sym;
 
     uint32_t imgCount = _dyld_image_count();
+    for (uint32_t i = 1; i < imgCount; i++) {
+        const char *imgPath = _dyld_get_image_name(i);
+        if (!imgPath || strstr(imgPath, "AutoIPLocHook") != NULL) continue;
+
+        if (strstr(imgPath, "ellekit") != NULL ||
+            strstr(imgPath, "TweakInject") != NULL ||
+            strstr(imgPath, "Substrate") != NULL ||
+            strstr(imgPath, "jbroot") != NULL) {
+            void *handle = dlopen(imgPath, RTLD_NOLOAD | RTLD_NOW);
+            if (handle) {
+                sym = dlsym(handle, "MSHookFunction");
+                if (sym) return (MSHookFunction_t)sym;
+            }
+        }
+    }
+
+    // 兜底：直接解析内存镜像 Mach-O 符号表并签署 arm64e PAC 指针
     for (uint32_t i = 1; i < imgCount; i++) {
         const char *imgPath = _dyld_get_image_name(i);
         if (!imgPath || strstr(imgPath, "AutoIPLocHook") != NULL) continue;
@@ -71,7 +87,7 @@ static MSHookFunction_t ResolvePACSafeHookFunction(void) {
             }
         }
     }
-    return (MSHookFunction_t)MSHookFunction;
+    return NULL;
 }
 
 static NSDictionary *LoadGeoConfig(void) {
@@ -96,7 +112,7 @@ static NSString *GetTargetTimeZoneName(void) {
     return nil;
 }
 
-// 1. 彻底隐藏所有插件与 RootHide 底座镜像特征（消除 [功能插件注入] 与 [RootHide底座]）
+// 1. 隐藏所有插件与 RootHide 底座动态库特征（消除 [功能插件注入] 与 [RootHide底座]）
 static BOOL IsSensitiveDylibPath(const char *path) {
     if (!path) return NO;
     return (strstr(path, "AutoIPLocHook") != NULL ||
@@ -108,6 +124,7 @@ static BOOL IsSensitiveDylibPath(const char *path) {
             strstr(path, "/var/jb") != NULL ||
             strstr(path, "Crane") != NULL ||
             strstr(path, "AntiLocDetect") != NULL ||
+            strstr(path, "Choicy") != NULL ||
             strstr(path, "amg") != NULL);
 }
 
@@ -130,7 +147,7 @@ static int hook_dladdr(const void *addr, Dl_info *info) {
     return res;
 }
 
-// 2. 屏蔽文件与目录探测（消除越狱/插件路径检测）
+// 2. 屏蔽越狱与插件目录路径探测
 static BOOL IsRestrictedJailbreakPath(const char *path) {
     if (!path) return NO;
     if (strstr(path, "com.autoiploc") != NULL) return NO;
@@ -213,7 +230,7 @@ static CFTimeZoneRef hook_CFTimeZoneCopySystem(void) {
     return orig_CFTimeZoneCopySystem ? orig_CFTimeZoneCopySystem() : CFTimeZoneCopySystem();
 }
 
-// 4. 补全基带与蜂窝网络特征（飞行模式下依然输出 T-Mobile LTE 参数，消除 [基带特征] 告警）
+// 4. 补全基带与蜂窝网络特征（飞行模式下依然保持 T-Mobile 310/260 LTE 参数，消除 [基带特征] 告警）
 static NSString *(*orig_carrierName)(id self, SEL _cmd);
 static NSString *hook_carrierName(id self, SEL _cmd) {
     NSString *orig = orig_carrierName ? orig_carrierName(self, _cmd) : nil;
@@ -267,7 +284,7 @@ static NSString *hook_currentRadioTech(id self, SEL _cmd) {
     return @"CTRadioAccessTechnologyLTE";
 }
 
-// 5. 隐藏系统 HTTP/HTTPS/SOCKS5/PAC 显式代理（消除 [系统代理] 告警并保持正常联网）
+// 5. 隐藏系统 HTTP/HTTPS/SOCKS5/PAC 显式代理（消除 [系统代理] 告警）
 static BOOL IsSystemNetworkingCaller(void *retAddr) {
     if (!retAddr) return NO;
     Dl_info info;
@@ -388,7 +405,7 @@ static NSString *hook_targetCountryCode(id self, SEL _cmd) {
     return GetTargetCountryCode();
 }
 
-// 9. 将 IP 周边模拟 US Wi-Fi（主热点 + 周边热点特征）直接写入系统网络信息接口
+// 9. 将 IP 周边模拟 US Wi-Fi（主热点 + 周边 1～2 个邻近热点）写入系统网络信息接口
 static NSArray<NSDictionary *> *GetMockWiFiList(void) {
     NSDictionary *wifiCfg = [NSDictionary dictionaryWithContentsOfFile:kWifiPrefPath];
     if ([wifiCfg[@"enabled"] boolValue]) {
@@ -413,8 +430,8 @@ static CFDictionaryRef hook_CNCopyCurrentNetworkInfo(CFStringRef interfaceName) 
     NSArray<NSDictionary *> *nets = GetMockWiFiList();
     if (nets.count > 0) {
         NSDictionary *topAP = nets[0];
-        NSString *ssid = topAP[@"SSID"] ?: @"ATTP354G7";
-        NSString *bssid = topAP[@"BSSID"] ?: @"3C:37:86:08:4E:D3";
+        NSString *ssid = topAP[@"SSID"] ?: @"GoogleFiber-DFF8";
+        NSString *bssid = topAP[@"BSSID"] ?: @"20:4E:7F:90:C0:27";
         NSMutableDictionary *result = [@{
             (__bridge NSString *)kCNNetworkInfoKeySSID: ssid,
             (__bridge NSString *)kCNNetworkInfoKeyBSSID: bssid,
@@ -434,6 +451,15 @@ static CFDictionaryRef hook_CNCopyCurrentNetworkInfo(CFStringRef interfaceName) 
 __attribute__((constructor))
 static void AutoIPLocHookEntry(void) {
     @autoreleasepool {
+        // 保护自身主程序、Shadowrocket 与桌面核心进程不被钩子干扰
+        NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+        if ([bid isEqualToString:@"com.local.autoiploc"] ||
+            [bid isEqualToString:@"com.liguangming.Shadowrocket"] ||
+            [bid isEqualToString:@"com.apple.springboard"] ||
+            [bid hasPrefix:@"com.opa334."]) {
+            return;
+        }
+
         // A. 同步全局时区
         NSString *initTZ = GetTargetTimeZoneName();
         if (initTZ) {
@@ -575,7 +601,7 @@ static void AutoIPLocHookEntry(void) {
             if (mChina) method_setImplementation(mChina, (IMP)hook_returnNO);
         }
 
-        // G. PAC 安全接管底层 C 函数
+        // G. 运行时动态提取 ElleKit MSHookFunction 接管底层 C 函数
         MSHookFunction_t hookFn = ResolvePACSafeHookFunction();
         if (hookFn) {
             hookFn((void *)_dyld_get_image_name, (void *)hook_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
