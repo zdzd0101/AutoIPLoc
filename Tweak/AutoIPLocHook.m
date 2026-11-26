@@ -435,6 +435,13 @@ static NSString *hook_currentRadioTech(id self, SEL _cmd) {
     return @"CTRadioAccessTechnologyLTE";
 }
 
+static NSString *(*orig_dataServiceIdentifier)(id self, SEL _cmd) = NULL;
+static NSString *hook_dataServiceIdentifier(id self, SEL _cmd) {
+    NSString *orig = orig_dataServiceIdentifier ? orig_dataServiceIdentifier(self, _cmd) : nil;
+    if (orig.length > 0) return orig;
+    return @"0000000100000002";
+}
+
 static BOOL hook_returnYES(id self, SEL _cmd) {
     return YES;
 }
@@ -724,6 +731,7 @@ static void AutoIPLocHookEntry(void) {
         if (netInfoCls) {
             HookObjCMethod(netInfoCls, NSSelectorFromString(@"serviceCurrentRadioAccessTechnology"), (IMP)hook_serviceRadioTech, (IMP *)&orig_serviceRadioTech);
             HookObjCMethod(netInfoCls, NSSelectorFromString(@"currentRadioAccessTechnology"), (IMP)hook_currentRadioTech, (IMP *)&orig_currentRadioTech);
+            HookObjCMethod(netInfoCls, NSSelectorFromString(@"dataServiceIdentifier"), (IMP)hook_dataServiceIdentifier, (IMP *)&orig_dataServiceIdentifier);
         }
 
         Class srcInfoCls = objc_getClass("CLLocationSourceInformation");
@@ -779,7 +787,7 @@ static void AutoIPLocHookEntry(void) {
 
         NSDictionary *status = @{
             @"active": @YES,
-            @"version": @"4.0.0",
+            @"version": @"4.1.0",
             @"lastProc": [NSString stringWithUTF8String:prog],
             @"cHookReady": @(g_MSHookFunction != NULL)
         };
