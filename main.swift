@@ -205,7 +205,13 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             self.streetAddress = street
             self.zipCode = zip
         }
-        if let wDict = readSharedPlist(paths:     func syncEnvironment(forceReanchor: Bool = true) {
+        if let wDict = readSharedPlist(paths: wifiPlistPaths),
+           let nets = wDict["networks"] as? [[String: String]] {
+            self.wifiList = nets
+        }
+    }
+
+    func syncEnvironment(forceReanchor: Bool = true) {
         refreshHookStatus()
         guard !isSyncing else { return }
         isSyncing = true
@@ -316,13 +322,6 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
                         guard stillCurrent else { return }
                         self.isSyncing = false
                         self.statusError = "当前节点无法连接 IP 探测接口（\(lastErrorMsg)），请切换节点后重试。"
-                    }
-                }
-            }.resume()
-        }
-    }
-
-ror = "当前节点无法连接 IP 探测接口（\(lastErrorMsg)），请切换节点后重试。"
                     }
                 }
             }.resume()
