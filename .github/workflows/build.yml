@@ -40,18 +40,6 @@ jobs:
 
           zip -r AutoIPLoc.tipa Payload
 
-          mkdir -p CydiaSubstrate.framework
-          cat << 'EOF' > CydiaSubstrate.framework/CydiaSubstrate.tbd
-          --- !tapi-tbd
-          tbd-version:     4
-          targets:         [ arm64-ios, arm64e-ios ]
-          install-name:    '/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate'
-          exports:
-            - targets:         [ arm64-ios, arm64e-ios ]
-              symbols:         [ _MSHookFunction, _MSHookMessageEx ]
-          ...
-          EOF
-
           mkdir -p deb_pkg/DEBIAN
           mkdir -p deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries
 
@@ -60,8 +48,7 @@ jobs:
             -isysroot "$SDK_PATH" \
             -miphoneos-version-min=15.0 \
             -Wl,-no_fixup_chains \
-            -F. \
-            -framework Foundation -framework UIKit -framework CoreLocation -framework CoreTelephony -framework SystemConfiguration -framework CFNetwork -framework CydiaSubstrate \
+            -framework Foundation -framework UIKit -framework CoreLocation -framework CoreTelephony -framework SystemConfiguration -framework CFNetwork \
             -fobjc-arc \
             Tweak/AutoIPLocHook.m \
             -o deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
@@ -86,7 +73,7 @@ jobs:
           EOF
 
           INSTALLED_SIZE=$(du -sk deb_pkg/var | cut -f1)
-          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 3.6.0\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Fat arm64+arm64e classic Mach-O RootHide Patcher-bound ElleKit stealth hook + sandbox-shared config\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
+          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 3.7.0\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Zero-external-link-dep fat arm64+arm64e classic Mach-O RootHide runtime-resolved stealth hook\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
 
           chmod 0755 deb_pkg/DEBIAN
           chmod 0644 deb_pkg/DEBIAN/control
@@ -95,7 +82,6 @@ jobs:
 
           dpkg-deb -Zgzip -b deb_pkg AutoIPLocHook.deb
           ls -lh AutoIPLoc.tipa AutoIPLocHook.deb
-          lipo -info deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
