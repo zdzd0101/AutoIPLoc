@@ -34,9 +34,19 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     @Published var lockSessionGeo = true
     @Published var wifiList: [[String: String]] = []
 
-    private let geoPlistPath = "/var/mobile/Library/Preferences/com.autoiploc.geo.plist"
-    private let wifiPlistPath = "/var/mobile/Library/Preferences/com.autoiploc.wifi.plist"
-    private let hookStatusPath = "/var/mobile/Library/Preferences/com.autoiploc.hookstatus.plist"
+    private let geoPlistPaths = [
+        "/var/mobile/Library/Preferences/com.autoiploc.geo.plist",
+        "/var/tmp/com.autoiploc.geo.plist"
+    ]
+    private let wifiPlistPaths = [
+        "/var/mobile/Library/Preferences/com.autoiploc.wifi.plist",
+        "/var/tmp/com.autoiploc.wifi.plist"
+    ]
+    private let hookStatusPaths = [
+        "/var/mobile/Library/Preferences/com.autoiploc.hookstatus.plist",
+        "/var/tmp/com.autoiploc.hookstatus.plist"
+    ]
+
     private let locationManager = CLLocationManager()
     private let pathMonitor = NWPathMonitor()
     private let monitorQueue = DispatchQueue(label: "com.autoiploc.netmonitor")
@@ -52,20 +62,30 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         startNetworkMonitor()
     }
 
-    func refreshHookStatus() {
-        if let dict = NSDictionary(contentsOfFile: hookStatusPath) as? [String: Any],
-           let active = dict["active"] as? Bool, active {
-            let ver = dict["version"] as? String ?? "3.5.0"
-            let proc = dict["lastProc"] as? String ?? "目标应用"
-            let hookOk = (dict["cHookReady"] as? Bool) ?? false
-            self.hookIsActive = hookOk
-            self.hookStatusText = hookOk
-                ? "已激活 v\(ver)（最近注入: \(proc)）"
-                : "已注入 v\(ver) 但底层符号未绑定（\(proc)）"
-        } else {
-            self.hookIsActive = false
-            self.hookStatusText = "未检测到注入记录（请重开检测 App）"
+    private func writeSharedPlist(_ dict: [String: Any], paths: [String]) {
+        let nsDict = dict as NSDictionary
+        for path in paths {
+            nsDict.write(toFile: path, atomically: true)
+            chmod(path, 0o666)
         }
+    }
+
+    func refreshHookStatus() {
+        for path in hookStatusPaths {
+            if let dict = NSDictionary(contentsOfFile: path) as? [String: Any],
+               let active = dict["active"] as? Bool, active {
+                let ver = dict["version"] as? String ?? "3.6.0"
+                let proc = dict["lastProc"] as? String ?? "目标应用"
+                let hookOk = (dict["cHookReady"] as? Bool) ?? false
+                self.hookIsActive = hookOk
+                self.hookStatusText = hookOk
+                    ? "已激活 v\(ver)（最近注入: \(proc)）"
+                    : "已注入 v\(ver) 但底层符号未绑定（\(proc)）"
+                return
+            }
+        }
+        self.hookIsActive = false
+        self.hookStatusText = "未检测到注入记录（请重开检测 App）"
     }
 
     private func startNetworkMonitor() {
@@ -83,7 +103,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     }
 
     private func loadSavedState() {
-        if let dict = NSDictionary(contentsOfFile: geoPlistPath) as? [String: Any],
+        if let dict = NSDictionary(contentsOfFile: geoPlistPaths[0]) as? [String: Any],
            let enabled = dict["enabled"] as? Bool, enabled,
            let ip = dict["ip"] as? String,
            let cc = dict["countryCode"] as? String,
@@ -108,7 +128,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             self.streetAddress = street
             self.zipCode = zip
         }
-        if let wDict = NSDictionary(contentsOfFile: wifiPlistPath) as? [String: Any],
+        if let wDict = NSDictionary(contentsOfFile: wifiPlistPaths[0]) as? [String: Any],
            let nets = wDict["networks"] as? [[String: String]] {
             self.wifiList = nets
         }
@@ -314,7 +334,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             "zip": profile.zip,
             "isp": profile.isp
         ]
-        (geoDict as NSDictionary).write(toFile: geoPlistPath, atomically: true)
+        writeSharedPlist(geoDict, paths: geoPlistPaths)
     }
 
     private func commitSimulation(_ profile: GeoProfile) {
@@ -379,7 +399,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             "enabled": enabled,
             "networks": wifiList
         ]
-        (dict as NSDictionary).write(toFile: wifiPlistPath, atomically: true)
+        writeSharedPlist(dict, paths: wifiPlistPaths)
     }
 
     func resetAppleMapsCache() {
@@ -410,7 +430,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         statusError = nil
 
         let geoDict: [String: Any] = ["enabled": false]
-        (geoDict as NSDictionary).write(toFile: geoPlistPath, atomically: true)
+        writeSharedPlist(geoDict, paths: geoPlistPaths)
         saveWiFiPlist(enabled: false)
     }
 }
