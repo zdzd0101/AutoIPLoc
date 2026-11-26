@@ -87,25 +87,33 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     }
 
     func refreshHookStatus() {
+        let now = Date().timeIntervalSince1970
         for path in hookStatusPaths {
             if let dict = NSDictionary(contentsOfFile: path) as? [String: Any],
                let active = dict["active"] as? Bool, active {
-                let ver = dict["version"] as? String ?? "4.2.0"
+                let ver = dict["version"] as? String ?? "4.3.0"
                 let proc = dict["lastProc"] as? String ?? "目标应用"
                 let hookOk = (dict["cHookReady"] as? Bool) ?? false
-                self.hookIsActive = hookOk
-                self.hookStatusText = hookOk
-                    ? "已激活 v\(ver) · ElleKit全功能就绪（\(proc)）"
-                    : "已注入 v\(ver) · 底层符号未绑定（\(proc)）"
-                return
+                let ts = (dict["timestamp"] as? Double) ?? 0
+                let ageSec = Int(max(0, now - ts))
+
+                if ts > 0 && ageSec <= 300 && hookOk {
+                    self.hookIsActive = true
+                    self.hookStatusText = "已实时激活 v\(ver) · arm64e就绪（\(proc) · \(ageSec)秒前）"
+                    return
+                } else if ts > 0 && ageSec > 300 {
+                    self.hookIsActive = false
+                    self.hookStatusText = "上次注入已过 \(ageSec / 60) 分钟（请确认 Dopamine 插件注入已开启并重开目标 App）"
+                    return
+                }
             }
         }
 
         if let dylibPath = findInstalledHookDylib() {
             if let handle = dlopen(dylibPath, RTLD_NOW) {
                 dlclose(handle)
-                self.hookIsActive = true
-                self.hookStatusText = "二进制校验通过（请划掉重开检测 App 激活）"
+                self.hookIsActive = false
+                self.hookStatusText = "插件就绪（请开启 Dopamine 插件注入并重开检测 App）"
             } else {
                 let errStr = dlerror().map { String(cString: $0) } ?? "未知加载错误"
                 self.hookIsActive = false
