@@ -102,6 +102,8 @@ static BOOL IsJailbreakPath(const char *path) {
     return (strstr(path, "/var/jb") != NULL ||
             strstr(path, ".jbroot") != NULL ||
             strstr(path, "roothide") != NULL ||
+            strstr(path, "RootHide") != NULL ||
+            strstr(path, "Bootstrap") != NULL ||
             strstr(path, "MobileSubstrate") != NULL ||
             strstr(path, "CydiaSubstrate") != NULL ||
             strstr(path, "libsubstrate") != NULL ||
@@ -113,6 +115,7 @@ static BOOL IsJailbreakPath(const char *path) {
             strstr(path, "Filza.app") != NULL ||
             strstr(path, "TrollStore") != NULL ||
             strstr(path, "Dopamine") != NULL ||
+            strstr(path, "Crane") != NULL ||
             strstr(path, "/usr/bin/sshd") != NULL ||
             strstr(path, "/etc/apt") != NULL ||
             strstr(path, "/bin/bash") != NULL ||
@@ -277,7 +280,7 @@ static BOOL hook_returnYES(id self, SEL _cmd) {
     return YES;
 }
 
-// 5. 隐藏系统 HTTP/HTTPS/SOCKS5/PAC 显式代理（仅对系统底层网络库放行联网，屏蔽 GeoComply 代理弹窗）
+// 5. 隐藏系统 HTTP/HTTPS/SOCKS5/PAC 显式代理（仅对系统底层网络库放行联网，消除 GeoComply 代理弹窗）
 static BOOL IsSystemNetworkingCaller(void *retAddr) {
     if (!retAddr) return NO;
     Dl_info info;
@@ -286,9 +289,7 @@ static BOOL IsSystemNetworkingCaller(void *retAddr) {
         if (strstr(info.dli_fname, "CFNetwork") != NULL ||
             strstr(info.dli_fname, "WebKit") != NULL ||
             strstr(info.dli_fname, "libnetwork") != NULL ||
-            strstr(info.dli_fname, "Network.framework") != NULL ||
-            strstr(info.dli_fname, "Foundation") != NULL ||
-            strstr(info.dli_fname, "Security") != NULL) {
+            strstr(info.dli_fname, "Network.framework") != NULL) {
             return YES;
         }
     }
@@ -615,7 +616,7 @@ static void AutoIPLocHookEntry(void) {
             }
         }
 
-        // G. 接管系统底层 C 函数（由 RootHide Patcher 自动绑定至 ElleKit PAC 签名跳板）
+        // G. 接管系统底层 C 函数（由 RootHide Patcher 自动绑定至 ElleKit）
         MSHookFunction((void *)_dyld_get_image_name, (void *)hook_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
         MSHookFunction((void *)dladdr, (void *)hook_dladdr, (void **)&orig_dladdr);
         MSHookFunction((void *)getenv, (void *)hook_getenv, (void **)&orig_getenv);
