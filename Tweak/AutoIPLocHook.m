@@ -8,10 +8,6 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <mach-o/dyld.h>
-#import <mach-o/loader.h>
-#import <mach-o/nlist.h>
-#import <mach/mach.h>
-#import <mach/vm_map.h>
 #import <ifaddrs.h>
 #import <dlfcn.h>
 #import <dirent.h>
@@ -28,81 +24,25 @@ static MSHookFunction_t g_MSHookFunction = NULL;
 static MSHookMessageEx_t g_MSHookMessageEx = NULL;
 static int (*orig_dladdr)(const void *addr, Dl_info *info) = NULL;
 
-struct rebinding_entry {
-    const char *name;
-    void *replacement;
-    void **replaced;
-};
-
-static void rebind_symbols_for_image(const struct mach_header *header, intptr_t slide, struct rebinding_entry *rebindings, size_t rebindings_nel) {
-    if (!header) return;
-    struct segment_command_64 *cur_seg_cmd;
-    struct segment_command_64 *linkedit_segment = NULL;
-    struct symtab_command *symtab_cmd = NULL;
-    struct dysymtab_command *dysymtab_cmd = NULL;
-
-    uintptr_t cur = (uintptr_t)header + sizeof(struct mach_header_64);
-    for (uint32_t i = 0; i < header->ncmds; i++, cur += cur_seg_cmd->cmdsize) {
-        cur_seg_cmd = (struct segment_command_64 *)cur;
-        if (cur_seg_cmd->cmd == LC_SEGMENT_64) {
-            if (strcmp(cur_seg_cmd->segname, SEG_LINKEDIT) == 0) {
-                linkedit_segment = cur_seg_cmd;
-            }
-        } else if (cur_seg_cmd->cmd == LC_SYMTAB) {
-            symtab_cmd = (struct symtab_command *)cur_seg_cmd;
-        } else if (cur_seg_cmd->cmd == LC_DYSYMTAB) {
-            dysymtab_cmd = (struct dysymtab_command *)cur_seg_cmd;
+static BOOL TryLoadElleKitFromRoot(const char *jbRoot) {
+    if (!jbRoot || jbRoot[0] == '\0') return NO;
+    const char *relPaths[] = {
+        "/usr/lib/libellekit.dylib",
+        "/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate",
+        "/usr/lib/libsubstrate.dylib",
+        "/usr/lib/TweakInject.dylib"
+    };
+    for (int i = 0; i < 4; i++) {
+        char fullPath[768] = {0};
+        snprintf(fullPath, sizeof(fullPath), "%s%s", jbRoot, relPaths[i]);
+        void *h = dlopen(fullPath, RTLD_NOW | RTLD_GLOBAL);
+        if (h) {
+            if (!g_MSHookFunction) g_MSHookFunction = (MSHookFunction_t)dlsym(h, "MSHookFunction");
+            if (!g_MSHookMessageEx) g_MSHookMessageEx = (MSHookMessageEx_t)dlsym(h, "MSHookMessageEx");
+            if (g_MSHookFunction && g_MSHookMessageEx) return YES;
         }
     }
-
-    if (!symtab_cmd || !dysymtab_cmd || !linkedit_segment || !dysymtab_cmd->nindirectsyms) return;
-
-    uintptr_t linkedit_base = (uintptr_t)slide + linkedit_segment->vmaddr - linkedit_segment->fileoff;
-    struct nlist_64 *symtab = (struct nlist_64 *)(linkedit_base + symtab_cmd->symoff);
-    char *strtab = (char *)(linkedit_base + symtab_cmd->stroff);
-    uint32_t *indirect_symtab = (uint32_t *)(linkedit_base + dysymtab_cmd->indirectsymoff);
-
-    cur = (uintptr_t)header + sizeof(struct mach_header_64);
-    for (uint32_t i = 0; i < header->ncmds; i++, cur += cur_seg_cmd->cmdsize) {
-        cur_seg_cmd = (struct segment_command_64 *)cur;
-        if (cur_seg_cmd->cmd == LC_SEGMENT_64) {
-            if (strcmp(cur_seg_cmd->segname, SEG_DATA) != 0 && strcmp(cur_seg_cmd->segname, "__DATA_CONST") != 0) {
-                continue;
-            }
-            for (uint32_t j = 0; j < cur_seg_cmd->nsects; j++) {
-                struct section_64 *sect = (struct section_64 *)(cur + sizeof(struct segment_command_64)) + j;
-                uint32_t type = sect->flags & SECTION_TYPE;
-                if (type != S_LAZY_SYMBOL_POINTERS && type != S_NON_LAZY_SYMBOL_POINTERS) continue;
-
-                uint32_t *indirect_symbol_indices = indirect_symtab + sect->reserved1;
-                void **indirect_symbol_bindings = (void **)((uintptr_t)slide + sect->addr);
-                size_t count = sect->size / sizeof(void *);
-
-                vm_protect(mach_task_self(), (vm_address_t)indirect_symbol_bindings, sect->size, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-
-                for (size_t k = 0; k < count; k++) {
-                    uint32_t symtab_index = indirect_symbol_indices[k];
-                    if (symtab_index == INDIRECT_SYMBOL_ABS || symtab_index == INDIRECT_SYMBOL_LOCAL ||
-                        symtab_index == (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS)) {
-                        continue;
-                    }
-                    uint32_t strtab_offset = symtab[symtab_index].n_un.n_strx;
-                    char *symbol_name = strtab + strtab_offset;
-                    if (strnlen(symbol_name, 2) < 2) continue;
-
-                    for (size_t r = 0; r < rebindings_nel; r++) {
-                        if (strcmp(&symbol_name[1], rebindings[r].name) == 0) {
-                            if (rebindings[r].replaced != NULL && *(rebindings[r].replaced) == NULL) {
-                                *(rebindings[r].replaced) = indirect_symbol_bindings[k];
-                            }
-                            indirect_symbol_bindings[k] = rebindings[r].replacement;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
+    return NO;
 }
 
 static void ResolveElleKitRuntime(void *selfSymbolAddr) {
@@ -112,6 +52,28 @@ static void ResolveElleKitRuntime(void *selfSymbolAddr) {
     if (!g_MSHookMessageEx) g_MSHookMessageEx = (MSHookMessageEx_t)dlsym(RTLD_NEXT, "MSHookMessageEx");
     if (g_MSHookFunction && g_MSHookMessageEx) return;
 
+    // 1. 优先读取 postinst 写入的真实 .jbroot 路径（绕过 RootHide 路径隐藏）
+    NSString *savedRoot = [NSString stringWithContentsOfFile:@"/var/tmp/com.autoiploc.jbroot.txt" encoding:NSUTF8StringEncoding error:nil];
+    if (savedRoot.length > 0) {
+        NSString *trimmed = [savedRoot stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (TryLoadElleKitFromRoot(trimmed.UTF8String)) return;
+    }
+
+    // 2. 通过自身镜像信息反推 .jbroot
+    Dl_info selfInfo;
+    if (dladdr(selfSymbolAddr, &selfInfo) != 0 && selfInfo.dli_fname != NULL) {
+        const char *libMarker = strstr(selfInfo.dli_fname, "/Library/");
+        if (libMarker != NULL) {
+            size_t rootLen = (size_t)(libMarker - selfInfo.dli_fname);
+            if (rootLen > 0 && rootLen < 512) {
+                char jbRoot[512] = {0};
+                memcpy(jbRoot, selfInfo.dli_fname, rootLen);
+                if (TryLoadElleKitFromRoot(jbRoot)) return;
+            }
+        }
+    }
+
+    // 3. 扫描已加载镜像提取 ElleKit 符号
     uint32_t count = _dyld_image_count();
     for (uint32_t i = 1; i < count; i++) {
         const char *img = _dyld_get_image_name(i);
@@ -124,34 +86,6 @@ static void ResolveElleKitRuntime(void *selfSymbolAddr) {
                 if (!g_MSHookFunction) g_MSHookFunction = (MSHookFunction_t)dlsym(h, "MSHookFunction");
                 if (!g_MSHookMessageEx) g_MSHookMessageEx = (MSHookMessageEx_t)dlsym(h, "MSHookMessageEx");
                 if (g_MSHookFunction && g_MSHookMessageEx) return;
-            }
-        }
-    }
-
-    Dl_info selfInfo;
-    if (dladdr(selfSymbolAddr, &selfInfo) != 0 && selfInfo.dli_fname != NULL) {
-        const char *libMarker = strstr(selfInfo.dli_fname, "/Library/");
-        if (libMarker != NULL) {
-            size_t rootLen = (size_t)(libMarker - selfInfo.dli_fname);
-            if (rootLen > 0 && rootLen < 512) {
-                char jbRoot[512] = {0};
-                memcpy(jbRoot, selfInfo.dli_fname, rootLen);
-                const char *relPaths[] = {
-                    "/usr/lib/libellekit.dylib",
-                    "/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate",
-                    "/usr/lib/libsubstrate.dylib",
-                    "/usr/lib/TweakInject.dylib"
-                };
-                for (int i = 0; i < 4; i++) {
-                    char fullPath[768] = {0};
-                    snprintf(fullPath, sizeof(fullPath), "%s%s", jbRoot, relPaths[i]);
-                    void *h = dlopen(fullPath, RTLD_NOW | RTLD_GLOBAL);
-                    if (h) {
-                        if (!g_MSHookFunction) g_MSHookFunction = (MSHookFunction_t)dlsym(h, "MSHookFunction");
-                        if (!g_MSHookMessageEx) g_MSHookMessageEx = (MSHookMessageEx_t)dlsym(h, "MSHookMessageEx");
-                        if (g_MSHookFunction && g_MSHookMessageEx) return;
-                    }
-                }
             }
         }
     }
@@ -570,18 +504,32 @@ static id hook_initWithSimState(id self, SEL _cmd, BOOL isSimulated, BOOL isAcce
     return self;
 }
 
+static id CreateCleanLocationSourceInfo(void) {
+    Class srcInfoCls = objc_getClass("CLLocationSourceInformation");
+    if (!srcInfoCls) return nil;
+    SEL initSel = NSSelectorFromString(@"initWithSoftwareSimulationState:externalAccessoryState:");
+    id obj = [srcInfoCls alloc];
+    if ([obj respondsToSelector:initSel]) {
+        if (orig_initWithSimState) {
+            return orig_initWithSimState(obj, initSel, NO, NO);
+        }
+        return ((id (*)(id, SEL, BOOL, BOOL))objc_msgSend)(obj, initSel, NO, NO);
+    }
+    return [obj init];
+}
+
 static id (*orig_sourceInformation)(id self, SEL _cmd) = NULL;
 static id hook_sourceInformation(id self, SEL _cmd) {
-    Class srcInfoCls = objc_getClass("CLLocationSourceInformation");
-    if (srcInfoCls) {
-        SEL initSel = NSSelectorFromString(@"initWithSoftwareSimulationState:externalAccessoryState:");
-        id obj = [srcInfoCls alloc];
-        if ([obj respondsToSelector:initSel]) {
-            return ((id (*)(id, SEL, BOOL, BOOL))objc_msgSend)(obj, initSel, NO, NO);
-        }
-        return [obj init];
-    }
+    id clean = CreateCleanLocationSourceInfo();
+    if (clean) return clean;
     return orig_sourceInformation ? orig_sourceInformation(self, _cmd) : nil;
+}
+
+static id (*orig_srcInfoCopyWithZone)(id self, SEL _cmd, NSZone *zone) = NULL;
+static id hook_srcInfoCopyWithZone(id self, SEL _cmd, NSZone *zone) {
+    id clean = CreateCleanLocationSourceInfo();
+    if (clean) return clean;
+    return orig_srcInfoCopyWithZone ? orig_srcInfoCopyWithZone(self, _cmd, zone) : self;
 }
 
 static NSString *hook_targetCountryCode(id self, SEL _cmd) {
@@ -612,8 +560,8 @@ static CFDictionaryRef hook_CNCopyCurrentNetworkInfo(CFStringRef interfaceName) 
     NSArray<NSDictionary *> *nets = GetMockWiFiList();
     if (nets.count > 0) {
         NSDictionary *topAP = nets[0];
-        NSString *ssid = topAP[@"SSID"] ?: @"Linksys-352B";
-        NSString *bssid = topAP[@"BSSID"] ?: @"20:4E:7F:6E:BB:D3";
+        NSString *ssid = topAP[@"SSID"] ?: @"NETGEAR-C27B-5G";
+        NSString *bssid = topAP[@"BSSID"] ?: @"20:4E:7F:67:BC:7F";
         NSMutableDictionary *result = [@{
             (__bridge NSString *)kCNNetworkInfoKeySSID: ssid,
             (__bridge NSString *)kCNNetworkInfoKeyBSSID: bssid,
@@ -628,34 +576,6 @@ static CFDictionaryRef hook_CNCopyCurrentNetworkInfo(CFStringRef interfaceName) 
         return (__bridge_retained CFDictionaryRef)result;
     }
     return orig_CNCopyCurrentNetworkInfo ? orig_CNCopyCurrentNetworkInfo(interfaceName) : NULL;
-}
-
-static void ApplyFishhookFallback(void) {
-    struct rebinding_entry entries[] = {
-        {"_dyld_get_image_name", (void *)hook_dyld_get_image_name, (void **)&orig_dyld_get_image_name},
-        {"dladdr", (void *)hook_dladdr, (void **)&orig_dladdr},
-        {"getenv", (void *)hook_getenv, (void **)&orig_getenv},
-        {"access", (void *)hook_access, (void **)&orig_access},
-        {"stat", (void *)hook_stat, (void **)&orig_stat},
-        {"lstat", (void *)hook_lstat, (void **)&orig_lstat},
-        {"fopen", (void *)hook_fopen, (void **)&orig_fopen},
-        {"opendir", (void *)hook_opendir, (void **)&orig_opendir},
-        {"fork", (void *)hook_fork, (void **)&orig_fork},
-        {"CFTimeZoneCopySystem", (void *)hook_CFTimeZoneCopySystem, (void **)&orig_CFTimeZoneCopySystem},
-        {"CFNetworkCopySystemProxySettings", (void *)hook_CFNetworkCopySystemProxySettings, (void **)&orig_CFNetworkCopySystemProxySettings},
-        {"SCDynamicStoreCopyProxies", (void *)hook_SCDynamicStoreCopyProxies, (void **)&orig_SCDynamicStoreCopyProxies},
-        {"getifaddrs", (void *)hook_getifaddrs, (void **)&orig_getifaddrs},
-        {"CNCopyCurrentNetworkInfo", (void *)hook_CNCopyCurrentNetworkInfo, (void **)&orig_CNCopyCurrentNetworkInfo},
-        {"CNCopySupportedInterfaces", (void *)hook_CNCopySupportedInterfaces, (void **)&orig_CNCopySupportedInterfaces}
-    };
-    size_t n = sizeof(entries) / sizeof(entries[0]);
-    uint32_t imgCount = _dyld_image_count();
-    for (uint32_t i = 0; i < imgCount; i++) {
-        const char *imgName = _dyld_get_image_name(i);
-        if (!imgName) continue;
-        if (strncmp(imgName, "/usr/lib/system/", 16) == 0 || strncmp(imgName, "/usr/lib/dyld", 13) == 0) continue;
-        rebind_symbols_for_image(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i), entries, n);
-    }
 }
 
 __attribute__((constructor))
@@ -739,6 +659,7 @@ static void AutoIPLocHookEntry(void) {
             HookObjCMethod(srcInfoCls, NSSelectorFromString(@"isSimulatedBySoftware"), (IMP)hook_returnNO, NULL);
             HookObjCMethod(srcInfoCls, NSSelectorFromString(@"isProducedByAccessory"), (IMP)hook_returnNO, NULL);
             HookObjCMethod(srcInfoCls, NSSelectorFromString(@"initWithSoftwareSimulationState:externalAccessoryState:"), (IMP)hook_initWithSimState, (IMP *)&orig_initWithSimState);
+            HookObjCMethod(srcInfoCls, @selector(copyWithZone:), (IMP)hook_srcInfoCopyWithZone, (IMP *)&orig_srcInfoCopyWithZone);
         }
         Class locCls = objc_getClass("CLLocation");
         if (locCls) {
@@ -781,15 +702,13 @@ static void AutoIPLocHookEntry(void) {
             g_MSHookFunction((void *)getifaddrs, (void *)hook_getifaddrs, (void **)&orig_getifaddrs);
             g_MSHookFunction((void *)CNCopyCurrentNetworkInfo, (void *)hook_CNCopyCurrentNetworkInfo, (void **)&orig_CNCopyCurrentNetworkInfo);
             g_MSHookFunction((void *)CNCopySupportedInterfaces, (void *)hook_CNCopySupportedInterfaces, (void **)&orig_CNCopySupportedInterfaces);
-        } else {
-            ApplyFishhookFallback();
         }
 
         NSDictionary *status = @{
             @"active": @YES,
-            @"version": @"4.1.0",
+            @"version": @"4.2.0",
             @"lastProc": [NSString stringWithUTF8String:prog],
-            @"cHookReady": @(g_MSHookFunction != NULL)
+            @"cHookReady": @(g_MSHookFunction != NULL && g_MSHookMessageEx != NULL)
         };
         [status writeToFile:@"/var/mobile/Library/Preferences/com.autoiploc.hookstatus.plist" atomically:YES];
         [status writeToFile:@"/var/tmp/com.autoiploc.hookstatus.plist" atomically:YES];
