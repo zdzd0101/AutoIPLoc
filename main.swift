@@ -4,6 +4,7 @@ import CoreLocation
 import Network
 import AVFoundation
 import Darwin
+import ObjectiveC
 
 struct GeoProfile: Codable {
     var ip: String
@@ -109,6 +110,69 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         }
     }
 
+    private func makeSimulationManager(requiredSelectors: [String]) -> CLSimulationManager? {
+        guard let managerClass = NSClassFromString("CLSimulationManager") else {
+            statusError = "当前系统未提供 CLSimulationManager，无法确认定位模拟已启动。"
+            return nil
+        }
+
+        for name in requiredSelectors {
+            let selector = NSSelectorFromString(name)
+            guard class_getInstanceMethod(managerClass, selector) != nil else {
+                statusError = "当前系统的 CLSimulationManager 缺少接口：\(name)"
+                return nil
+            }
+        }
+        return CLSimulationManager()
+    }
+
+    private func startLocationSimulation(for profile: GeoProfile) -> Bool {
+        let required = [
+            "stopLocationSimulation",
+            "clearSimulatedLocations",
+            "appendSimulatedLocation:",
+            "flush",
+            "startLocationSimulation"
+        ]
+        guard let manager = makeSimulationManager(requiredSelectors: required) else {
+            return false
+        }
+
+        let location = CLLocation(
+            coordinate: CLLocationCoordinate2D(
+                latitude: profile.latitude,
+                longitude: profile.longitude
+            ),
+            altitude: Double.random(in: 18.0...145.0),
+            horizontalAccuracy: 5.0,
+            verticalAccuracy: 8.0,
+            course: -1,
+            speed: 0,
+            timestamp: Date()
+        )
+        manager.stopLocationSimulation()
+        manager.clearSimulatedLocations()
+        manager.appendSimulatedLocation(location)
+        manager.flush()
+        manager.startLocationSimulation()
+        return true
+    }
+
+    private func stopLocationSimulation() -> Bool {
+        let required = [
+            "stopLocationSimulation",
+            "clearSimulatedLocations",
+            "flush"
+        ]
+        guard let manager = makeSimulationManager(requiredSelectors: required) else {
+            return false
+        }
+        manager.stopLocationSimulation()
+        manager.clearSimulatedLocations()
+        manager.flush()
+        return true
+    }
+
     private func findInstalledHookDylib() -> String? {
         let fm = FileManager.default
         let baseDir = "/var/containers/Bundle/Application"
@@ -198,12 +262,15 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
                 street: street, zip: zip, isp: isp
             )
             self.lockedProfile = profile
-            self.isSimulating = true
+            self.isSimulating = startLocationSimulation(for: profile)
             self.exitIP = "\(ip) [\(cc)]"
             self.timezoneName = tz
             self.coordText = String(format: "%.5f, %.5f", lat, lon)
             self.streetAddress = street
             self.zipCode = zip
+            if !self.isSimulating && self.statusError == nil {
+                self.statusError = "已加载保存的定位配置，但系统未确认定位模拟已启动。"
+            }
         }
         if let wDict = readSharedPlist(paths: wifiPlistPaths),
            let nets = wDict["networks"] as? [[String: String]] {
@@ -461,9 +528,9 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         }
     }
 
-    private func writeGeoPlist(_ profile: GeoProfile) {
+    private func writeGeoPlist(_ profile: GeoProfile, enabled: Bool = true) {
         let geoDict: [String: Any] = [
-            "enabled": true,
+            "enabled": enabled,
             "ip": profile.ip,
             "countryCode": profile.countryCode,
             "region": profile.region,
@@ -480,7 +547,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
 
     private func commitSimulation(_ profile: GeoProfile) {
         self.lockedProfile = profile
-        self.isSimulating = true
+        self.isSimulating = false
         self.isSyncing = false
         self.statusError = nil
         self.exitIP = "\(profile.ip) [\(profile.countryCode)]"
@@ -493,24 +560,13 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             regenerateWiFiList(save: false)
         }
 
-        writeGeoPlist(profile)
-        saveWiFiPlist(enabled: true)
-
-        let simLocation = CLLocation(
-            coordinate: CLLocationCoordinate2D(latitude: profile.latitude, longitude: profile.longitude),
-            altitude: Double.random(in: 18.0...145.0),
-            horizontalAccuracy: 5.0,
-            verticalAccuracy: 8.0,
-            course: -1,
-            speed: 0,
-            timestamp: Date()
-        )
-        let simManager = CLSimulationManager()
-        simManager.stopLocationSimulation()
-        simManager.clearSimulatedLocations()
-        simManager.appendSimulatedLocation(simLocation)
-        simManager.flush()
-        simManager.startLocationSimulation()
+        let simulationStarted = startLocationSimulation(for: profile)
+        self.isSimulating = simulationStarted
+        writeGeoPlist(profile, enabled: simulationStarted)
+        saveWiFiPlist(enabled: simulationStarted)
+        if !simulationStarted && self.statusError == nil {
+            self.statusError = "定位配置已保存，但系统定位模拟未启动。"
+        }
     }
 
     func regenerateWiFiList(save: Bool = true) {
@@ -550,8 +606,16 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             "/var/mobile/Library/Caches/GeoServices",
             "/var/mobile/Library/Preferences/com.apple.GEO.plist"
         ]
-        for p in paths {
-            try? fm.removeItem(atPath: p)
+        var failures: [String] = []
+        for path in paths where fm.fileExists(atPath: path) {
+            do {
+                try fm.removeItem(atPath: path)
+            } catch {
+                failures.append("\(path): \(error.localizedDescription)")
+            }
+        }
+        if !failures.isEmpty {
+            statusError = "部分 Apple Maps 缓存未能清理：\(failures.joined(separator: "；"))"
         }
     }
 
@@ -566,10 +630,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         sessionToCancel?.invalidateAndCancel()
         isSyncing = false
 
-        let simManager = CLSimulationManager()
-        simManager.stopLocationSimulation()
-        simManager.clearSimulatedLocations()
-        simManager.flush()
+        guard stopLocationSimulation() else { return }
 
         isSimulating = false
         lockedProfile = nil
