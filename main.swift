@@ -1,697 +1,590 @@
-#import <Foundation/Foundation.h>
-#import <UIKit/UIKit.h>
-#import <CoreLocation/CoreLocation.h>
-#import <CoreTelephony/CTCarrier.h>
-#import <CoreTelephony/CTTelephonyNetworkInfo.h>
-#import <SystemConfiguration/CaptiveNetwork.h>
-#import <CFNetwork/CFNetwork.h>
-#import <objc/runtime.h>
-#import <objc/message.h>
-#import <mach-o/dyld.h>
-#import <ifaddrs.h>
-#import <dlfcn.h>
-#import <dirent.h>
-#import <sys/stat.h>
-#import <unistd.h>
-#import <errno.h>
-#import <stdlib.h>
-#import <string.h>
+import SwiftUI
+import UIKit
+import CoreLocation
+import Network
+import AVFoundation
+import Darwin
 
-typedef void (*MSHookFunction_t)(void *symbol, void *replace, void **result);
-typedef void (*MSHookMessageEx_t)(Class _class, SEL message, IMP hook, IMP *old);
+struct GeoProfile: Codable {
+    var ip: String
+    var countryCode: String
+    var region: String
+    var city: String
+    var timezone: String
+    var latitude: Double
+    var longitude: Double
+    var street: String
+    var zip: String
+    var isp: String
+}
 
-static MSHookFunction_t g_MSHookFunction = NULL;
-static MSHookMessageEx_t g_MSHookMessageEx = NULL;
-static int (*orig_dladdr)(const void *addr, Dl_info *info) = NULL;
+final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegate {
+    static let shared = LocationEngine()
 
-static void ResolveElleKitRuntime(void *selfSymbolAddr) {
-    g_MSHookFunction = (MSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
-    g_MSHookMessageEx = (MSHookMessageEx_t)dlsym(RTLD_DEFAULT, "MSHookMessageEx");
-    if (!g_MSHookFunction) g_MSHookFunction = (MSHookFunction_t)dlsym(RTLD_NEXT, "MSHookFunction");
-    if (!g_MSHookMessageEx) g_MSHookMessageEx = (MSHookMessageEx_t)dlsym(RTLD_NEXT, "MSHookMessageEx");
-    if (g_MSHookFunction && g_MSHookMessageEx) return;
+    @Published var isSimulating = false
+    @Published var isSyncing = false
+    @Published var statusError: String? = nil
+    @Published var exitIP = "未获取 [--]"
+    @Published var timezoneName = "- (待同步)"
+    @Published var coordText = "- (0.0000, 0.0000)"
+    @Published var streetAddress = "等待同步解析附近精确街道地址..."
+    @Published var zipCode = "--"
+    @Published var hookStatusText = "待检测（重开一次目标 App 后自动刷新）"
+    @Published var hookIsActive = false
+    @Published var autoSyncOnNetworkChange = true
+    @Published var lockSessionGeo = true
+    @Published var wifiList: [[String: String]] = []
 
-    // 1. 扫描进程内已加载镜像提取 ElleKit 符号（在挂钩 _dyld_get_image_name 之前执行）
-    uint32_t count = _dyld_image_count();
-    for (uint32_t i = 1; i < count; i++) {
-        const char *img = _dyld_get_image_name(i);
-        if (!img) continue;
-        if (strstr(img, "ellekit") != NULL || strstr(img, "substrate") != NULL ||
-            strstr(img, "Substrate") != NULL || strstr(img, "TweakInject") != NULL) {
-            void *h = dlopen(img, RTLD_NOLOAD | RTLD_LAZY);
-            if (!h) h = dlopen(img, RTLD_NOW | RTLD_GLOBAL);
-            if (h) {
-                if (!g_MSHookFunction) g_MSHookFunction = (MSHookFunction_t)dlsym(h, "MSHookFunction");
-                if (!g_MSHookMessageEx) g_MSHookMessageEx = (MSHookMessageEx_t)dlsym(h, "MSHookMessageEx");
-                if (g_MSHookFunction && g_MSHookMessageEx) return;
-            }
+    private let geoPlistPaths = [
+        "/var/mobile/Library/Preferences/com.autoiploc.geo.plist",
+        "/var/tmp/com.autoiploc.geo.plist"
+    ]
+    private let wifiPlistPaths = [
+        "/var/mobile/Library/Preferences/com.autoiploc.wifi.plist",
+        "/var/tmp/com.autoiploc.wifi.plist"
+    ]
+    private let hookStatusPaths = [
+        "/var/mobile/Library/Preferences/com.autoiploc.hookstatus.plist",
+        "/var/tmp/com.autoiploc.hookstatus.plist"
+    ]
+
+    private let locationManager = CLLocationManager()
+    private let pathMonitor = NWPathMonitor()
+    private let monitorQueue = DispatchQueue(label: "com.autoiploc.netmonitor")
+    private var lastPathStatus: NWPath.Status?
+    private var lockedProfile: GeoProfile?
+
+    override init() {
+        super.init()
+        locationManager.delegate = self
+        locationManager.requestAlwaysAuthorization()
+        loadSavedState()
+        refreshHookStatus()
+        startNetworkMonitor()
+    }
+
+    private func writeSharedPlist(_ dict: [String: Any], paths: [String]) {
+        let nsDict = dict as NSDictionary
+        for path in paths {
+            nsDict.write(toFile: path, atomically: true)
+            chmod(path, 0o666)
         }
     }
 
-    // 2. 通过自身动态库路径反推 .jbroot 目录加载 libellekit.dylib
-    Dl_info selfInfo;
-    if (dladdr(selfSymbolAddr, &selfInfo) != 0 && selfInfo.dli_fname != NULL) {
-        const char *libMarker = strstr(selfInfo.dli_fname, "/Library/");
-        if (libMarker != NULL) {
-            size_t rootLen = (size_t)(libMarker - selfInfo.dli_fname);
-            if (rootLen > 0 && rootLen < 512) {
-                char jbRoot[512] = {0};
-                memcpy(jbRoot, selfInfo.dli_fname, rootLen);
-                const char *relPaths[] = {
-                    "/usr/lib/libellekit.dylib",
-                    "/usr/lib/libsubstrate.dylib",
-                    "/usr/lib/TweakInject.dylib"
-                };
-                for (int i = 0; i < 3; i++) {
-                    char fullPath[768] = {0};
-                    snprintf(fullPath, sizeof(fullPath), "%s%s", jbRoot, relPaths[i]);
-                    void *h = dlopen(fullPath, RTLD_NOW | RTLD_GLOBAL);
-                    if (h) {
-                        if (!g_MSHookFunction) g_MSHookFunction = (MSHookFunction_t)dlsym(h, "MSHookFunction");
-                        if (!g_MSHookMessageEx) g_MSHookMessageEx = (MSHookMessageEx_t)dlsym(h, "MSHookMessageEx");
-                        if (g_MSHookFunction && g_MSHookMessageEx) return;
+    func refreshHookStatus() {
+        for path in hookStatusPaths {
+            if let dict = NSDictionary(contentsOfFile: path) as? [String: Any],
+               let active = dict["active"] as? Bool, active {
+                let ver = dict["version"] as? String ?? "3.7.1"
+                let proc = dict["lastProc"] as? String ?? "目标应用"
+                let hookOk = (dict["cHookReady"] as? Bool) ?? false
+                self.hookIsActive = hookOk
+                self.hookStatusText = hookOk
+                    ? "已激活 v\(ver)（最近注入: \(proc)）"
+                    : "已注入 v\(ver) 但底层符号未绑定（\(proc)）"
+                return
+            }
+        }
+        self.hookIsActive = false
+        self.hookStatusText = "未检测到注入记录（请重开检测 App）"
+    }
+
+    private func startNetworkMonitor() {
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            guard let self = self else { return }
+            defer { self.lastPathStatus = path.status }
+            guard let prev = self.lastPathStatus, prev != path.status, path.status == .satisfied else { return }
+            DispatchQueue.main.async {
+                if self.autoSyncOnNetworkChange && !(self.lockSessionGeo && self.isSimulating) {
+                    self.syncEnvironment(forceReanchor: false)
+                }
+            }
+        }
+        pathMonitor.start(queue: monitorQueue)
+    }
+
+    private func loadSavedState() {
+        if let dict = NSDictionary(contentsOfFile: geoPlistPaths[0]) as? [String: Any],
+           let enabled = dict["enabled"] as? Bool, enabled,
+           let ip = dict["ip"] as? String,
+           let cc = dict["countryCode"] as? String,
+           let tz = dict["timezone"] as? String,
+           let lat = dict["lat"] as? Double,
+           let lon = dict["lon"] as? Double {
+            let street = dict["street"] as? String ?? "742 Evergreen Terrace"
+            let zip = dict["zip"] as? String ?? "10001"
+            let city = dict["city"] as? String ?? ""
+            let region = dict["region"] as? String ?? ""
+            let isp = dict["isp"] as? String ?? ""
+            let profile = GeoProfile(
+                ip: ip, countryCode: cc, region: region, city: city,
+                timezone: tz, latitude: lat, longitude: lon,
+                street: street, zip: zip, isp: isp
+            )
+            self.lockedProfile = profile
+            self.isSimulating = true
+            self.exitIP = "\(ip) [\(cc)]"
+            self.timezoneName = tz
+            self.coordText = String(format: "%.5f, %.5f", lat, lon)
+            self.streetAddress = street
+            self.zipCode = zip
+        }
+        if let wDict = NSDictionary(contentsOfFile: wifiPlistPaths[0]) as? [String: Any],
+           let nets = wDict["networks"] as? [[String: String]] {
+            self.wifiList = nets
+        }
+    }
+
+    func syncEnvironment(forceReanchor: Bool = true) {
+        refreshHookStatus()
+        guard !isSyncing else { return }
+        isSyncing = true
+        statusError = nil
+
+        let endpoints = [
+            "http://ip-api.com/json/?fields=status,countryCode,regionName,city,zip,lat,lon,timezone,isp,query",
+            "https://ipwho.is/",
+            "https://freeipapi.com/api/json",
+            "https://ipinfo.io/json",
+            "https://api.ip.sb/geoip"
+        ]
+
+        let cfg = URLSessionConfiguration.default
+        cfg.timeoutIntervalForRequest = 15.0
+        cfg.timeoutIntervalForResource = 20.0
+        cfg.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        let session = URLSession(configuration: cfg)
+
+        let lock = NSLock()
+        var settled = false
+        var completedCount = 0
+        var lastErrorMsg = "超时"
+
+        for urlStr in endpoints {
+            guard let url = URL(string: urlStr) else { continue }
+            var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 15.0)
+            req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 16_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.2 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
+            req.setValue("application/json", forHTTPHeaderField: "Accept")
+
+            session.dataTask(with: req) { [weak self] data, response, error in
+                guard let self = self else { return }
+
+                var parsedProfile: GeoProfile? = nil
+                if let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
+                   let data = data {
+                    parsedProfile = self.parseGeoJSON(data: data)
+                }
+
+                lock.lock()
+                if settled {
+                    lock.unlock()
+                    return
+                }
+                if let valid = parsedProfile {
+                    settled = true
+                    lock.unlock()
+                    session.invalidateAndCancel()
+                    DispatchQueue.main.async {
+                        self.applyDetectedProfile(valid, forceReanchor: forceReanchor)
                     }
+                    return
+                }
+
+                completedCount += 1
+                let code = (response as? HTTPURLResponse)?.statusCode ?? (error as NSError?)?.code ?? -1
+                lastErrorMsg = "code:\(code)"
+                let allFailed = (completedCount >= endpoints.count)
+                if allFailed {
+                    settled = true
+                }
+                lock.unlock()
+
+                if allFailed {
+                    session.finishTasksAndInvalidate()
+                    DispatchQueue.main.async {
+                        self.isSyncing = false
+                        self.statusError = "当前节点无法连接 IP 探测接口（\(lastErrorMsg)），请切换节点后重试。"
+                    }
+                }
+            }.resume()
+        }
+    }
+
+    private func parseGeoJSON(data: Data) -> GeoProfile? {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        if let status = json["status"] as? String, status.lowercased() == "fail" { return nil }
+        if let success = json["success"] as? Bool, !success { return nil }
+
+        let ip = (json["query"] as? String)
+            ?? (json["ip"] as? String)
+            ?? (json["ipAddress"] as? String)
+            ?? ""
+        guard !ip.isEmpty else { return nil }
+
+        let cc = ((json["countryCode"] as? String)
+            ?? (json["country_code"] as? String)
+            ?? (json["country"] as? String)
+            ?? "US").uppercased()
+        if cc == "CN" || cc == "HK" || cc == "MO" { return nil }
+
+        let region = (json["regionName"] as? String)
+            ?? (json["region"] as? String)
+            ?? ""
+        let city = (json["city"] as? String)
+            ?? (json["cityName"] as? String)
+            ?? ""
+        let isp = (json["isp"] as? String)
+            ?? ((json["connection"] as? [String: Any])?["isp"] as? String)
+            ?? (json["org"] as? String)
+            ?? "Residential Broadband"
+        let zip = (json["zip"] as? String)
+            ?? (json["postal"] as? String)
+            ?? (json["zipCode"] as? String)
+            ?? ""
+
+        var tz = "America/New_York"
+        if let tzDict = json["timezone"] as? [String: Any], let tzId = tzDict["id"] as? String, !tzId.isEmpty {
+            tz = tzId
+        } else if let tzStr = json["timezone"] as? String, !tzStr.isEmpty {
+            tz = tzStr
+        } else if let tzArr = json["timeZones"] as? [String], let firstTz = tzArr.first, !firstTz.isEmpty {
+            tz = firstTz
+        }
+
+        var lat = (json["lat"] as? Double)
+            ?? (json["latitude"] as? Double)
+            ?? 0.0
+        var lon = (json["lon"] as? Double)
+            ?? (json["longitude"] as? Double)
+            ?? 0.0
+        if (lat == 0.0 || lon == 0.0), let locStr = json["loc"] as? String {
+            let parts = locStr.split(separator: ",")
+            if parts.count == 2, let la = Double(parts[0]), let lo = Double(parts[1]) {
+                lat = la
+                lon = lo
+            }
+        }
+        if lat == 0.0 && lon == 0.0 {
+            lat = 39.0438
+            lon = -77.4874
+        }
+
+        return GeoProfile(
+            ip: ip, countryCode: cc, region: region, city: city,
+            timezone: tz, latitude: lat, longitude: lon,
+            street: "", zip: zip, isp: isp
+        )
+    }
+
+    private func applyDetectedProfile(_ raw: GeoProfile, forceReanchor: Bool) {
+        if lockSessionGeo, isSimulating, let locked = lockedProfile,
+           locked.countryCode == raw.countryCode, locked.timezone == raw.timezone, !forceReanchor {
+            self.exitIP = "\(raw.ip) [\(raw.countryCode)]"
+            self.isSyncing = false
+            return
+        }
+
+        let jitterLat = raw.latitude + Double.random(in: -0.0065...0.0065)
+        let jitterLon = raw.longitude + Double.random(in: -0.0065...0.0065)
+        let loc = CLLocation(latitude: jitterLat, longitude: jitterLon)
+
+        let fallbackStreet = "\(Int.random(in: 112...4890)) Oakridge Ave, \(raw.city.isEmpty ? "Austin" : raw.city), \(raw.region.isEmpty ? "TX" : raw.region)"
+        let fallbackZip = raw.zip.isEmpty ? String(Int.random(in: 10001...98199)) : raw.zip
+
+        let finalized = GeoProfile(
+            ip: raw.ip, countryCode: raw.countryCode, region: raw.region,
+            city: raw.city, timezone: raw.timezone,
+            latitude: jitterLat, longitude: jitterLon,
+            street: fallbackStreet, zip: fallbackZip, isp: raw.isp
+        )
+        self.commitSimulation(finalized)
+
+        CLGeocoder().reverseGeocodeLocation(loc) { [weak self] placemarks, _ in
+            guard let self = self, let pm = placemarks?.first else { return }
+            let num = pm.subThoroughfare ?? "\(Int.random(in: 105...3980))"
+            let road = pm.thoroughfare ?? "Maple Creek Dr"
+            let c = pm.locality ?? (raw.city.isEmpty ? "Dallas" : raw.city)
+            let st = pm.administrativeArea ?? (raw.region.isEmpty ? "TX" : raw.region)
+            let resolvedStreet = "\(num) \(road), \(c), \(st)"
+            let resolvedZip = (pm.postalCode?.isEmpty == false) ? pm.postalCode! : fallbackZip
+
+            DispatchQueue.main.async {
+                self.streetAddress = resolvedStreet
+                self.zipCode = resolvedZip
+                if var current = self.lockedProfile {
+                    current.street = resolvedStreet
+                    current.zip = resolvedZip
+                    self.lockedProfile = current
+                    self.writeGeoPlist(current)
                 }
             }
         }
     }
-}
 
-static void HookObjCMethod(Class cls, SEL sel, IMP newImp, IMP *oldImp) {
-    if (!cls || !sel || !newImp) return;
-    Method m = class_getInstanceMethod(cls, sel);
-    if (!m) return;
-    if (g_MSHookMessageEx) {
-        g_MSHookMessageEx(cls, sel, newImp, oldImp);
-    } else {
-        IMP prev = method_setImplementation(m, newImp);
-        if (oldImp && *oldImp == NULL) *oldImp = prev;
+    private func writeGeoPlist(_ profile: GeoProfile) {
+        let geoDict: [String: Any] = [
+            "enabled": true,
+            "ip": profile.ip,
+            "countryCode": profile.countryCode,
+            "region": profile.region,
+            "city": profile.city,
+            "timezone": profile.timezone,
+            "lat": profile.latitude,
+            "lon": profile.longitude,
+            "street": profile.street,
+            "zip": profile.zip,
+            "isp": profile.isp
+        ]
+        writeSharedPlist(geoDict, paths: geoPlistPaths)
     }
-}
 
-static BOOL IsSelfCaller(void *retAddr) {
-    if (!retAddr) return NO;
-    Dl_info info;
-    int ok = orig_dladdr ? orig_dladdr(retAddr, &info) : dladdr(retAddr, &info);
-    if (ok != 0 && info.dli_fname != NULL) {
-        if (strstr(info.dli_fname, "AutoIPLocHook") != NULL) {
-            return YES;
+    private func commitSimulation(_ profile: GeoProfile) {
+        self.lockedProfile = profile
+        self.isSimulating = true
+        self.isSyncing = false
+        self.statusError = nil
+        self.exitIP = "\(profile.ip) [\(profile.countryCode)]"
+        self.timezoneName = profile.timezone
+        self.coordText = String(format: "%.5f, %.5f", profile.latitude, profile.longitude)
+        self.streetAddress = profile.street
+        self.zipCode = profile.zip
+
+        if self.wifiList.isEmpty {
+            regenerateWiFiList(save: false)
+        }
+
+        writeGeoPlist(profile)
+        saveWiFiPlist(enabled: true)
+
+        let simLocation = CLLocation(
+            coordinate: CLLocationCoordinate2D(latitude: profile.latitude, longitude: profile.longitude),
+            altitude: Double.random(in: 18.0...145.0),
+            horizontalAccuracy: 5.0,
+            verticalAccuracy: 8.0,
+            course: -1,
+            speed: 0,
+            timestamp: Date()
+        )
+        let simManager = CLSimulationManager()
+        simManager.stopLocationSimulation()
+        simManager.clearSimulatedLocations()
+        simManager.appendSimulatedLocation(simLocation)
+        simManager.flush()
+        simManager.startLocationSimulation()
+    }
+
+    func regenerateWiFiList(save: Bool = true) {
+        let prefixes = [
+            "Xfinity", "SpectrumSetup", "ATT-FIBER", "Fios",
+            "MySpectrumWiFi", "NETGEAR", "Linksys", "HOME-WIFI"
+        ]
+        let ouis = ["20:4E:7F", "00:26:F2", "E4:F0:42", "B8:3A:08", "C8:D7:19", "44:E9:DD"]
+        var generated: [[String: String]] = []
+
+        for _ in 0..<14 {
+            let p = prefixes.randomElement()!
+            let suffix = String(format: "%04X", Int.random(in: 0x1000...0xFFFF))
+            let band = Bool.random() ? "-5G" : ""
+            let oui = ouis.randomElement()!
+            let mac = String(format: "%@:%02X:%02X:%02X", oui, Int.random(in: 0...255), Int.random(in: 0...255), Int.random(in: 0...255))
+            generated.append(["SSID": "\(p)-\(suffix)\(band)", "BSSID": mac])
+        }
+        self.wifiList = generated
+        if save {
+            saveWiFiPlist(enabled: isSimulating)
         }
     }
-    return NO;
-}
 
-static NSDictionary *LoadGeoConfig(void) {
-    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/com.autoiploc.geo.plist"];
-    if (!d) d = [NSDictionary dictionaryWithContentsOfFile:@"/var/tmp/com.autoiploc.geo.plist"];
-    return d;
-}
-
-static NSDictionary *LoadWiFiConfig(void) {
-    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/com.autoiploc.wifi.plist"];
-    if (!d) d = [NSDictionary dictionaryWithContentsOfFile:@"/var/tmp/com.autoiploc.wifi.plist"];
-    return d;
-}
-
-static NSString *GetTargetCountryCode(void) {
-    NSDictionary *cfg = LoadGeoConfig();
-    NSString *cc = cfg[@"countryCode"];
-    if (cc && cc.length == 2 && ![cc isEqualToString:@"--"]) {
-        return cc.uppercaseString;
+    private func saveWiFiPlist(enabled: Bool) {
+        let dict: [String: Any] = [
+            "enabled": enabled,
+            "networks": wifiList
+        ]
+        writeSharedPlist(dict, paths: wifiPlistPaths)
     }
-    return @"US";
-}
 
-static NSString *GetTargetTimeZoneName(void) {
-    NSDictionary *cfg = LoadGeoConfig();
-    NSString *tz = cfg[@"timezone"];
-    if (tz && tz.length > 3 && ![tz isEqualToString:@"-"]) {
-        return tz;
-    }
-    return nil;
-}
-
-// 1. 白名单屏蔽所有非系统动态库路径（消除 [功能插件注入]、[RootHide底座] 与 GeoComply 动态库扫描）
-static BOOL IsSensitiveDylibPath(const char *path) {
-    if (!path) return NO;
-    if (strncmp(path, "/System/", 8) == 0) return NO;
-    if (strncmp(path, "/usr/lib/", 9) == 0) return NO;
-    if (strncmp(path, "/Developer/", 11) == 0) return NO;
-    if (strstr(path, ".app/") != NULL) return NO;
-    return YES;
-}
-
-static const char *(*orig_dyld_get_image_name)(uint32_t image_index) = NULL;
-static const char *hook_dyld_get_image_name(uint32_t image_index) {
-    const char *name = orig_dyld_get_image_name ? orig_dyld_get_image_name(image_index) : NULL;
-    if (IsSensitiveDylibPath(name)) {
-        return "/usr/lib/libobjc.A.dylib";
-    }
-    return name;
-}
-
-static int hook_dladdr(const void *addr, Dl_info *info) {
-    int ret = orig_dladdr ? orig_dladdr(addr, info) : 0;
-    if (ret != 0 && info && info->dli_fname && IsSensitiveDylibPath(info->dli_fname)) {
-        info->dli_fname = "/usr/lib/libobjc.A.dylib";
-    }
-    return ret;
-}
-
-// 2. 隐藏环境变量与越狱文件/进程特征（绕过 GeoComply 篡改检测）
-static char *(*orig_getenv)(const char *name) = NULL;
-static char *hook_getenv(const char *name) {
-    if (name && (strcmp(name, "DYLD_INSERT_LIBRARIES") == 0 ||
-                 strcmp(name, "_MSSafeMode") == 0 ||
-                 strcmp(name, "SUBSTRATE_SAFE_MODE") == 0 ||
-                 strcmp(name, "JBROOT") == 0)) {
-        return NULL;
-    }
-    return orig_getenv ? orig_getenv(name) : NULL;
-}
-
-static BOOL IsJailbreakPath(const char *path) {
-    if (!path) return NO;
-    return (strstr(path, "/var/jb") != NULL ||
-            strstr(path, ".jbroot") != NULL ||
-            strstr(path, "roothide") != NULL ||
-            strstr(path, "RootHide") != NULL ||
-            strstr(path, "Bootstrap") != NULL ||
-            strstr(path, "MobileSubstrate") != NULL ||
-            strstr(path, "CydiaSubstrate") != NULL ||
-            strstr(path, "libsubstrate") != NULL ||
-            strstr(path, "ellekit") != NULL ||
-            strstr(path, "TweakInject") != NULL ||
-            strstr(path, "Cydia.app") != NULL ||
-            strstr(path, "Sileo.app") != NULL ||
-            strstr(path, "Zebra.app") != NULL ||
-            strstr(path, "Filza.app") != NULL ||
-            strstr(path, "TrollStore") != NULL ||
-            strstr(path, "Dopamine") != NULL ||
-            strstr(path, "Crane") != NULL ||
-            strstr(path, "Geranium") != NULL ||
-            strstr(path, "/usr/bin/sshd") != NULL ||
-            strstr(path, "/etc/apt") != NULL ||
-            strstr(path, "/bin/bash") != NULL ||
-            strstr(path, "/bin/sh") != NULL ||
-            strstr(path, "autoiploc") != NULL);
-}
-
-static int (*orig_access)(const char *path, int mode) = NULL;
-static int hook_access(const char *path, int mode) {
-    if (!IsSelfCaller(__builtin_return_address(0)) && IsJailbreakPath(path)) {
-        errno = ENOENT;
-        return -1;
-    }
-    return orig_access ? orig_access(path, mode) : -1;
-}
-
-static int (*orig_stat)(const char *path, struct stat *buf) = NULL;
-static int hook_stat(const char *path, struct stat *buf) {
-    if (!IsSelfCaller(__builtin_return_address(0)) && IsJailbreakPath(path)) {
-        errno = ENOENT;
-        return -1;
-    }
-    return orig_stat ? orig_stat(path, buf) : -1;
-}
-
-static int (*orig_lstat)(const char *path, struct stat *buf) = NULL;
-static int hook_lstat(const char *path, struct stat *buf) {
-    if (!IsSelfCaller(__builtin_return_address(0)) && IsJailbreakPath(path)) {
-        errno = ENOENT;
-        return -1;
-    }
-    return orig_lstat ? orig_lstat(path, buf) : -1;
-}
-
-static FILE *(*orig_fopen)(const char *filename, const char *mode) = NULL;
-static FILE *hook_fopen(const char *filename, const char *mode) {
-    if (!IsSelfCaller(__builtin_return_address(0)) && IsJailbreakPath(filename)) {
-        errno = ENOENT;
-        return NULL;
-    }
-    return orig_fopen ? orig_fopen(filename, mode) : NULL;
-}
-
-static DIR *(*orig_opendir)(const char *filename) = NULL;
-static DIR *hook_opendir(const char *filename) {
-    if (!IsSelfCaller(__builtin_return_address(0)) && IsJailbreakPath(filename)) {
-        errno = ENOENT;
-        return NULL;
-    }
-    return orig_opendir ? orig_opendir(filename) : NULL;
-}
-
-static BOOL (*orig_fileExists)(id self, SEL _cmd, NSString *path) = NULL;
-static BOOL hook_fileExists(id self, SEL _cmd, NSString *path) {
-    if (!IsSelfCaller(__builtin_return_address(0)) && IsJailbreakPath(path.UTF8String)) {
-        return NO;
-    }
-    return orig_fileExists ? orig_fileExists(self, _cmd, path) : NO;
-}
-
-static BOOL (*orig_fileExistsIsDir)(id self, SEL _cmd, NSString *path, BOOL *isDir) = NULL;
-static BOOL hook_fileExistsIsDir(id self, SEL _cmd, NSString *path, BOOL *isDir) {
-    if (!IsSelfCaller(__builtin_return_address(0)) && IsJailbreakPath(path.UTF8String)) {
-        return NO;
-    }
-    return orig_fileExistsIsDir ? orig_fileExistsIsDir(self, _cmd, path, isDir) : NO;
-}
-
-static pid_t (*orig_fork)(void) = NULL;
-static pid_t hook_fork(void) {
-    errno = EPERM;
-    return -1;
-}
-
-// 3. 接管 NSTimeZone 与 CFTimeZone
-static NSTimeZone *(*orig_systemTimeZone)(id self, SEL _cmd) = NULL;
-static NSTimeZone *hook_systemTimeZone(id self, SEL _cmd) {
-    NSString *tzName = GetTargetTimeZoneName();
-    if (tzName) {
-        NSTimeZone *tz = [NSTimeZone timeZoneWithName:tzName];
-        if (tz) return tz;
-    }
-    return orig_systemTimeZone ? orig_systemTimeZone(self, _cmd) : [NSTimeZone timeZoneWithName:@"America/New_York"];
-}
-
-static NSTimeZone *(*orig_defaultTimeZone)(id self, SEL _cmd) = NULL;
-static NSTimeZone *hook_defaultTimeZone(id self, SEL _cmd) {
-    NSString *tzName = GetTargetTimeZoneName();
-    if (tzName) {
-        NSTimeZone *tz = [NSTimeZone timeZoneWithName:tzName];
-        if (tz) return tz;
-    }
-    return orig_defaultTimeZone ? orig_defaultTimeZone(self, _cmd) : [NSTimeZone timeZoneWithName:@"America/New_York"];
-}
-
-static NSTimeZone *(*orig_localTimeZone)(id self, SEL _cmd) = NULL;
-static NSTimeZone *hook_localTimeZone(id self, SEL _cmd) {
-    NSString *tzName = GetTargetTimeZoneName();
-    if (tzName) {
-        NSTimeZone *tz = [NSTimeZone timeZoneWithName:tzName];
-        if (tz) return tz;
-    }
-    return orig_localTimeZone ? orig_localTimeZone(self, _cmd) : [NSTimeZone timeZoneWithName:@"America/New_York"];
-}
-
-static CFTimeZoneRef (*orig_CFTimeZoneCopySystem)(void) = NULL;
-static CFTimeZoneRef hook_CFTimeZoneCopySystem(void) {
-    NSString *tzName = GetTargetTimeZoneName();
-    if (tzName) {
-        CFTimeZoneRef tz = CFTimeZoneCreateWithName(kCFAllocatorDefault, (__bridge CFStringRef)tzName, true);
-        if (tz) return tz;
-    }
-    return orig_CFTimeZoneCopySystem ? orig_CFTimeZoneCopySystem() : CFTimeZoneCopySystem();
-}
-
-// 4. 补全双卡槽基带与蜂窝网络特征（统一修正为美国 T-Mobile 310/260 LTE）
-static NSString *(*orig_carrierName)(id self, SEL _cmd) = NULL;
-static NSString *hook_carrierName(id self, SEL _cmd) {
-    NSString *orig = orig_carrierName ? orig_carrierName(self, _cmd) : nil;
-    if (orig.length == 0 || [orig isEqualToString:@"--"] || [orig isEqualToString:@"Carrier"] || [orig isEqualToString:@"EE"]) {
-        return @"T-Mobile";
-    }
-    return orig;
-}
-
-static NSString *(*orig_mobileCountryCode)(id self, SEL _cmd) = NULL;
-static NSString *hook_mobileCountryCode(id self, SEL _cmd) {
-    NSString *orig = orig_mobileCountryCode ? orig_mobileCountryCode(self, _cmd) : nil;
-    if (orig.length == 0 || [orig isEqualToString:@"460"] || [orig isEqualToString:@"454"] || [orig isEqualToString:@"455"] || [orig isEqualToString:@"234"]) {
-        return @"310";
-    }
-    return orig;
-}
-
-static NSString *(*orig_mobileNetworkCode)(id self, SEL _cmd) = NULL;
-static NSString *hook_mobileNetworkCode(id self, SEL _cmd) {
-    NSString *orig = orig_mobileNetworkCode ? orig_mobileNetworkCode(self, _cmd) : nil;
-    if (orig.length == 0 || [orig isEqualToString:@"65535"] || [orig isEqualToString:@"30"]) {
-        return @"260";
-    }
-    return orig;
-}
-
-static NSString *(*orig_isoCountryCode)(id self, SEL _cmd) = NULL;
-static NSString *hook_isoCountryCode(id self, SEL _cmd) {
-    NSString *orig = orig_isoCountryCode ? orig_isoCountryCode(self, _cmd) : nil;
-    if (orig.length == 0 || [orig.lowercaseString isEqualToString:@"cn"] || [orig.lowercaseString isEqualToString:@"hk"] || [orig.lowercaseString isEqualToString:@"mo"] || [orig.lowercaseString isEqualToString:@"gb"]) {
-        return GetTargetCountryCode().lowercaseString;
-    }
-    return orig;
-}
-
-static NSDictionary<NSString *, NSString *> *(*orig_serviceRadioTech)(id self, SEL _cmd) = NULL;
-static NSDictionary<NSString *, NSString *> *hook_serviceRadioTech(id self, SEL _cmd) {
-    NSDictionary<NSString *, NSString *> *orig = orig_serviceRadioTech ? orig_serviceRadioTech(self, _cmd) : nil;
-    if (orig.count > 0) return orig;
-    return @{
-        @"0000000100000001": @"CTRadioAccessTechnologyLTE",
-        @"0000000100000002": @"CTRadioAccessTechnologyLTE"
-    };
-}
-
-static NSString *(*orig_currentRadioTech)(id self, SEL _cmd) = NULL;
-static NSString *hook_currentRadioTech(id self, SEL _cmd) {
-    NSString *orig = orig_currentRadioTech ? orig_currentRadioTech(self, _cmd) : nil;
-    if (orig.length > 0) return orig;
-    return @"CTRadioAccessTechnologyLTE";
-}
-
-static BOOL hook_returnYES(id self, SEL _cmd) {
-    return YES;
-}
-
-// 5. 隐藏系统 HTTP/HTTPS/SOCKS5/PAC 显式代理（仅对系统底层网络库放行联网，消除 GeoComply 代理弹窗）
-static BOOL IsSystemNetworkingCaller(void *retAddr) {
-    if (!retAddr) return NO;
-    Dl_info info;
-    int ok = orig_dladdr ? orig_dladdr(retAddr, &info) : dladdr(retAddr, &info);
-    if (ok != 0 && info.dli_fname != NULL) {
-        if (strstr(info.dli_fname, "CFNetwork") != NULL ||
-            strstr(info.dli_fname, "WebKit") != NULL ||
-            strstr(info.dli_fname, "libnetwork") != NULL ||
-            strstr(info.dli_fname, "Network.framework") != NULL) {
-            return YES;
+    func resetAppleMapsCache() {
+        let fm = FileManager.default
+        let paths = [
+            "/var/mobile/Library/Caches/com.apple.Maps",
+            "/var/mobile/Library/Caches/GeoServices",
+            "/var/mobile/Library/Preferences/com.apple.GEO.plist"
+        ]
+        for p in paths {
+            try? fm.removeItem(atPath: p)
         }
     }
-    return NO;
-}
 
-static CFDictionaryRef CreateCleanProxyDict(void) {
-    NSDictionary *cleanProxy = @{
-        @"HTTPEnable": @0,
-        @"HTTPSEnable": @0,
-        @"SOCKSEnable": @0,
-        @"ProxyAutoConfigEnable": @0,
-        @"FTPPassive": @1,
-        @"ExceptionsList": @[@"*.local", @"169.254/16"]
-    };
-    return (__bridge_retained CFDictionaryRef)cleanProxy;
-}
+    func stopSimulation() {
+        let simManager = CLSimulationManager()
+        simManager.stopLocationSimulation()
+        simManager.clearSimulatedLocations()
+        simManager.flush()
 
-static CFDictionaryRef (*orig_CFNetworkCopySystemProxySettings)(void) = NULL;
-static CFDictionaryRef hook_CFNetworkCopySystemProxySettings(void) {
-    if (IsSystemNetworkingCaller(__builtin_return_address(0)) && orig_CFNetworkCopySystemProxySettings) {
-        return orig_CFNetworkCopySystemProxySettings();
+        isSimulating = false
+        lockedProfile = nil
+        exitIP = "未获取 [--]"
+        timezoneName = "- (待同步)"
+        coordText = "- (0.0000, 0.0000)"
+        streetAddress = "等待同步解析附近精确街道地址..."
+        zipCode = "--"
+        statusError = nil
+
+        let geoDict: [String: Any] = ["enabled": false]
+        writeSharedPlist(geoDict, paths: geoPlistPaths)
+        saveWiFiPlist(enabled: false)
     }
-    return CreateCleanProxyDict();
 }
 
-static CFDictionaryRef (*orig_SCDynamicStoreCopyProxies)(void *store) = NULL;
-static CFDictionaryRef hook_SCDynamicStoreCopyProxies(void *store) {
-    if (IsSystemNetworkingCaller(__builtin_return_address(0)) && orig_SCDynamicStoreCopyProxies) {
-        return orig_SCDynamicStoreCopyProxies(store);
-    }
-    return CreateCleanProxyDict();
-}
+struct ContentView: View {
+    @ObservedObject private var engine = LocationEngine.shared
 
-static NSDictionary *(*orig_connectionProxyDictionary)(id self, SEL _cmd) = NULL;
-static NSDictionary *hook_connectionProxyDictionary(id self, SEL _cmd) {
-    return @{};
-}
+    var body: some View {
+        NavigationView {
+            ScrollView {
+                VStack(spacing: 14) {
+                    if let err = engine.statusError {
+                        Text("⚠️ \(err)")
+                            .font(.footnote.bold())
+                            .foregroundColor(.white)
+                            .padding(10)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Color.red)
+                            .cornerRadius(10)
+                    }
 
-// 6. 过滤 Shadowrocket 产生的 utun / ipsec / ppp 虚拟隧道网卡
-static BOOL IsVirtualVPNInterface(const char *ifname) {
-    if (!ifname) return NO;
-    return (strncmp(ifname, "utun", 4) == 0 ||
-            strncmp(ifname, "ipsec", 5) == 0 ||
-            strncmp(ifname, "ppp", 3) == 0 ||
-            strncmp(ifname, "tun", 3) == 0 ||
-            strncmp(ifname, "wg", 2) == 0);
-}
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Image(systemName: engine.isSimulating ? "checkmark.circle.fill" : "stop.circle.fill")
+                                .foregroundColor(engine.isSimulating ? .green : .gray)
+                            Text(engine.isSimulating ? "正在模拟美国住宅环境" : "已停止模拟")
+                                .font(.headline)
+                        }
+                        Text("出口 IP: \(engine.exitIP)")
+                            .font(.subheadline.monospaced())
+                        Text("全局时区: \(engine.timezoneName)")
+                            .font(.subheadline)
+                        Text("模拟坐标: \(engine.coordText)")
+                            .font(.caption.monospaced())
+                            .foregroundColor(.secondary)
+                        Divider()
+                        HStack {
+                            Circle()
+                                .fill(engine.hookIsActive ? Color.green : Color.orange)
+                                .frame(width: 8, height: 8)
+                            Text("底层隐身插件: \(engine.hookStatusText)")
+                                .font(.caption.bold())
+                                .foregroundColor(engine.hookIsActive ? .green : .orange)
+                            Spacer()
+                            Button("刷新") {
+                                engine.refreshHookStatus()
+                            }
+                            .font(.caption)
+                        }
+                        Divider()
+                        Text("IP 附近精确住宅街道地址")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Text(engine.streetAddress)
+                            .font(.subheadline.weight(.medium))
+                        HStack {
+                            Text("ZIP 邮编: \(engine.zipCode)")
+                                .font(.subheadline.bold())
+                            Spacer()
+                            Button("复制 ZIP") {
+                                UIPasteboard.general.string = engine.zipCode
+                            }
+                            .buttonStyle(.bordered)
+                            Button("复制地址") {
+                                UIPasteboard.general.string = engine.streetAddress
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.green)
+                        }
+                    }
+                    .padding()
+                    .background(Color(.secondarySystemBackground))
+                    .cornerRadius(14)
 
-static int (*orig_getifaddrs)(struct ifaddrs **ifap) = NULL;
-static int hook_getifaddrs(struct ifaddrs **ifap) {
-    int ret = orig_getifaddrs ? orig_getifaddrs(ifap) : -1;
-    if (ret == 0 && ifap && *ifap) {
-        struct ifaddrs *head = *ifap;
-        while (head && IsVirtualVPNInterface(head->ifa_name) && head->ifa_next != NULL) {
-            struct ifaddrs *nextNode = head->ifa_next;
-            memcpy(head, nextNode, sizeof(struct ifaddrs));
-        }
-        struct ifaddrs *curr = head;
-        while (curr && curr->ifa_next != NULL) {
-            if (IsVirtualVPNInterface(curr->ifa_next->ifa_name)) {
-                curr->ifa_next = curr->ifa_next->ifa_next;
-            } else {
-                curr = curr->ifa_next;
+                    VStack(spacing: 10) {
+                        Toggle("网络与代理切换自动同步 IP + 时区 + Wi-Fi", isOn: $engine.autoSyncOnNetworkChange)
+                            .font(.subheadline)
+                        Toggle("防旋转 IP 跳变锁定（同会话固定坐标与时区）", isOn: $engine.lockSessionGeo)
+                            .font(.subheadline)
+                    }
+                    .padding()
+                    .background(Color(.secondarySystemBackground))
+                    .cornerRadius(14)
+
+                    Button(action: { engine.syncEnvironment(forceReanchor: true) }) {
+                        HStack(spacing: 8) {
+                            if engine.isSyncing {
+                                ProgressView()
+                                    .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                            }
+                            Text(engine.isSyncing ? "正在探测当前美国出口 IP..." : "立即同步当前 IP 定位与全局环境")
+                                .font(.headline)
+                        }
+                        .foregroundColor(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .background(engine.isSyncing ? Color.blue.opacity(0.75) : Color.blue)
+                        .cornerRadius(12)
+                    }
+                    .disabled(engine.isSyncing)
+
+                    Button(action: { engine.resetAppleMapsCache() }) {
+                        Text("重置并恢复苹果国际原生地图（清除高德缓存）")
+                            .font(.subheadline.bold())
+                            .foregroundColor(.blue)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 12)
+                            .background(Color.blue.opacity(0.12))
+                            .cornerRadius(12)
+                    }
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("已注入周边 Wi-Fi（\(engine.wifiList.count) 个）")
+                                .font(.subheadline.bold())
+                            Spacer()
+                            Button("换一批") {
+                                engine.regenerateWiFiList(save: true)
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                        if let first = engine.wifiList.first {
+                            Text("主关联热点: \(first["SSID"] ?? "") (\(first["BSSID"] ?? ""))")
+                                .font(.caption.monospaced())
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .padding()
+                    .background(Color(.secondarySystemBackground))
+                    .cornerRadius(14)
+
+                    Button(action: { engine.stopSimulation() }) {
+                        Text("一键停止模拟并立即恢复真实定位")
+                            .font(.subheadline)
+                            .foregroundColor(.red)
+                            .padding(.top, 6)
+                    }
+                }
+                .padding()
+            }
+            .navigationTitle("IP 自动定位与全局时区助手")
+            .onAppear {
+                engine.refreshHookStatus()
             }
         }
     }
-    return ret;
 }
 
-// 7. 屏蔽工具类 URL Scheme 暴露 (apple-magnifier://, sileo://, zbra:// 等)
-static BOOL IsBlockedURLScheme(NSString *scheme) {
-    if (scheme.length == 0) return NO;
-    NSSet *blocked = [NSSet setWithArray:@[
-        @"apple-magnifier", @"sileo", @"zbra", @"cydia",
-        @"filza", @"santander", @"trollstore", @"dopamine", @"roothide",
-        @"geranium", @"locsim", @"shadowrocket", @"quantumult", @"surge", @"loon", @"stash"
-    ]];
-    return [blocked containsObject:scheme.lowercaseString];
-}
-
-static BOOL (*orig_canOpenURL)(id self, SEL _cmd, NSURL *url) = NULL;
-static BOOL hook_canOpenURL(id self, SEL _cmd, NSURL *url) {
-    if (IsBlockedURLScheme(url.scheme)) return NO;
-    return orig_canOpenURL ? orig_canOpenURL(self, _cmd, url) : NO;
-}
-
-static BOOL (*orig_privCanOpenURL)(id self, SEL _cmd, NSURL *url, BOOL publicOnly) = NULL;
-static BOOL hook_privCanOpenURL(id self, SEL _cmd, NSURL *url, BOOL publicOnly) {
-    if (IsBlockedURLScheme(url.scheme)) return NO;
-    return orig_privCanOpenURL ? orig_privCanOpenURL(self, _cmd, url, publicOnly) : NO;
-}
-
-static NSArray *(*orig_appsForScheme)(id self, SEL _cmd, NSString *scheme) = NULL;
-static NSArray *hook_appsForScheme(id self, SEL _cmd, NSString *scheme) {
-    if (IsBlockedURLScheme(scheme)) return @[];
-    return orig_appsForScheme ? orig_appsForScheme(self, _cmd, scheme) : @[];
-}
-
-static NSURL *(*orig_urlOverride)(id self, SEL _cmd, NSURL *url) = NULL;
-static NSURL *hook_urlOverride(id self, SEL _cmd, NSURL *url) {
-    if (IsBlockedURLScheme(url.scheme)) return nil;
-    return orig_urlOverride ? orig_urlOverride(self, _cmd, url) : nil;
-}
-
-// 8. 彻底抹除软件模拟定位标记 (isSimulatedBySoftware = NO) 与锁定国际地图国家码
-static BOOL hook_returnNO(id self, SEL _cmd) {
-    return NO;
-}
-
-static id (*orig_initWithSimState)(id self, SEL _cmd, BOOL isSimulated, BOOL isAccessory) = NULL;
-static id hook_initWithSimState(id self, SEL _cmd, BOOL isSimulated, BOOL isAccessory) {
-    if (orig_initWithSimState) {
-        return orig_initWithSimState(self, _cmd, NO, NO);
-    }
-    return self;
-}
-
-static id (*orig_sourceInformation)(id self, SEL _cmd) = NULL;
-static id hook_sourceInformation(id self, SEL _cmd) {
-    Class srcInfoCls = objc_getClass("CLLocationSourceInformation");
-    if (srcInfoCls) {
-        SEL initSel = NSSelectorFromString(@"initWithSoftwareSimulationState:externalAccessoryState:");
-        id obj = [srcInfoCls alloc];
-        if ([obj respondsToSelector:initSel]) {
-            return ((id (*)(id, SEL, BOOL, BOOL))objc_msgSend)(obj, initSel, NO, NO);
+@main
+struct AutoIPLocApp: App {
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
         }
-        return [obj init];
-    }
-    return orig_sourceInformation ? orig_sourceInformation(self, _cmd) : nil;
-}
-
-static NSString *hook_targetCountryCode(id self, SEL _cmd) {
-    return GetTargetCountryCode();
-}
-
-// 9. 注入当前关联 US Wi-Fi（主热点 + 周边热点）
-static NSArray<NSDictionary *> *GetMockWiFiList(void) {
-    NSDictionary *wifiCfg = LoadWiFiConfig();
-    if ([wifiCfg[@"enabled"] boolValue]) {
-        NSArray *nets = wifiCfg[@"networks"];
-        if ([nets isKindOfClass:[NSArray class]] && nets.count > 0) {
-            return nets;
-        }
-    }
-    return nil;
-}
-
-static CFArrayRef (*orig_CNCopySupportedInterfaces)(void) = NULL;
-static CFArrayRef hook_CNCopySupportedInterfaces(void) {
-    if (GetMockWiFiList() != nil) {
-        return (__bridge_retained CFArrayRef)@[@"en0"];
-    }
-    return orig_CNCopySupportedInterfaces ? orig_CNCopySupportedInterfaces() : (__bridge_retained CFArrayRef)@[@"en0"];
-}
-
-static CFDictionaryRef (*orig_CNCopyCurrentNetworkInfo)(CFStringRef interfaceName) = NULL;
-static CFDictionaryRef hook_CNCopyCurrentNetworkInfo(CFStringRef interfaceName) {
-    NSArray<NSDictionary *> *nets = GetMockWiFiList();
-    if (nets.count > 0) {
-        NSDictionary *topAP = nets[0];
-        NSString *ssid = topAP[@"SSID"] ?: @"Fios-7CE9-5G";
-        NSString *bssid = topAP[@"BSSID"] ?: @"C8:D7:19:1C:73:9A";
-        NSMutableDictionary *result = [@{
-            (__bridge NSString *)kCNNetworkInfoKeySSID: ssid,
-            (__bridge NSString *)kCNNetworkInfoKeyBSSID: bssid,
-            (__bridge NSString *)kCNNetworkInfoKeySSIDData: [ssid dataUsingEncoding:NSUTF8StringEncoding]
-        } mutableCopy];
-        if (nets.count > 1) {
-            result[@"NearbyAP1"] = [NSString stringWithFormat:@"%@ (%@)", nets[1][@"SSID"] ?: @"", nets[1][@"BSSID"] ?: @""];
-        }
-        if (nets.count > 2) {
-            result[@"NearbyAP2"] = [NSString stringWithFormat:@"%@ (%@)", nets[2][@"SSID"] ?: @"", nets[2][@"BSSID"] ?: @""];
-        }
-        return (__bridge_retained CFDictionaryRef)result;
-    }
-    return orig_CNCopyCurrentNetworkInfo ? orig_CNCopyCurrentNetworkInfo(interfaceName) : NULL;
-}
-
-__attribute__((constructor))
-static void AutoIPLocHookEntry(void) {
-    @autoreleasepool {
-        const char *prog = getprogname();
-        if (!prog) return;
-        if (strcmp(prog, "SpringBoard") == 0 ||
-            strcmp(prog, "backboardd") == 0 ||
-            strcmp(prog, "Preferences") == 0 ||
-            strcmp(prog, "AutoIPLoc") == 0 ||
-            strcmp(prog, "Shadowrocket") == 0 ||
-            strcmp(prog, "Dopamine") == 0 ||
-            strcmp(prog, "Sileo") == 0 ||
-            strcmp(prog, "TrollStore") == 0 ||
-            strcmp(prog, "Filza") == 0) {
-            return;
-        }
-
-        char execBuf[1024] = {0};
-        uint32_t execSize = sizeof(execBuf);
-        if (_NSGetExecutablePath(execBuf, &execSize) != 0) return;
-        if (strstr(execBuf, ".app/") == NULL) return;
-
-        dlopen("/System/Library/Frameworks/CoreLocation.framework/CoreLocation", RTLD_NOW);
-        dlopen("/System/Library/Frameworks/CoreTelephony.framework/CoreTelephony", RTLD_NOW);
-        dlopen("/System/Library/PrivateFrameworks/GeoServices.framework/GeoServices", RTLD_NOW);
-        ResolveElleKitRuntime((void *)&AutoIPLocHookEntry);
-
-        // A. 接管时区
-        NSString *initTZ = GetTargetTimeZoneName();
-        if (initTZ) {
-            setenv("TZ", initTZ.UTF8String, 1);
-            tzset();
-            [NSTimeZone resetSystemTimeZone];
-        }
-        Class tzMeta = objc_getMetaClass("NSTimeZone");
-        if (tzMeta) {
-            HookObjCMethod(tzMeta, @selector(systemTimeZone), (IMP)hook_systemTimeZone, (IMP *)&orig_systemTimeZone);
-            HookObjCMethod(tzMeta, @selector(defaultTimeZone), (IMP)hook_defaultTimeZone, (IMP *)&orig_defaultTimeZone);
-            HookObjCMethod(tzMeta, @selector(localTimeZone), (IMP)hook_localTimeZone, (IMP *)&orig_localTimeZone);
-        }
-
-        // B. 拦截 URL Scheme 与越狱文件路径检测
-        Class appCls = objc_getClass("UIApplication");
-        if (appCls) {
-            HookObjCMethod(appCls, @selector(canOpenURL:), (IMP)hook_canOpenURL, (IMP *)&orig_canOpenURL);
-            HookObjCMethod(appCls, NSSelectorFromString(@"_canOpenURL:publicURLsOnly:"), (IMP)hook_privCanOpenURL, (IMP *)&orig_privCanOpenURL);
-        }
-        Class wsCls = objc_getClass("LSApplicationWorkspace");
-        if (wsCls) {
-            HookObjCMethod(wsCls, NSSelectorFromString(@"applicationsAvailableForHandlingURLScheme:"), (IMP)hook_appsForScheme, (IMP *)&orig_appsForScheme);
-            HookObjCMethod(wsCls, NSSelectorFromString(@"URLOverrideForURL:"), (IMP)hook_urlOverride, (IMP *)&orig_urlOverride);
-        }
-        Class fmCls = objc_getClass("NSFileManager");
-        if (fmCls) {
-            HookObjCMethod(fmCls, @selector(fileExistsAtPath:), (IMP)hook_fileExists, (IMP *)&orig_fileExists);
-            HookObjCMethod(fmCls, @selector(fileExistsAtPath:isDirectory:), (IMP)hook_fileExistsIsDir, (IMP *)&orig_fileExistsIsDir);
-        }
-
-        // C. 隐藏 NSURLSessionConfiguration 代理字典
-        Class sessionCfgCls = objc_getClass("NSURLSessionConfiguration");
-        if (sessionCfgCls) {
-            HookObjCMethod(sessionCfgCls, @selector(connectionProxyDictionary), (IMP)hook_connectionProxyDictionary, (IMP *)&orig_connectionProxyDictionary);
-        }
-
-        // D. 补全双卡槽基带与蜂窝运营商参数
-        Class carrierCls = objc_getClass("CTCarrier");
-        if (carrierCls) {
-            HookObjCMethod(carrierCls, NSSelectorFromString(@"carrierName"), (IMP)hook_carrierName, (IMP *)&orig_carrierName);
-            HookObjCMethod(carrierCls, NSSelectorFromString(@"mobileCountryCode"), (IMP)hook_mobileCountryCode, (IMP *)&orig_mobileCountryCode);
-            HookObjCMethod(carrierCls, NSSelectorFromString(@"mobileNetworkCode"), (IMP)hook_mobileNetworkCode, (IMP *)&orig_mobileNetworkCode);
-            HookObjCMethod(carrierCls, NSSelectorFromString(@"isoCountryCode"), (IMP)hook_isoCountryCode, (IMP *)&orig_isoCountryCode);
-            HookObjCMethod(carrierCls, NSSelectorFromString(@"allowsVOIP"), (IMP)hook_returnYES, NULL);
-        }
-        Class netInfoCls = objc_getClass("CTTelephonyNetworkInfo");
-        if (netInfoCls) {
-            HookObjCMethod(netInfoCls, NSSelectorFromString(@"serviceCurrentRadioAccessTechnology"), (IMP)hook_serviceRadioTech, (IMP *)&orig_serviceRadioTech);
-            HookObjCMethod(netInfoCls, NSSelectorFromString(@"currentRadioAccessTechnology"), (IMP)hook_currentRadioTech, (IMP *)&orig_currentRadioTech);
-        }
-
-        // E. 彻底抹除模拟定位标记 (isSimulatedBySoftware = NO)
-        Class srcInfoCls = objc_getClass("CLLocationSourceInformation");
-        if (srcInfoCls) {
-            HookObjCMethod(srcInfoCls, NSSelectorFromString(@"isSimulatedBySoftware"), (IMP)hook_returnNO, NULL);
-            HookObjCMethod(srcInfoCls, NSSelectorFromString(@"isProducedByAccessory"), (IMP)hook_returnNO, NULL);
-            HookObjCMethod(srcInfoCls, NSSelectorFromString(@"initWithSoftwareSimulationState:externalAccessoryState:"), (IMP)hook_initWithSimState, (IMP *)&orig_initWithSimState);
-        }
-        Class locCls = objc_getClass("CLLocation");
-        if (locCls) {
-            HookObjCMethod(locCls, NSSelectorFromString(@"isSimulatedBySoftware"), (IMP)hook_returnNO, NULL);
-            HookObjCMethod(locCls, NSSelectorFromString(@"_isSimulated"), (IMP)hook_returnNO, NULL);
-            HookObjCMethod(locCls, NSSelectorFromString(@"sourceInformation"), (IMP)hook_sourceInformation, (IMP *)&orig_sourceInformation);
-        }
-
-        // F. 锁定国际地图国家码
-        Class geoCls = objc_getClass("GEOCountryConfiguration");
-        if (geoCls) {
-            NSArray *sels = @[@"countryCode", @"_countryCode", @"currentCountryCode", @"sourceCountryCode"];
-            for (NSString *selName in sels) {
-                HookObjCMethod(geoCls, NSSelectorFromString(selName), (IMP)hook_targetCountryCode, NULL);
-            }
-        }
-        Class platformCls = objc_getClass("GEOPlatform");
-        if (platformCls) {
-            HookObjCMethod(platformCls, NSSelectorFromString(@"isChina"), (IMP)hook_returnNO, NULL);
-        }
-
-        // G. 接管系统底层 C 函数
-        if (g_MSHookFunction) {
-            g_MSHookFunction((void *)_dyld_get_image_name, (void *)hook_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
-            g_MSHookFunction((void *)dladdr, (void *)hook_dladdr, (void **)&orig_dladdr);
-            g_MSHookFunction((void *)getenv, (void *)hook_getenv, (void **)&orig_getenv);
-            g_MSHookFunction((void *)access, (void *)hook_access, (void **)&orig_access);
-            g_MSHookFunction((void *)stat, (void *)hook_stat, (void **)&orig_stat);
-            g_MSHookFunction((void *)lstat, (void *)hook_lstat, (void **)&orig_lstat);
-            g_MSHookFunction((void *)fopen, (void *)hook_fopen, (void **)&orig_fopen);
-            g_MSHookFunction((void *)opendir, (void *)hook_opendir, (void **)&orig_opendir);
-            g_MSHookFunction((void *)fork, (void *)hook_fork, (void **)&orig_fork);
-
-            void *symCFTimeZone = dlsym(RTLD_DEFAULT, "CFTimeZoneCopySystem");
-            if (symCFTimeZone) g_MSHookFunction(symCFTimeZone, (void *)hook_CFTimeZoneCopySystem, (void **)&orig_CFTimeZoneCopySystem);
-
-            g_MSHookFunction((void *)CFNetworkCopySystemProxySettings, (void *)hook_CFNetworkCopySystemProxySettings, (void **)&orig_CFNetworkCopySystemProxySettings);
-
-            void *symSCDyn = dlsym(RTLD_DEFAULT, "SCDynamicStoreCopyProxies");
-            if (symSCDyn) g_MSHookFunction(symSCDyn, (void *)hook_SCDynamicStoreCopyProxies, (void **)&orig_SCDynamicStoreCopyProxies);
-
-            g_MSHookFunction((void *)getifaddrs, (void *)hook_getifaddrs, (void **)&orig_getifaddrs);
-            g_MSHookFunction((void *)CNCopyCurrentNetworkInfo, (void *)hook_CNCopyCurrentNetworkInfo, (void **)&orig_CNCopyCurrentNetworkInfo);
-            g_MSHookFunction((void *)CNCopySupportedInterfaces, (void *)hook_CNCopySupportedInterfaces, (void **)&orig_CNCopySupportedInterfaces);
-        }
-
-        // 写入激活状态供 AutoIPLoc 主界面实时读取
-        NSDictionary *status = @{
-            @"active": @YES,
-            @"version": @"3.7.0",
-            @"lastProc": [NSString stringWithUTF8String:prog],
-            @"cHookReady": @(g_MSHookFunction != NULL)
-        };
-        [status writeToFile:@"/var/mobile/Library/Preferences/com.autoiploc.hookstatus.plist" atomically:YES];
-        [status writeToFile:@"/var/tmp/com.autoiploc.hookstatus.plist" atomically:YES];
-        chmod("/var/tmp/com.autoiploc.hookstatus.plist", 0666);
     }
 }
