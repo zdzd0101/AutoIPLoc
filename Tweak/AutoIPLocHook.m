@@ -52,14 +52,12 @@ static void ResolveElleKitRuntime(void *selfSymbolAddr) {
     if (!g_MSHookMessageEx) g_MSHookMessageEx = (MSHookMessageEx_t)dlsym(RTLD_NEXT, "MSHookMessageEx");
     if (g_MSHookFunction && g_MSHookMessageEx) return;
 
-    // 1. 优先读取 postinst 写入的真实 .jbroot 路径（绕过 RootHide 路径隐藏）
     NSString *savedRoot = [NSString stringWithContentsOfFile:@"/var/tmp/com.autoiploc.jbroot.txt" encoding:NSUTF8StringEncoding error:nil];
     if (savedRoot.length > 0) {
         NSString *trimmed = [savedRoot stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         if (TryLoadElleKitFromRoot(trimmed.UTF8String)) return;
     }
 
-    // 2. 通过自身镜像信息反推 .jbroot
     Dl_info selfInfo;
     if (dladdr(selfSymbolAddr, &selfInfo) != 0 && selfInfo.dli_fname != NULL) {
         const char *libMarker = strstr(selfInfo.dli_fname, "/Library/");
@@ -73,7 +71,6 @@ static void ResolveElleKitRuntime(void *selfSymbolAddr) {
         }
     }
 
-    // 3. 扫描已加载镜像提取 ElleKit 符号
     uint32_t count = _dyld_image_count();
     for (uint32_t i = 1; i < count; i++) {
         const char *img = _dyld_get_image_name(i);
@@ -492,6 +489,7 @@ static NSURL *hook_urlOverride(id self, SEL _cmd, NSURL *url) {
     return orig_urlOverride ? orig_urlOverride(self, _cmd, url) : nil;
 }
 
+// 彻底抹除模拟定位标记（覆盖 getter、构造器、copyWithZone 与 XPC initWithCoder 内部 ivar）
 static BOOL hook_returnNO(id self, SEL _cmd) {
     return NO;
 }
@@ -518,6 +516,13 @@ static id CreateCleanLocationSourceInfo(void) {
     return [obj init];
 }
 
+static id (*orig_srcInfoInitWithCoder)(id self, SEL _cmd, NSCoder *coder) = NULL;
+static id hook_srcInfoInitWithCoder(id self, SEL _cmd, NSCoder *coder) {
+    id obj = orig_srcInfoInitWithCoder ? orig_srcInfoInitWithCoder(self, _cmd, coder) : self;
+    id clean = CreateCleanLocationSourceInfo();
+    return clean ?: obj;
+}
+
 static id (*orig_sourceInformation)(id self, SEL _cmd) = NULL;
 static id hook_sourceInformation(id self, SEL _cmd) {
     id clean = CreateCleanLocationSourceInfo();
@@ -530,6 +535,19 @@ static id hook_srcInfoCopyWithZone(id self, SEL _cmd, NSZone *zone) {
     id clean = CreateCleanLocationSourceInfo();
     if (clean) return clean;
     return orig_srcInfoCopyWithZone ? orig_srcInfoCopyWithZone(self, _cmd, zone) : self;
+}
+
+static id (*orig_locInitWithCoder)(id self, SEL _cmd, NSCoder *coder) = NULL;
+static id hook_locInitWithCoder(id self, SEL _cmd, NSCoder *coder) {
+    id obj = orig_locInitWithCoder ? orig_locInitWithCoder(self, _cmd, coder) : self;
+    if (obj) {
+        Ivar ivar = class_getInstanceVariable([CLLocation class], "_sourceInformation");
+        if (ivar) {
+            id clean = CreateCleanLocationSourceInfo();
+            if (clean) object_setIvar(obj, ivar, clean);
+        }
+    }
+    return obj;
 }
 
 static NSString *hook_targetCountryCode(id self, SEL _cmd) {
@@ -659,6 +677,7 @@ static void AutoIPLocHookEntry(void) {
             HookObjCMethod(srcInfoCls, NSSelectorFromString(@"isSimulatedBySoftware"), (IMP)hook_returnNO, NULL);
             HookObjCMethod(srcInfoCls, NSSelectorFromString(@"isProducedByAccessory"), (IMP)hook_returnNO, NULL);
             HookObjCMethod(srcInfoCls, NSSelectorFromString(@"initWithSoftwareSimulationState:externalAccessoryState:"), (IMP)hook_initWithSimState, (IMP *)&orig_initWithSimState);
+            HookObjCMethod(srcInfoCls, @selector(initWithCoder:), (IMP)hook_srcInfoInitWithCoder, (IMP *)&orig_srcInfoInitWithCoder);
             HookObjCMethod(srcInfoCls, @selector(copyWithZone:), (IMP)hook_srcInfoCopyWithZone, (IMP *)&orig_srcInfoCopyWithZone);
         }
         Class locCls = objc_getClass("CLLocation");
@@ -666,6 +685,7 @@ static void AutoIPLocHookEntry(void) {
             HookObjCMethod(locCls, NSSelectorFromString(@"isSimulatedBySoftware"), (IMP)hook_returnNO, NULL);
             HookObjCMethod(locCls, NSSelectorFromString(@"_isSimulated"), (IMP)hook_returnNO, NULL);
             HookObjCMethod(locCls, NSSelectorFromString(@"sourceInformation"), (IMP)hook_sourceInformation, (IMP *)&orig_sourceInformation);
+            HookObjCMethod(locCls, @selector(initWithCoder:), (IMP)hook_locInitWithCoder, (IMP *)&orig_locInitWithCoder);
         }
 
         Class geoCls = objc_getClass("GEOCountryConfiguration");
@@ -706,9 +726,10 @@ static void AutoIPLocHookEntry(void) {
 
         NSDictionary *status = @{
             @"active": @YES,
-            @"version": @"4.2.0",
+            @"version": @"4.3.0",
             @"lastProc": [NSString stringWithUTF8String:prog],
-            @"cHookReady": @(g_MSHookFunction != NULL && g_MSHookMessageEx != NULL)
+            @"cHookReady": @(g_MSHookFunction != NULL && g_MSHookMessageEx != NULL),
+            @"timestamp": @([[NSDate date] timeIntervalSince1970])
         };
         [status writeToFile:@"/var/mobile/Library/Preferences/com.autoiploc.hookstatus.plist" atomically:YES];
         [status writeToFile:@"/var/tmp/com.autoiploc.hookstatus.plist" atomically:YES];
