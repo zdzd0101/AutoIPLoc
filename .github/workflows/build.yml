@@ -44,7 +44,7 @@ jobs:
           mkdir -p deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries
 
           clang -dynamiclib \
-            -arch arm64 \
+            -arch arm64 -arch arm64e \
             -isysroot "$SDK_PATH" \
             -miphoneos-version-min=15.0 \
             -install_name /Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib \
@@ -64,26 +64,47 @@ jobs:
               <dict>
                   <key>Bundles</key>
                   <array>
-                      <string>com.apple.CoreFoundation</string>
-                      <string>com.apple.Foundation</string>
                       <string>com.apple.UIKit</string>
+                      <string>com.apple.Foundation</string>
                   </array>
               </dict>
           </dict>
           </plist>
           EOF
 
+          cat << 'EOF' > deb_pkg/DEBIAN/postinst
+          #!/bin/sh
+          for JB in /var/containers/Bundle/Application/.jbroot-*; do
+            if [ -d "$JB" ]; then
+              mkdir -p "$JB/Library/MobileSubstrate/DynamicLibraries"
+              mkdir -p "$JB/usr/lib/TweakInject"
+              if [ -f "$JB/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib" ]; then
+                cp -f "$JB/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib" "$JB/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib"
+                cp -f "$JB/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist" "$JB/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist"
+              fi
+              if [ -f "$JB/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib" ]; then
+                chmod 755 "$JB/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib"
+                chmod 644 "$JB/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist"
+                ln -sf "$JB/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib" "$JB/usr/lib/TweakInject/AutoIPLocHook.dylib"
+                ln -sf "$JB/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist" "$JB/usr/lib/TweakInject/AutoIPLocHook.plist"
+              fi
+            fi
+          done
+          exit 0
+          EOF
+
           INSTALLED_SIZE=$(du -sk deb_pkg/var | cut -f1)
-          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 3.8.0\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Pure arm64 iOS 16.2 zero-external-dep dual ElleKit+fishhook RootHide stealth hook\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
+          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 3.9.0\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Fat arm64+arm64e zero-external-dep RootHide auto-placed stealth hook\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
 
           chmod 0755 deb_pkg/DEBIAN
+          chmod 0755 deb_pkg/DEBIAN/postinst
           chmod 0644 deb_pkg/DEBIAN/control
           chmod 0755 deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
           chmod 0644 deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
 
           dpkg-deb -Zgzip -b deb_pkg AutoIPLocHook.deb
           ls -lh AutoIPLoc.tipa AutoIPLocHook.deb
-          otool -L deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
+          lipo -info deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
