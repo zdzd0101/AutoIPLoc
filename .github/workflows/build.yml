@@ -75,8 +75,9 @@ jobs:
           lipo "$MAIN_BIN" -verify_arch arm64
           lipo -info "$HOOK_BIN"
           lipo "$HOOK_BIN" -verify_arch arm64 arm64e
-          otool -l "$HOOK_BIN" | grep -q "platform IOS" || {
+          otool -l "$HOOK_BIN" | grep -Eq "platform IOS|LC_VERSION_MIN_IPHONEOS" || {
             echo "Hook binary does not advertise an iOS build platform" >&2
+            otool -l "$HOOK_BIN" >&2
             exit 1
           }
 
