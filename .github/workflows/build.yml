@@ -19,7 +19,15 @@ jobs:
           set -e
           unset SDKROOT
           mkdir -p Payload/AutoIPLoc.app
-          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          SDK_PATH="$(xcrun --sdk iphoneos --show-sdk-path)"
+          IOS_CLANG="$(xcrun --sdk iphoneos --find clang)"
+          SDK_NAME="$(basename "$SDK_PATH")"
+          case "$SDK_NAME" in
+            iPhoneOS*.sdk) ;;
+            *) echo "Expected iPhoneOS SDK, got: $SDK_PATH" >&2; exit 1 ;;
+          esac
+          echo "Using iPhoneOS SDK: $SDK_PATH"
+          xcrun --sdk iphoneos --show-sdk-version
 
           swiftc main.swift \
             -parse-as-library \
@@ -30,6 +38,9 @@ jobs:
             -o Payload/AutoIPLoc.app/AutoIPLoc
 
           cp Info.plist Payload/AutoIPLoc.app/Info.plist
+          plutil -lint Info.plist
+          plutil -lint entitlements.plist
+          plutil -lint Tweak/AutoIPLocHook.plist
           /usr/libexec/PlistBuddy -c "Delete :NSAppTransportSecurity" Payload/AutoIPLoc.app/Info.plist 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity dict" Payload/AutoIPLoc.app/Info.plist
           /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSAllowsArbitraryLoads bool true" Payload/AutoIPLoc.app/Info.plist
@@ -43,8 +54,9 @@ jobs:
           mkdir -p deb_pkg/DEBIAN
           mkdir -p deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries
 
-          clang -dynamiclib \
+          "$IOS_CLANG" -dynamiclib \
             -arch arm64 -arch arm64e \
+            -target arm64-apple-ios15.0 \
             -isysroot "$SDK_PATH" \
             -miphoneos-version-min=15.0 \
             -install_name /Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib \
@@ -53,7 +65,22 @@ jobs:
             Tweak/AutoIPLocHook.m \
             -o deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
 
-          codesign --force --sign - --timestamp=none deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
+          MAIN_BIN="Payload/AutoIPLoc.app/AutoIPLoc"
+          HOOK_BIN="deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib"
+
+          echo "Validating Mach-O architecture slices..."
+          lipo -info "$MAIN_BIN"
+          lipo -verify_arch arm64 "$MAIN_BIN"
+          lipo -info "$HOOK_BIN"
+          lipo -verify_arch arm64 "$HOOK_BIN"
+          lipo -verify_arch arm64e "$HOOK_BIN"
+          otool -l "$HOOK_BIN" | grep -q "platform IOS" || {
+            echo "Hook binary does not advertise an iOS build platform" >&2
+            exit 1
+          }
+
+          codesign --force --sign - --timestamp=none "$HOOK_BIN"
+          codesign --verify --verbose=2 "$HOOK_BIN"
 
           cat << 'EOF' > deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
           <?xml version="1.0" encoding="UTF-8"?>
@@ -91,7 +118,12 @@ jobs:
           chmod 0755 deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
           chmod 0644 deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
 
-          dpkg-deb -Zgzip -b deb_pkg AutoIPLocHook.deb
+          dpkg-deb --root-owner-group -Zgzip -b deb_pkg AutoIPLocHook.deb
+          dpkg-deb --info AutoIPLocHook.deb
+          dpkg-deb --contents AutoIPLocHook.deb
+          test -s AutoIPLoc.tipa
+          test -s AutoIPLocHook.deb
+          unzip -l AutoIPLoc.tipa
           ls -lh AutoIPLoc.tipa AutoIPLocHook.deb
 
       - name: Upload Artifacts
