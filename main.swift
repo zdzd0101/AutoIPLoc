@@ -28,12 +28,15 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     @Published var coordText = "- (0.0000, 0.0000)"
     @Published var streetAddress = "等待同步解析附近精确街道地址..."
     @Published var zipCode = "--"
+    @Published var hookStatusText = "待检测（重开一次目标 App 后自动刷新）"
+    @Published var hookIsActive = false
     @Published var autoSyncOnNetworkChange = true
     @Published var lockSessionGeo = true
     @Published var wifiList: [[String: String]] = []
 
     private let geoPlistPath = "/var/mobile/Library/Preferences/com.autoiploc.geo.plist"
     private let wifiPlistPath = "/var/mobile/Library/Preferences/com.autoiploc.wifi.plist"
+    private let hookStatusPath = "/var/mobile/Library/Preferences/com.autoiploc.hookstatus.plist"
     private let locationManager = CLLocationManager()
     private let pathMonitor = NWPathMonitor()
     private let monitorQueue = DispatchQueue(label: "com.autoiploc.netmonitor")
@@ -45,7 +48,24 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         locationManager.delegate = self
         locationManager.requestAlwaysAuthorization()
         loadSavedState()
+        refreshHookStatus()
         startNetworkMonitor()
+    }
+
+    func refreshHookStatus() {
+        if let dict = NSDictionary(contentsOfFile: hookStatusPath) as? [String: Any],
+           let active = dict["active"] as? Bool, active {
+            let ver = dict["version"] as? String ?? "3.5.0"
+            let proc = dict["lastProc"] as? String ?? "目标应用"
+            let hookOk = (dict["cHookReady"] as? Bool) ?? false
+            self.hookIsActive = hookOk
+            self.hookStatusText = hookOk
+                ? "已激活 v\(ver)（最近注入: \(proc)）"
+                : "已注入 v\(ver) 但底层符号未绑定（\(proc)）"
+        } else {
+            self.hookIsActive = false
+            self.hookStatusText = "未检测到注入记录（请重开检测 App）"
+        }
     }
 
     private func startNetworkMonitor() {
@@ -95,6 +115,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     }
 
     func syncEnvironment(forceReanchor: Bool = true) {
+        refreshHookStatus()
         guard !isSyncing else { return }
         isSyncing = true
         statusError = nil
@@ -426,6 +447,20 @@ struct ContentView: View {
                             .font(.caption.monospaced())
                             .foregroundColor(.secondary)
                         Divider()
+                        HStack {
+                            Circle()
+                                .fill(engine.hookIsActive ? Color.green : Color.orange)
+                                .frame(width: 8, height: 8)
+                            Text("底层隐身插件: \(engine.hookStatusText)")
+                                .font(.caption.bold())
+                                .foregroundColor(engine.hookIsActive ? .green : .orange)
+                            Spacer()
+                            Button("刷新") {
+                                engine.refreshHookStatus()
+                            }
+                            .font(.caption)
+                        }
+                        Divider()
                         Text("IP 附近精确住宅街道地址")
                             .font(.caption)
                             .foregroundColor(.secondary)
@@ -517,6 +552,9 @@ struct ContentView: View {
                 .padding()
             }
             .navigationTitle("IP 自动定位与全局时区助手")
+            .onAppear {
+                engine.refreshHookStatus()
+            }
         }
     }
 }
