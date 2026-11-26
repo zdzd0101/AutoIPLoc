@@ -21,10 +21,6 @@ extern void MSHookMessageEx(Class _class, SEL message, IMP hook, IMP *old);
 
 static int (*orig_dladdr)(const void *addr, Dl_info *info) = NULL;
 
-static NSString *const kGeoPrefPath = @"/var/mobile/Library/Preferences/com.autoiploc.geo.plist";
-static NSString *const kWifiPrefPath = @"/var/mobile/Library/Preferences/com.autoiploc.wifi.plist";
-static NSString *const kHookStatusPath = @"/var/mobile/Library/Preferences/com.autoiploc.hookstatus.plist";
-
 static BOOL IsSelfCaller(void *retAddr) {
     if (!retAddr) return NO;
     Dl_info info;
@@ -38,7 +34,15 @@ static BOOL IsSelfCaller(void *retAddr) {
 }
 
 static NSDictionary *LoadGeoConfig(void) {
-    return [NSDictionary dictionaryWithContentsOfFile:kGeoPrefPath];
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/com.autoiploc.geo.plist"];
+    if (!d) d = [NSDictionary dictionaryWithContentsOfFile:@"/var/tmp/com.autoiploc.geo.plist"];
+    return d;
+}
+
+static NSDictionary *LoadWiFiConfig(void) {
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/com.autoiploc.wifi.plist"];
+    if (!d) d = [NSDictionary dictionaryWithContentsOfFile:@"/var/tmp/com.autoiploc.wifi.plist"];
+    return d;
 }
 
 static NSString *GetTargetCountryCode(void) {
@@ -429,7 +433,7 @@ static NSString *hook_targetCountryCode(id self, SEL _cmd) {
 
 // 9. 注入当前关联 US Wi-Fi（主热点 + 周边热点）
 static NSArray<NSDictionary *> *GetMockWiFiList(void) {
-    NSDictionary *wifiCfg = [NSDictionary dictionaryWithContentsOfFile:kWifiPrefPath];
+    NSDictionary *wifiCfg = LoadWiFiConfig();
     if ([wifiCfg[@"enabled"] boolValue]) {
         NSArray *nets = wifiCfg[@"networks"];
         if ([nets isKindOfClass:[NSArray class]] && nets.count > 0) {
@@ -639,13 +643,15 @@ static void AutoIPLocHookEntry(void) {
         MSHookFunction((void *)CNCopyCurrentNetworkInfo, (void *)hook_CNCopyCurrentNetworkInfo, (void **)&orig_CNCopyCurrentNetworkInfo);
         MSHookFunction((void *)CNCopySupportedInterfaces, (void *)hook_CNCopySupportedInterfaces, (void **)&orig_CNCopySupportedInterfaces);
 
-        // 记录激活状态供 AutoIPLoc 主界面显示
+        // 写入激活状态供 AutoIPLoc 主界面实时读取
         NSDictionary *status = @{
             @"active": @YES,
-            @"version": @"3.5.0",
+            @"version": @"3.6.0",
             @"lastProc": [NSString stringWithUTF8String:prog],
             @"cHookReady": @(orig_dyld_get_image_name != NULL)
         };
-        [status writeToFile:kHookStatusPath atomically:YES];
+        [status writeToFile:@"/var/mobile/Library/Preferences/com.autoiploc.hookstatus.plist" atomically:YES];
+        [status writeToFile:@"/var/tmp/com.autoiploc.hookstatus.plist" atomically:YES];
+        chmod("/var/tmp/com.autoiploc.hookstatus.plist", 0666);
     }
 }
