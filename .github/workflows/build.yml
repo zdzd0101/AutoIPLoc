@@ -92,21 +92,9 @@ jobs:
           codesign --force --sign - --timestamp=none "$HOOK_BIN"
           codesign --verify --verbose=2 "$HOOK_BIN"
 
-          cat << 'EOF' > deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-              <key>Filter</key>
-              <dict>
-                  <key>Bundles</key>
-                  <array>
-                      <string>com.apple.UIKit</string>
-                  </array>
-              </dict>
-          </dict>
-          </plist>
-          EOF
+          cp Tweak/AutoIPLocHook.plist \
+            deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
+          plutil -lint deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
 
           cat << 'EOF' > deb_pkg/DEBIAN/postinst
           #!/bin/sh
