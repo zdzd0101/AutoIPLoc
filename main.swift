@@ -53,6 +53,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     private let monitorQueue = DispatchQueue(label: "com.autoiploc.netmonitor")
     private var lastPathStatus: NWPath.Status?
     private var lockedProfile: GeoProfile?
+    private var activeGeocodeRequestID = UUID()
 
     override init() {
         super.init()
@@ -379,6 +380,8 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         )
         self.commitSimulation(finalized)
 
+        let requestID = UUID()
+        self.activeGeocodeRequestID = requestID
         CLGeocoder().reverseGeocodeLocation(loc) { [weak self] placemarks, _ in
             guard let self = self, let pm = placemarks?.first else { return }
             let addressParts = [
@@ -398,6 +401,9 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             let resolvedZip = (pm.postalCode?.isEmpty == false) ? pm.postalCode! : fallbackZip
 
             DispatchQueue.main.async {
+                guard self.activeGeocodeRequestID == requestID,
+                      self.isSimulating else { return }
+
                 self.streetAddress = resolvedStreet
                 self.zipCode = resolvedZip
                 if var current = self.lockedProfile {
@@ -505,6 +511,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     }
 
     func stopSimulation() {
+        activeGeocodeRequestID = UUID()
         let simManager = CLSimulationManager()
         simManager.stopLocationSimulation()
         simManager.clearSimulatedLocations()
