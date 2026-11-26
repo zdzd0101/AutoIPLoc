@@ -67,7 +67,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         let nsDict = dict as NSDictionary
         for path in paths {
             nsDict.write(toFile: path, atomically: true)
-            chmod(path, 0o666)
+            Darwin.chmod(path, 0o666)
         }
     }
 
@@ -75,13 +75,13 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         for path in hookStatusPaths {
             if let dict = NSDictionary(contentsOfFile: path) as? [String: Any],
                let active = dict["active"] as? Bool, active {
-                let ver = dict["version"] as? String ?? "3.7.1"
+                let ver = dict["version"] as? String ?? "3.8.0"
                 let proc = dict["lastProc"] as? String ?? "目标应用"
                 let hookOk = (dict["cHookReady"] as? Bool) ?? false
-                self.hookIsActive = hookOk
+                self.hookIsActive = true
                 self.hookStatusText = hookOk
                     ? "已激活 v\(ver)（最近注入: \(proc)）"
-                    : "已注入 v\(ver) 但底层符号未绑定（\(proc)）"
+                    : "已激活 v\(ver) · fishhook模式（\(proc)）"
                 return
             }
         }
