@@ -779,7 +779,7 @@ static void AutoIPLocHookEntry(void) {
 
         NSDictionary *status = @{
             @"active": @YES,
-            @"version": @"3.9.0",
+            @"version": @"4.0.0",
             @"lastProc": [NSString stringWithUTF8String:prog],
             @"cHookReady": @(g_MSHookFunction != NULL)
         };
