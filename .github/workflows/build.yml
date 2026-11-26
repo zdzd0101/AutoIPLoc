@@ -75,11 +75,19 @@ jobs:
           lipo "$MAIN_BIN" -verify_arch arm64
           lipo -info "$HOOK_BIN"
           lipo "$HOOK_BIN" -verify_arch arm64 arm64e
-          otool -l "$HOOK_BIN" | grep -Eq "platform IOS|LC_VERSION_MIN_IPHONEOS" || {
-            echo "Hook binary does not advertise an iOS build platform" >&2
-            otool -l "$HOOK_BIN" >&2
-            exit 1
-          }
+          for ARCH in arm64 arm64e; do
+            otool -arch "$ARCH" -l "$HOOK_BIN" | awk '
+              /cmd LC_BUILD_VERSION/ { in_build = 1; next }
+              /cmd LC_VERSION_MIN_IPHONEOS/ { legacy_ios = 1 }
+              /cmd LC_/ && !/LC_BUILD_VERSION/ { in_build = 0 }
+              in_build && /platform 2/ { modern_ios = 1 }
+              END { exit (modern_ios || legacy_ios) ? 0 : 1 }
+            ' || {
+              echo "Hook $ARCH slice is not marked as an iOS binary" >&2
+              otool -arch "$ARCH" -l "$HOOK_BIN" >&2
+              exit 1
+            }
+          done
 
           codesign --force --sign - --timestamp=none "$HOOK_BIN"
           codesign --verify --verbose=2 "$HOOK_BIN"
