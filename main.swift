@@ -51,9 +51,12 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     private let locationManager = CLLocationManager()
     private let pathMonitor = NWPathMonitor()
     private let monitorQueue = DispatchQueue(label: "com.autoiploc.netmonitor")
+    private let syncStateLock = NSLock()
     private var lastPathStatus: NWPath.Status?
     private var lockedProfile: GeoProfile?
     private var activeGeocodeRequestID = UUID()
+    private var activeSyncRequestID = UUID()
+    private var activeURLSession: URLSession?
 
     override init() {
         super.init()
@@ -202,18 +205,13 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             self.streetAddress = street
             self.zipCode = zip
         }
-        if let wDict = readSharedPlist(paths: wifiPlistPaths),
-           let nets = wDict["networks"] as? [[String: String]] {
-            self.wifiList = nets
-        }
-    }
-
-    func syncEnvironment(forceReanchor: Bool = true) {
+        if let wDict = readSharedPlist(paths:     func syncEnvironment(forceReanchor: Bool = true) {
         refreshHookStatus()
         guard !isSyncing else { return }
         isSyncing = true
         statusError = nil
 
+        let requestID = UUID()
         let endpoints = [
             "http://ip-api.com/json/?fields=status,countryCode,regionName,city,zip,lat,lon,timezone,isp,query",
             "https://ipwho.is/",
@@ -228,55 +226,103 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         cfg.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         let session = URLSession(configuration: cfg)
 
-        let lock = NSLock()
+        var requests: [URLRequest] = []
+        for urlStr in endpoints {
+            guard let url = URL(string: urlStr) else { continue }
+            var req = URLRequest(
+                url: url,
+                cachePolicy: .reloadIgnoringLocalAndRemoteCacheData,
+                timeoutInterval: 15.0
+            )
+            req.setValue(
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 16_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.2 Mobile/15E148 Safari/604.1",
+                forHTTPHeaderField: "User-Agent"
+            )
+            req.setValue("application/json", forHTTPHeaderField: "Accept")
+            requests.append(req)
+        }
+
+        guard !requests.isEmpty else {
+            isSyncing = false
+            statusError = "没有可用的 IP 探测接口地址。"
+            return
+        }
+
+        syncStateLock.lock()
+        activeSyncRequestID = requestID
+        activeURLSession = session
+        syncStateLock.unlock()
+
         var settled = false
         var completedCount = 0
         var lastErrorMsg = "超时"
+        let expectedCount = requests.count
 
-        for urlStr in endpoints {
-            guard let url = URL(string: urlStr) else { continue }
-            var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 15.0)
-            req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 16_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.2 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
-            req.setValue("application/json", forHTTPHeaderField: "Accept")
-
-            session.dataTask(with: req) { [weak self] data, response, error in
+        for request in requests {
+            session.dataTask(with: request) { [weak self] data, response, error in
                 guard let self = self else { return }
 
                 var parsedProfile: GeoProfile? = nil
-                if let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
+                if let http = response as? HTTPURLResponse,
+                   (200...299).contains(http.statusCode),
                    let data = data {
                     parsedProfile = self.parseGeoJSON(data: data)
                 }
 
-                lock.lock()
-                if settled {
-                    lock.unlock()
+                self.syncStateLock.lock()
+                guard self.activeSyncRequestID == requestID else {
+                    self.syncStateLock.unlock()
                     return
                 }
+                if settled {
+                    self.syncStateLock.unlock()
+                    return
+                }
+
                 if let valid = parsedProfile {
                     settled = true
-                    lock.unlock()
+                    self.activeURLSession = nil
+                    self.syncStateLock.unlock()
                     session.invalidateAndCancel()
+
                     DispatchQueue.main.async {
+                        self.syncStateLock.lock()
+                        let stillCurrent = self.activeSyncRequestID == requestID
+                        self.syncStateLock.unlock()
+                        guard stillCurrent else { return }
                         self.applyDetectedProfile(valid, forceReanchor: forceReanchor)
                     }
                     return
                 }
 
                 completedCount += 1
-                let code = (response as? HTTPURLResponse)?.statusCode ?? (error as NSError?)?.code ?? -1
+                let code = (response as? HTTPURLResponse)?.statusCode
+                    ?? (error as NSError?)?.code
+                    ?? -1
                 lastErrorMsg = "code:\(code)"
-                let allFailed = (completedCount >= endpoints.count)
+                let allFailed = completedCount >= expectedCount
                 if allFailed {
                     settled = true
+                    self.activeURLSession = nil
                 }
-                lock.unlock()
+                self.syncStateLock.unlock()
 
                 if allFailed {
                     session.finishTasksAndInvalidate()
                     DispatchQueue.main.async {
+                        self.syncStateLock.lock()
+                        let stillCurrent = self.activeSyncRequestID == requestID
+                        self.syncStateLock.unlock()
+                        guard stillCurrent else { return }
                         self.isSyncing = false
                         self.statusError = "当前节点无法连接 IP 探测接口（\(lastErrorMsg)），请切换节点后重试。"
+                    }
+                }
+            }.resume()
+        }
+    }
+
+ror = "当前节点无法连接 IP 探测接口（\(lastErrorMsg)），请切换节点后重试。"
                     }
                 }
             }.resume()
@@ -512,6 +558,15 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
 
     func stopSimulation() {
         activeGeocodeRequestID = UUID()
+
+        syncStateLock.lock()
+        activeSyncRequestID = UUID()
+        let sessionToCancel = activeURLSession
+        activeURLSession = nil
+        syncStateLock.unlock()
+        sessionToCancel?.invalidateAndCancel()
+        isSyncing = false
+
         let simManager = CLSimulationManager()
         simManager.stopLocationSimulation()
         simManager.clearSimulatedLocations()
