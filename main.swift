@@ -90,13 +90,13 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         for path in hookStatusPaths {
             if let dict = NSDictionary(contentsOfFile: path) as? [String: Any],
                let active = dict["active"] as? Bool, active {
-                let ver = dict["version"] as? String ?? "4.1.0"
+                let ver = dict["version"] as? String ?? "4.2.0"
                 let proc = dict["lastProc"] as? String ?? "目标应用"
                 let hookOk = (dict["cHookReady"] as? Bool) ?? false
-                self.hookIsActive = true
+                self.hookIsActive = hookOk
                 self.hookStatusText = hookOk
-                    ? "已激活 v\(ver)（最近注入: \(proc)）"
-                    : "已激活 v\(ver) · fishhook模式（\(proc)）"
+                    ? "已激活 v\(ver) · ElleKit全功能就绪（\(proc)）"
+                    : "已注入 v\(ver) · 底层符号未绑定（\(proc)）"
                 return
             }
         }
