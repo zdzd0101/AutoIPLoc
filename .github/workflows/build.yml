@@ -21,6 +21,7 @@ jobs:
           mkdir -p Payload/AutoIPLoc.app
           SDK_PATH="$(xcrun --sdk iphoneos --show-sdk-path)"
           IOS_CLANG="$(xcrun --sdk iphoneos --find clang)"
+          IOS_SWIFTC="$(xcrun --sdk iphoneos --find swiftc)"
           SDK_NAME="$(basename "$SDK_PATH")"
           case "$SDK_NAME" in
             iPhoneOS*.sdk) ;;
@@ -29,11 +30,12 @@ jobs:
           echo "Using iPhoneOS SDK: $SDK_PATH"
           xcrun --sdk iphoneos --show-sdk-version
 
-          swiftc main.swift \
+          "$IOS_SWIFTC" main.swift \
             -parse-as-library \
             -import-objc-header Bridge.h \
             -sdk "$SDK_PATH" \
             -target arm64-apple-ios15.0 \
+            -Xcc -isysroot -Xcc "$SDK_PATH" \
             -framework SwiftUI -framework UIKit -framework CoreLocation -framework Network -framework AVFoundation \
             -o Payload/AutoIPLoc.app/AutoIPLoc
 
@@ -70,10 +72,9 @@ jobs:
 
           echo "Validating Mach-O architecture slices..."
           lipo -info "$MAIN_BIN"
-          lipo -verify_arch arm64 "$MAIN_BIN"
+          lipo "$MAIN_BIN" -verify_arch arm64
           lipo -info "$HOOK_BIN"
-          lipo -verify_arch arm64 "$HOOK_BIN"
-          lipo -verify_arch arm64e "$HOOK_BIN"
+          lipo "$HOOK_BIN" -verify_arch arm64 arm64e
           otool -l "$HOOK_BIN" | grep -q "platform IOS" || {
             echo "Hook binary does not advertise an iOS build platform" >&2
             exit 1
