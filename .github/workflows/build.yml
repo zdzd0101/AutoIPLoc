@@ -40,18 +40,6 @@ jobs:
 
           zip -r AutoIPLoc.tipa Payload
 
-          mkdir -p CydiaSubstrate.framework
-          cat << 'EOF' > CydiaSubstrate.framework/CydiaSubstrate.tbd
-          --- !tapi-tbd
-          tbd-version:     4
-          targets:         [ arm64-ios ]
-          install-name:    '/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate'
-          exports:
-            - targets:         [ arm64-ios ]
-              symbols:         [ _MSHookFunction, _MSHookMessageEx ]
-          ...
-          EOF
-
           mkdir -p deb_pkg/DEBIAN
           mkdir -p deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries
 
@@ -59,8 +47,8 @@ jobs:
             -arch arm64 \
             -isysroot "$SDK_PATH" \
             -miphoneos-version-min=15.0 \
-            -F. \
-            -framework Foundation -framework UIKit -framework CoreLocation -framework CoreTelephony -framework SystemConfiguration -framework CFNetwork -framework CydiaSubstrate \
+            -Wl,-no_fixup_chains \
+            -framework Foundation -framework UIKit -framework CoreLocation -framework CoreTelephony -framework SystemConfiguration -framework CFNetwork \
             -fobjc-arc \
             Tweak/AutoIPLocHook.m \
             -o deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
@@ -84,7 +72,7 @@ jobs:
           EOF
 
           INSTALLED_SIZE=$(du -sk deb_pkg/var | cut -f1)
-          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 3.3.0\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Pure arm64 iOS 16.2 ABI-compatible RootHide ElleKit stealth hook for GeoComply, EnvAuditor & CarrierCheck\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
+          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 3.4.0\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Zero-link-dep classic Mach-O RootHide runtime-resolved ElleKit stealth hook\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
 
           chmod 0755 deb_pkg/DEBIAN
           chmod 0644 deb_pkg/DEBIAN/control
