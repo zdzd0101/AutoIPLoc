@@ -44,17 +44,17 @@ jobs:
           mkdir -p deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries
 
           clang -dynamiclib \
-            -arch arm64 -arch arm64e \
+            -arch arm64 \
             -isysroot "$SDK_PATH" \
             -miphoneos-version-min=15.0 \
+            -Wl,-no_fixup_chains \
             -install_name /Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib \
             -framework Foundation -framework UIKit -framework CoreLocation -framework CoreTelephony -framework SystemConfiguration -framework CFNetwork \
             -fobjc-arc \
             Tweak/AutoIPLocHook.m \
             -o deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
 
-          codesign --force --sign - --timestamp=none deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
-          codesign -dvvv deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
+          ./ldid -S deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
 
           cat << 'EOF' > deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
           <?xml version="1.0" encoding="UTF-8"?>
@@ -73,7 +73,7 @@ jobs:
           EOF
 
           INSTALLED_SIZE=$(du -sk deb_pkg/var | cut -f1)
-          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 4.0.0\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Apple-codesigned SHA256 fat arm64+arm64e RootHide stealth hook\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
+          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 4.1.0\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Pure arm64 classic-fixup iOS 16.2 zero-dep RootHide stealth hook + dlopen self-diagnostic\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
 
           chmod 0755 deb_pkg/DEBIAN
           chmod 0644 deb_pkg/DEBIAN/control
@@ -82,6 +82,7 @@ jobs:
 
           dpkg-deb -Zgzip -b deb_pkg AutoIPLocHook.deb
           ls -lh AutoIPLoc.tipa AutoIPLocHook.deb
+          file deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
