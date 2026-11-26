@@ -29,7 +29,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     @Published var coordText = "- (0.0000, 0.0000)"
     @Published var streetAddress = "等待同步解析附近精确街道地址..."
     @Published var zipCode = "--"
-    @Published var hookStatusText = "待检测（重开一次目标 App 后自动刷新）"
+    @Published var hookStatusText = "正在检测插件状态..."
     @Published var hookIsActive = false
     @Published var autoSyncOnNetworkChange = true
     @Published var lockSessionGeo = true
@@ -71,11 +71,26 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         }
     }
 
+    private func findInstalledHookDylib() -> String? {
+        let fm = FileManager.default
+        let baseDir = "/var/containers/Bundle/Application"
+        if let items = try? fm.contentsOfDirectory(atPath: baseDir) {
+            for item in items where item.hasPrefix(".jbroot-") {
+                let candidate = "\(baseDir)/\(item)/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib"
+                if fm.fileExists(atPath: candidate) {
+                    return candidate
+                }
+            }
+        }
+        let fallback = "/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib"
+        return fm.fileExists(atPath: fallback) ? fallback : nil
+    }
+
     func refreshHookStatus() {
         for path in hookStatusPaths {
             if let dict = NSDictionary(contentsOfFile: path) as? [String: Any],
                let active = dict["active"] as? Bool, active {
-                let ver = dict["version"] as? String ?? "3.8.0"
+                let ver = dict["version"] as? String ?? "4.1.0"
                 let proc = dict["lastProc"] as? String ?? "目标应用"
                 let hookOk = (dict["cHookReady"] as? Bool) ?? false
                 self.hookIsActive = true
@@ -85,8 +100,21 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
                 return
             }
         }
-        self.hookIsActive = false
-        self.hookStatusText = "未检测到注入记录（请重开检测 App）"
+
+        if let dylibPath = findInstalledHookDylib() {
+            if let handle = dlopen(dylibPath, RTLD_NOW) {
+                dlclose(handle)
+                self.hookIsActive = true
+                self.hookStatusText = "二进制校验通过（请划掉重开检测 App 激活）"
+            } else {
+                let errStr = dlerror().map { String(cString: $0) } ?? "未知加载错误"
+                self.hookIsActive = false
+                self.hookStatusText = "加载失败: \(errStr)"
+            }
+        } else {
+            self.hookIsActive = false
+            self.hookStatusText = "未找到 AutoIPLocHook.dylib（请用 RootHide Patcher 安装）"
+        }
     }
 
     private func startNetworkMonitor() {
