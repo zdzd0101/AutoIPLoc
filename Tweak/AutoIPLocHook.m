@@ -646,9 +646,8 @@ static void ApplyFishhookFallback(void) {
     for (uint32_t i = 0; i < imgCount; i++) {
         const char *imgName = _dyld_get_image_name(i);
         if (!imgName) continue;
-        if (strstr(imgName, ".app/") != NULL || strstr(imgName, "CFNetwork") != NULL || strstr(imgName, "CoreLocation") != NULL) {
-            rebind_symbols_for_image(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i), entries, n);
-        }
+        if (strncmp(imgName, "/usr/lib/system/", 16) == 0 || strncmp(imgName, "/usr/lib/dyld", 13) == 0) continue;
+        rebind_symbols_for_image(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i), entries, n);
     }
 }
 
@@ -780,7 +779,7 @@ static void AutoIPLocHookEntry(void) {
 
         NSDictionary *status = @{
             @"active": @YES,
-            @"version": @"3.8.0",
+            @"version": @"3.9.0",
             @"lastProc": [NSString stringWithUTF8String:prog],
             @"cHookReady": @(g_MSHookFunction != NULL)
         };
