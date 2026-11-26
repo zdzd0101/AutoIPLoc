@@ -44,10 +44,10 @@ jobs:
           cat << 'EOF' > CydiaSubstrate.framework/CydiaSubstrate.tbd
           --- !tapi-tbd
           tbd-version:     4
-          targets:         [ arm64-ios, arm64e-ios ]
+          targets:         [ arm64-ios ]
           install-name:    '/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate'
           exports:
-            - targets:         [ arm64-ios, arm64e-ios ]
+            - targets:         [ arm64-ios ]
               symbols:         [ _MSHookFunction, _MSHookMessageEx ]
           ...
           EOF
@@ -56,7 +56,7 @@ jobs:
           mkdir -p deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries
 
           clang -dynamiclib \
-            -arch arm64 -arch arm64e \
+            -arch arm64 \
             -isysroot "$SDK_PATH" \
             -miphoneos-version-min=15.0 \
             -F. \
@@ -76,10 +76,7 @@ jobs:
               <dict>
                   <key>Bundles</key>
                   <array>
-                      <string>com.apple.CoreFoundation</string>
-                      <string>com.apple.Foundation</string>
                       <string>com.apple.UIKit</string>
-                      <string>com.apple.SwiftUI</string>
                   </array>
               </dict>
           </dict>
@@ -87,7 +84,7 @@ jobs:
           EOF
 
           INSTALLED_SIZE=$(du -sk deb_pkg/var | cut -f1)
-          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 3.2.0\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: GeoComply + EnvAuditor + CarrierCheck all-in-one RootHide ElleKit stealth hook\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
+          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 3.3.0\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Pure arm64 iOS 16.2 ABI-compatible RootHide ElleKit stealth hook for GeoComply, EnvAuditor & CarrierCheck\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
 
           chmod 0755 deb_pkg/DEBIAN
           chmod 0644 deb_pkg/DEBIAN/control
