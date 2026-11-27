@@ -103,3 +103,73 @@ Keep PR #1 Draft. Required device evidence remains: installed RootHide/Dopamine 
 - RootHide Bootstrap injection model: https://github.com/RootHide/Bootstrap#usage
 - Choicy source constants for PreferenceLoader and Preferences: https://github.com/opa334/Choicy/blob/master/Shared.h
 - Choicy upstream changelog: https://opa334.github.io/depic/Choicy/changelog.html
+
+
+## 2026-11-27 — device package inventory snapshot supplied by user
+
+The following facts come from the user's NewTerm output. They are package inventory observations, not a filesystem or injection success test.
+
+### Packages reported installed
+
+- `com.opa334.choicy` 1.5.4 (`iphoneos-arm64e`)
+- `com.opa334.altlist` 1.0.11 (`iphoneos-arm64e`)
+- `preferenceloader` 2.2.8 (`iphoneos-arm64e`)
+- `ellekit` 1.2-3 (`iphoneos-arm64e`)
+- `com.roothide.manager` 1.4.0
+- `com.roothide.patcher` 2.1.4-1+debug (the pasted output repeats this entry; confirm with `dpkg-query`)
+- `com.roothide.patchloader` 0.0.8
+- `roothide` 0.1.0
+- `dopamine-basebin-link` 1.0.0
+- Installed AutoIPLoc Hook: `com.local.autoiploc.hook` 4.3.5
+
+Choicy, AltList and PreferenceLoader are present in the package inventory, so their complete absence is not the explanation for the missing Choicy pane. This does not prove PreferenceLoader loaded in Settings, that Choicy's preference bundle registered, or that the relevant RootHide injection configuration is active. The device-side inventory is consistent with RootHide-related packages and ElleKit being installed, but the precise Bootstrap/manager build and active injection state remain unconfirmed.
+
+The installed AutoIPLoc Hook is 4.3.5; Build #196 creates 4.3.6. Do not upgrade from the current package to the conventional `var/jb` artifact until the RootHide package scheme and destination path are established.
+
+### AutoIPLoc files and crash report listing
+
+The user reported that all six queried Geo/Wi-Fi/status plist paths were missing:
+- `/var/mobile/Library/Preferences/com.autoiploc.geo.plist`
+- `/var/mobile/Library/Preferences/com.autoiploc.wifi.plist`
+- `/var/mobile/Library/Preferences/com.autoiploc.hookstatus.plist`
+- `/var/tmp/com.autoiploc.geo.plist`
+- `/var/tmp/com.autoiploc.wifi.plist`
+- `/var/tmp/com.autoiploc.hookstatus.plist`
+
+This means the queried locations currently provide no configuration or Hook report evidence. It does not distinguish whether the app has not yet written configuration, the Hook did not run, the reporting process could not write, or paths are being mapped differently in this RootHide environment.
+
+The supplied `ls -lt /var/mobile/Library/Logs/CrashReporter` produced no entries. Since stderr was redirected, this does not distinguish an empty directory from a missing/inaccessible directory. No crash log was supplied, so the Choicy/Tweak Injection crash cause remains unassigned.
+
+### RootHide path observation requiring interpretation
+
+The user reported:
+`/var/containers/Bundle/Application/.jbroot-B65E3B6A7115A07D -> //`
+
+This was observed as a symbolic link by `ls -ld`. Do not infer the active jbroot from the link name or link target string alone. RootHide documentation describes both a randomized jbroot root directory and per-Mach-O-directory `.jbroot` links. Obtain `readlink`, `realpath`, `stat`, and a shallow listing of the resolved target before classifying this device's path layout.
+
+### Next read-only device checks
+
+Use non-loop commands to avoid NewTerm multiline-paste ambiguity:
+
+```sh
+echo "=== exact package status ==="
+dpkg-query -W -f='${binary:Package} ${Version} ${Architecture} ${db:Status-Abbrev}\n' com.local.autoiploc.hook com.opa334.choicy com.opa334.altlist preferenceloader ellekit com.roothide.manager com.roothide.patcher com.roothide.patchloader roothide 2>&1
+
+echo "=== RootHide link details ==="
+readlink /var/containers/Bundle/Application/.jbroot-B65E3B6A7115A07D 2>&1
+realpath /var/containers/Bundle/Application/.jbroot-B65E3B6A7115A07D 2>&1
+stat -f '%N type=%HT owner=%Su group=%Sg mode=%Lp' /var/containers/Bundle/Application/.jbroot-B65E3B6A7115A07D 2>&1
+ls -la /var/containers/Bundle/Application/.jbroot-B65E3B6A7115A07D/. 2>&1 | head -20
+
+echo "=== package-owned Hook files ==="
+dpkg-query -L com.local.autoiploc.hook 2>&1
+ls -la /var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.* 2>&1
+```
+
+For crash logs, check both the active and retired reports without suppressing errors:
+```sh
+ls -la /var/mobile/Library/Logs/CrashReporter 2>&1 | head -30
+ls -la /var/mobile/Library/Logs/CrashReporter/Retired 2>&1 | head -30
+```
+
+Do not run cache deletion, remove packages, toggle global Tweak Injection, or modify any `.jbroot` link while collecting these facts.
