@@ -170,8 +170,8 @@ static NSDictionary *LoadGeoConfig(void) {
     os_unfair_lock_unlock(&g_cfgLock);
 
     g_selfCallDepth++;
-    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/com.autoiploc.geo.plist"];
-    if (!d) d = [NSDictionary dictionaryWithContentsOfFile:@"/var/tmp/com.autoiploc.geo.plist"];
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@"/var/tmp/com.autoiploc.geo.plist"];
+    if (!d) d = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/com.autoiploc.geo.plist"];
     g_selfCallDepth--;
 
     os_unfair_lock_lock(&g_cfgLock);
@@ -192,8 +192,8 @@ static NSDictionary *LoadWiFiConfig(void) {
     os_unfair_lock_unlock(&g_cfgLock);
 
     g_selfCallDepth++;
-    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/com.autoiploc.wifi.plist"];
-    if (!d) d = [NSDictionary dictionaryWithContentsOfFile:@"/var/tmp/com.autoiploc.wifi.plist"];
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@"/var/tmp/com.autoiploc.wifi.plist"];
+    if (!d) d = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/com.autoiploc.wifi.plist"];
     g_selfCallDepth--;
 
     os_unfair_lock_lock(&g_cfgLock);
@@ -671,7 +671,7 @@ static BOOL hook_returnYES(id self, SEL _cmd) {
 }
 
 // ============================================================================
-// 9. 代理与 VPN 网卡隐身（PAC 剥离 + 正确放行系统框架 + 单节点链表修复）
+// 9. 代理与 VPN 网卡隐身（PAC 剥离 + 放行系统/地图网络框架 + 单节点修复）
 // ============================================================================
 
 static BOOL IsSystemNetworkingCaller(void *retAddr) {
@@ -683,7 +683,11 @@ static BOOL IsSystemNetworkingCaller(void *retAddr) {
         if (strstr(info.dli_fname, "CFNetwork") != NULL ||
             strstr(info.dli_fname, "WebKit") != NULL ||
             strstr(info.dli_fname, "libnetwork") != NULL ||
-            strstr(info.dli_fname, "Network.framework") != NULL) {
+            strstr(info.dli_fname, "Network.framework") != NULL ||
+            strstr(info.dli_fname, "GeoServices") != NULL ||
+            strstr(info.dli_fname, "MapKit") != NULL ||
+            strstr(info.dli_fname, "VectorKit") != NULL ||
+            strstr(info.dli_fname, "Foundation") != NULL) {
             return YES;
         }
     }
@@ -1132,18 +1136,19 @@ static void AutoIPLocHookEntry(void) {
             g_MSHookFunction((void *)CNCopySupportedInterfaces, (void *)hook_CNCopySupportedInterfaces, (void **)&orig_CNCopySupportedInterfaces);
         }
 
-        // 写入插件状态时开启 TLS 自放行，避免被刚挂载的文件 Hook 拦截
+        // 采用非原子直接覆写 + 0666 权限，提升沙盒进程写入成功率并避免旧文件覆盖新状态
         g_selfCallDepth++;
         NSDictionary *status = @{
             @"active": @YES,
-            @"version": @"4.5.0",
+            @"version": @"4.5.1",
             @"lastProc": [NSString stringWithUTF8String:prog],
             @"cHookReady": @(g_MSHookFunction != NULL && g_MSHookMessageEx != NULL),
             @"timestamp": @([[NSDate date] timeIntervalSince1970])
         };
-        [status writeToFile:@"/var/mobile/Library/Preferences/com.autoiploc.hookstatus.plist" atomically:YES];
-        [status writeToFile:@"/var/tmp/com.autoiploc.hookstatus.plist" atomically:YES];
+        [status writeToFile:@"/var/tmp/com.autoiploc.hookstatus.plist" atomically:NO];
         chmod("/var/tmp/com.autoiploc.hookstatus.plist", 0666);
+        [status writeToFile:@"/var/mobile/Library/Preferences/com.autoiploc.hookstatus.plist" atomically:NO];
+        chmod("/var/mobile/Library/Preferences/com.autoiploc.hookstatus.plist", 0666);
         g_selfCallDepth--;
     }
 }
