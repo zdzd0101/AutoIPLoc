@@ -11,6 +11,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Run host-side stability regression tests
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/autoiploc-tests
+
+          clang -std=c11 -Wall -Wextra -Werror -pedantic -pthread \
+            -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -I Tweak Tweak/AutoIPLocIfaddrs.c Tests/AutoIPLocIfaddrsTests.c \
+            -o /tmp/autoiploc-tests/ifaddrs-ownership-tests
+          ASAN_OPTIONS=detect_leaks=0 /tmp/autoiploc-tests/ifaddrs-ownership-tests
+
+          swiftc -warnings-as-errors WiFiConfigValidation.swift Tests/WiFiConfigValidationTests.swift \
+            -o /tmp/autoiploc-tests/wifi-config-tests
+          /tmp/autoiploc-tests/wifi-config-tests
+
+          swiftc -warnings-as-errors IPGeoDisplayInfo.swift Tests/IPGeoDisplayInfoTests.swift \
+            -o /tmp/autoiploc-tests/ip-geodata-tests
+          /tmp/autoiploc-tests/ip-geodata-tests
+
+          swiftc -warnings-as-errors HookInstallResolver.swift Tests/HookInstallResolverTests.swift \
+            -o /tmp/autoiploc-tests/hook-path-tests
+          /tmp/autoiploc-tests/hook-path-tests
+
       - name: Install dpkg
         run: HOMEBREW_NO_AUTO_UPDATE=1 brew install dpkg
 
@@ -19,20 +42,97 @@ jobs:
           set -e
           unset SDKROOT
           mkdir -p Payload/AutoIPLoc.app
-          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          SDK_PATH="$(xcrun --sdk iphoneos --show-sdk-path)"
+          IOS_CLANG="$(xcrun --sdk iphoneos --find clang)"
+          IOS_SWIFTC="$(xcrun --sdk iphoneos --find swiftc)"
+          SDK_NAME="$(basename "$SDK_PATH")"
+          case "$SDK_NAME" in
+            iPhoneOS*.sdk) ;;
+            *) echo "Expected iPhoneOS SDK, got: $SDK_PATH" >&2; exit 1 ;;
+          esac
+          echo "Using iPhoneOS SDK: $SDK_PATH"
+          xcrun --sdk iphoneos --show-sdk-version
 
-          swiftc main.swift \
+          "$IOS_SWIFTC" WiFiConfigValidation.swift IPGeoDisplayInfo.swift HookInstallResolver.swift main.swift \
             -parse-as-library \
             -import-objc-header Bridge.h \
             -sdk "$SDK_PATH" \
             -target arm64-apple-ios15.0 \
-            -framework SwiftUI -framework UIKit -framework CoreLocation -framework Network -framework AVFoundation \
+            -Xcc -isysroot -Xcc "$SDK_PATH" \
+            -framework SwiftUI -framework UIKit -framework CoreLocation -framework Network \
             -o Payload/AutoIPLoc.app/AutoIPLoc
 
           cp Info.plist Payload/AutoIPLoc.app/Info.plist
-          /usr/libexec/PlistBuddy -c "Delete :NSAppTransportSecurity" Payload/AutoIPLoc.app/Info.plist 2>/dev/null || true
-          /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity dict" Payload/AutoIPLoc.app/Info.plist
-          /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSAllowsArbitraryLoads bool true" Payload/AutoIPLoc.app/Info.plist
+          plutil -lint Info.plist
+          plutil -lint entitlements.plist
+          plutil -lint Tweak/AutoIPLocHook.plist
+          echo "Checking App transport and input validation invariants..."
+          if grep -Fq "http://" main.swift; then
+            echo "Insecure HTTP endpoint found in main.swift" >&2
+            exit 1
+          fi
+          if grep -Fq "NSAllowsArbitraryLoads" Info.plist; then
+            echo "Unrestricted App Transport Security exception found" >&2
+            exit 1
+          fi
+          grep -Fq "inet_pton(AF_INET" main.swift
+          grep -Fq "inet_pton(AF_INET6" main.swift
+          grep -Fq "isValidGeoProfile(profile)" main.swift
+          grep -Fq "WiFiConfigValidator.validatedNetworks" main.swift
+          grep -Fq "HookInstallResolver.candidatePaths" main.swift
+          grep -Fq "geoConfigReadable" Tweak/AutoIPLocHook.m
+          grep -Fq "wifiConfigReadable" Tweak/AutoIPLocHook.m
+          if grep -Fq '<string>com.apple.Preferences</string>' Tweak/AutoIPLocHook.plist; then
+            echo "AutoIPLoc Hook must not target the Preferences bundle" >&2
+            exit 1
+          fi
+          grep -Fq 'strcmp(prog, "Preferences") == 0' Tweak/AutoIPLocHook.m
+          grep -Fq "activeReports.max(by:" main.swift
+          if grep -Eq 'AVFoundation|AVAudio|AVCapture|AVPlayer' main.swift; then
+            echo "Unused AVFoundation/audio/video dependency detected in main.swift" >&2
+            exit 1
+          fi
+          if /usr/libexec/PlistBuddy -c 'Print :UIBackgroundModes' Info.plist | grep -q 'audio'; then
+            echo "Audio background mode remains without an audio feature" >&2
+            exit 1
+          fi
+          echo "Checking Hook source safety invariants..."
+          grep -Fq "MethodHasExpectedSignature" Tweak/AutoIPLocHook.m
+          grep -Fq "object_setIvarWithStrongDefault" Tweak/AutoIPLocHook.m
+          grep -Fq "ns_consumed" Tweak/AutoIPLocHook.m
+          grep -Fq "ns_returns_retained" Tweak/AutoIPLocHook.m
+          grep -Fq "_Thread_local int g_selfCallDepth" Tweak/AutoIPLocHook.m
+          grep -Fq "if (g_selfCallDepth > 0) return NO;" Tweak/AutoIPLocHook.m
+          if grep -Fq "IsSelfCaller" Tweak/AutoIPLocHook.m; then
+            echo "Legacy return-address self-caller detection remains" >&2
+            exit 1
+          fi
+          grep -Fq "ptrauth_strip(returnAddress, ptrauth_key_return_address)" Tweak/AutoIPLocHook.m
+          grep -Fq "os_unfair_lock g_configCacheLock" Tweak/AutoIPLocHook.m
+          grep -Fq "kConfigCacheRefreshInterval = 3.0" Tweak/AutoIPLocHook.m
+          grep -Fq "g_geoConfigCacheInitialized" Tweak/AutoIPLocHook.m
+          grep -Fq "g_wifiConfigCacheInitialized" Tweak/AutoIPLocHook.m
+          grep -Fq "g_geoConfigRefreshPending" Tweak/AutoIPLocHook.m
+          grep -Fq "g_wifiConfigRefreshPending" Tweak/AutoIPLocHook.m
+          grep -Fq "ReadGeoConfigFromDisk" Tweak/AutoIPLocHook.m
+          grep -Fq "ReadWiFiConfigFromDisk" Tweak/AutoIPLocHook.m
+          grep -Fq "InitializeConfigCaches();" Tweak/AutoIPLocHook.m
+          grep -Fq "dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0)" Tweak/AutoIPLocHook.m
+          grep -Fq "methodMatchesSignature" main.swift
+          grep -Fq "method_copyArgumentType" main.swift
+          grep -Fq "hook_freeifaddrs" Tweak/AutoIPLocHook.m
+          grep -Fq "AutoIPLocIfaddrsCloneAndRegister" Tweak/AutoIPLocHook.m
+          grep -Fq "AutoIPLocIfaddrsReleaseRegistered" Tweak/AutoIPLocHook.m
+          grep -Fq "if (!ifap)" Tweak/AutoIPLocHook.m
+          grep -Fq "INSTALL_C_FUNCTION_HOOK(freeifaddrs" Tweak/AutoIPLocHook.m
+          if grep -Fq "memcpy(head, nextNode" Tweak/AutoIPLocHook.m; then
+            echo "Unsafe in-place ifaddrs list mutation detected" >&2
+            exit 1
+          fi
+          if grep -Eq '\(IMP \*\)&orig_|\(void \*\*\)&orig_' Tweak/AutoIPLocHook.m; then
+            echo "Aliased typed function-pointer storage passed to hook API" >&2
+            exit 1
+          fi
 
           curl -fsSL https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_macosx_x86_64 -o ldid
           chmod +x ldid
@@ -43,55 +143,106 @@ jobs:
           mkdir -p deb_pkg/DEBIAN
           mkdir -p deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries
 
-          clang -dynamiclib \
+          "$IOS_CLANG" -dynamiclib \
             -arch arm64 -arch arm64e \
+            -target arm64-apple-ios15.0 \
             -isysroot "$SDK_PATH" \
             -miphoneos-version-min=15.0 \
             -install_name /Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib \
             -framework Foundation -framework UIKit -framework CoreLocation -framework CoreTelephony -framework SystemConfiguration -framework CFNetwork \
             -fobjc-arc \
-            Tweak/AutoIPLocHook.m \
+            Tweak/AutoIPLocHook.m Tweak/AutoIPLocIfaddrs.c \
+            -I Tweak \
             -o deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
 
-          codesign --force --sign - --timestamp=none deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
+          MAIN_BIN="Payload/AutoIPLoc.app/AutoIPLoc"
+          HOOK_BIN="deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib"
 
-          cat << 'EOF' > deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-              <key>Filter</key>
-              <dict>
-                  <key>Bundles</key>
-                  <array>
-                      <string>com.apple.UIKit</string>
-                  </array>
-              </dict>
-          </dict>
-          </plist>
-          EOF
+          echo "Validating Mach-O architecture slices..."
+          lipo -info "$MAIN_BIN"
+          lipo "$MAIN_BIN" -verify_arch arm64
+          lipo -info "$HOOK_BIN"
+          lipo "$HOOK_BIN" -verify_arch arm64 arm64e
+          for ARCH in arm64 arm64e; do
+            otool -arch "$ARCH" -l "$HOOK_BIN" | awk '
+              /cmd LC_BUILD_VERSION/ { in_build = 1; next }
+              /cmd LC_VERSION_MIN_IPHONEOS/ { legacy_ios = 1 }
+              /cmd LC_/ && !/LC_BUILD_VERSION/ { in_build = 0 }
+              in_build && /platform 2/ { modern_ios = 1 }
+              END { exit (modern_ios || legacy_ios) ? 0 : 1 }
+            ' || {
+              echo "Hook $ARCH slice is not marked as an iOS binary" >&2
+              otool -arch "$ARCH" -l "$HOOK_BIN" >&2
+              exit 1
+            }
+          done
+
+          codesign --force --sign - --timestamp=none "$HOOK_BIN"
+          codesign --verify --verbose=2 "$HOOK_BIN"
+
+          cp Tweak/AutoIPLocHook.plist \
+            deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
+          plutil -lint deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
 
           cat << 'EOF' > deb_pkg/DEBIAN/postinst
           #!/bin/sh
-          for JB in /var/containers/Bundle/Application/.jbroot-*; do
+          set -eu
+          umask 022
+
+          ROOT_FILE="/var/tmp/com.autoiploc.jbroot.txt"
+          ROOT_TMP="${ROOT_FILE}.$$"
+          ROOT_DIR="/var/containers/Bundle/Application"
+
+          : > "$ROOT_TMP"
+          for JB in "$ROOT_DIR"/.jbroot-*; do
             if [ -d "$JB" ]; then
-              printf "%s\n" "$JB" > /var/tmp/com.autoiploc.jbroot.txt
-              chmod 666 /var/tmp/com.autoiploc.jbroot.txt
+              printf "%s\n" "$JB" >> "$ROOT_TMP"
             fi
           done
+
+          if [ -s "$ROOT_TMP" ]; then
+            chmod 0644 "$ROOT_TMP"
+            mv -f "$ROOT_TMP" "$ROOT_FILE"
+          else
+            rm -f "$ROOT_TMP" "$ROOT_FILE"
+          fi
           exit 0
           EOF
 
+          cat << 'EOF' > deb_pkg/DEBIAN/postrm
+          #!/bin/sh
+          set -eu
+
+          case "${1:-}" in
+            remove|purge)
+              # Remove package-owned diagnostics only. Preserve user Geo/Wi-Fi
+              # configuration so reinstall/rollback does not destroy user data.
+              rm -f /var/tmp/com.autoiploc.jbroot.txt
+              rm -f /var/tmp/com.autoiploc.hookstatus.plist
+              rm -f /var/mobile/Library/Preferences/com.autoiploc.hookstatus.plist
+              ;;
+          esac
+
+          exit 0
+          EOF
+          sh -n deb_pkg/DEBIAN/postrm
+
           INSTALLED_SIZE=$(du -sk deb_pkg/var | cut -f1)
-          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 4.3.0\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Fat arm64+arm64e XPC-level CLLocationSourceInformation scrub & RootHide ElleKit stealth hook\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
+          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 4.3.6\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Fat arm64+arm64e XPC-level CLLocationSourceInformation scrub & RootHide ElleKit stealth hook\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
 
           chmod 0755 deb_pkg/DEBIAN
           chmod 0755 deb_pkg/DEBIAN/postinst
+          chmod 0755 deb_pkg/DEBIAN/postrm
           chmod 0644 deb_pkg/DEBIAN/control
           chmod 0755 deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
           chmod 0644 deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
 
-          dpkg-deb -Zgzip -b deb_pkg AutoIPLocHook.deb
+          dpkg-deb --root-owner-group -Zgzip -b deb_pkg AutoIPLocHook.deb
+          dpkg-deb --info AutoIPLocHook.deb
+          dpkg-deb --contents AutoIPLocHook.deb
+          test -s AutoIPLoc.tipa
+          test -s AutoIPLocHook.deb
+          unzip -l AutoIPLoc.tipa
           ls -lh AutoIPLoc.tipa AutoIPLocHook.deb
 
       - name: Upload Artifacts

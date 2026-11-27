@@ -9,6 +9,7 @@
 #import <objc/message.h>
 #import <mach-o/dyld.h>
 #import <ifaddrs.h>
+#import "AutoIPLocIfaddrs.h"
 #import <dlfcn.h>
 #import <dirent.h>
 #import <sys/stat.h>
@@ -16,6 +17,19 @@
 #import <errno.h>
 #import <stdlib.h>
 #import <string.h>
+#import <stdio.h>
+#import <stdint.h>
+#import <pthread.h>
+#import <time.h>
+#import <os/lock.h>
+#import <dispatch/dispatch.h>
+
+#if __has_feature(ptrauth_calls)
+#import <ptrauth.h>
+#define AUTOIPLOC_HAS_PTRAUTH 1
+#else
+#define AUTOIPLOC_HAS_PTRAUTH 0
+#endif
 
 typedef void (*MSHookFunction_t)(void *symbol, void *replace, void **result);
 typedef void (*MSHookMessageEx_t)(Class _class, SEL message, IMP hook, IMP *old);
@@ -23,6 +37,29 @@ typedef void (*MSHookMessageEx_t)(Class _class, SEL message, IMP hook, IMP *old)
 static MSHookFunction_t g_MSHookFunction = NULL;
 static MSHookMessageEx_t g_MSHookMessageEx = NULL;
 static int (*orig_dladdr)(const void *addr, Dl_info *info) = NULL;
+static unsigned int g_installedCHookCount = 0;
+static unsigned int g_installedObjCHookCount = 0;
+static _Thread_local int g_selfCallDepth = 0;
+
+static void BeginInternalIO(void) {
+    ++g_selfCallDepth;
+}
+
+static void EndInternalIO(void) {
+    if (g_selfCallDepth > 0) {
+        --g_selfCallDepth;
+    }
+}
+
+#define INSTALL_C_FUNCTION_HOOK(target, replacement, originalStorage) \
+    do { \
+        void *capturedOriginal = NULL; \
+        g_MSHookFunction((void *)(target), (void *)(replacement), &capturedOriginal); \
+        if (capturedOriginal != NULL) { \
+            (originalStorage) = (__typeof__(originalStorage))capturedOriginal; \
+            g_installedCHookCount++; \
+        } \
+    } while (0)
 
 static BOOL TryLoadElleKitFromRoot(const char *jbRoot) {
     if (!jbRoot || jbRoot[0] == '\0') return NO;
@@ -34,8 +71,11 @@ static BOOL TryLoadElleKitFromRoot(const char *jbRoot) {
     };
     for (int i = 0; i < 4; i++) {
         char fullPath[768] = {0};
-        snprintf(fullPath, sizeof(fullPath), "%s%s", jbRoot, relPaths[i]);
+        int pathLength = snprintf(fullPath, sizeof(fullPath), "%s%s", jbRoot, relPaths[i]);
+        if (pathLength <= 0 || (size_t)pathLength >= sizeof(fullPath)) continue;
+        BeginInternalIO();
         void *h = dlopen(fullPath, RTLD_NOW | RTLD_GLOBAL);
+        EndInternalIO();
         if (h) {
             if (!g_MSHookFunction) g_MSHookFunction = (MSHookFunction_t)dlsym(h, "MSHookFunction");
             if (!g_MSHookMessageEx) g_MSHookMessageEx = (MSHookMessageEx_t)dlsym(h, "MSHookMessageEx");
@@ -52,10 +92,22 @@ static void ResolveElleKitRuntime(void *selfSymbolAddr) {
     if (!g_MSHookMessageEx) g_MSHookMessageEx = (MSHookMessageEx_t)dlsym(RTLD_NEXT, "MSHookMessageEx");
     if (g_MSHookFunction && g_MSHookMessageEx) return;
 
-    NSString *savedRoot = [NSString stringWithContentsOfFile:@"/var/tmp/com.autoiploc.jbroot.txt" encoding:NSUTF8StringEncoding error:nil];
+    NSString *savedRoot = nil;
+    BeginInternalIO();
+    @try {
+        savedRoot = [NSString stringWithContentsOfFile:@"/var/tmp/com.autoiploc.jbroot.txt"
+                                               encoding:NSUTF8StringEncoding
+                                                  error:nil];
+    } @finally {
+        EndInternalIO();
+    }
     if (savedRoot.length > 0) {
-        NSString *trimmed = [savedRoot stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if (TryLoadElleKitFromRoot(trimmed.UTF8String)) return;
+        NSCharacterSet *separators = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+        for (NSString *rawRoot in [savedRoot componentsSeparatedByCharactersInSet:separators]) {
+            NSString *trimmed = [rawRoot stringByTrimmingCharactersInSet:separators];
+            if (![trimmed hasPrefix:@"/var/containers/Bundle/Application/.jbroot-"]) continue;
+            if (TryLoadElleKitFromRoot(trimmed.UTF8String)) return;
+        }
     }
 
     Dl_info selfInfo;
@@ -77,8 +129,10 @@ static void ResolveElleKitRuntime(void *selfSymbolAddr) {
         if (!img) continue;
         if (strstr(img, "ellekit") != NULL || strstr(img, "substrate") != NULL ||
             strstr(img, "Substrate") != NULL || strstr(img, "TweakInject") != NULL) {
+            BeginInternalIO();
             void *h = dlopen(img, RTLD_NOLOAD | RTLD_LAZY);
             if (!h) h = dlopen(img, RTLD_NOW | RTLD_GLOBAL);
+            EndInternalIO();
             if (h) {
                 if (!g_MSHookFunction) g_MSHookFunction = (MSHookFunction_t)dlsym(h, "MSHookFunction");
                 if (!g_MSHookMessageEx) g_MSHookMessageEx = (MSHookMessageEx_t)dlsym(h, "MSHookMessageEx");
@@ -88,40 +142,217 @@ static void ResolveElleKitRuntime(void *selfSymbolAddr) {
     }
 }
 
-static void HookObjCMethod(Class cls, SEL sel, IMP newImp, IMP *oldImp) {
-    if (!cls || !sel || !newImp) return;
-    Method m = class_getInstanceMethod(cls, sel);
-    if (!m) return;
-    if (g_MSHookMessageEx) {
-        g_MSHookMessageEx(cls, sel, newImp, oldImp);
-    } else {
-        IMP prev = method_setImplementation(m, newImp);
-        if (oldImp && *oldImp == NULL) *oldImp = prev;
-    }
+static char ObjCTypeCode(const char *encoding) {
+    if (!encoding) return '\0';
+    while (*encoding && strchr("rnNoORV", *encoding) != NULL) encoding++;
+    return *encoding;
 }
 
-static BOOL IsSelfCaller(void *retAddr) {
-    if (!retAddr) return NO;
-    Dl_info info;
-    int ok = orig_dladdr ? orig_dladdr(retAddr, &info) : dladdr(retAddr, &info);
-    if (ok != 0 && info.dli_fname != NULL) {
-        if (strstr(info.dli_fname, "AutoIPLocHook") != NULL) {
-            return YES;
-        }
+static BOOL ObjCTypeMatches(const char *encoding, char expected) {
+    char actual = ObjCTypeCode(encoding);
+    if (expected == 'B') return actual == 'B' || actual == 'c';
+    return actual == expected;
+}
+
+static BOOL MethodHasExpectedSignature(Method method, char expectedReturn, const char *expectedArguments) {
+    if (!method || !expectedArguments) return NO;
+
+    size_t expectedArgumentCount = strlen(expectedArguments);
+    if (method_getNumberOfArguments(method) != expectedArgumentCount + 2) return NO;
+
+    char *returnType = method_copyReturnType(method);
+    char *selfType = method_copyArgumentType(method, 0);
+    char *selectorType = method_copyArgumentType(method, 1);
+
+    BOOL matches = ObjCTypeMatches(returnType, expectedReturn) &&
+                   (ObjCTypeCode(selfType) == '@' || ObjCTypeCode(selfType) == '#') &&
+                   ObjCTypeCode(selectorType) == ':';
+
+    free(returnType);
+    free(selfType);
+    free(selectorType);
+    if (!matches) return NO;
+
+    for (size_t index = 0; index < expectedArgumentCount; index++) {
+        char *argumentType = method_copyArgumentType(method, (unsigned int)index + 2);
+        matches = ObjCTypeMatches(argumentType, expectedArguments[index]);
+        free(argumentType);
+        if (!matches) return NO;
     }
-    return NO;
+    return YES;
+}
+
+static BOOL HookObjCMethod(Class cls, SEL sel, IMP newImp, IMP *oldImp,
+                           char expectedReturn, const char *expectedArguments) {
+    if (!cls || !sel || !newImp) return NO;
+
+    Method method = class_getInstanceMethod(cls, sel);
+    if (!MethodHasExpectedSignature(method, expectedReturn, expectedArguments)) return NO;
+
+    IMP previous = method_getImplementation(method);
+    if (g_MSHookMessageEx) {
+        IMP hookOriginal = NULL;
+        g_MSHookMessageEx(cls, sel, newImp, &hookOriginal);
+        if (hookOriginal != NULL) previous = hookOriginal;
+    } else {
+        IMP replaced = method_setImplementation(method, newImp);
+        if (replaced != NULL) previous = replaced;
+    }
+
+    if (oldImp) *oldImp = previous;
+    g_installedObjCHookCount++;
+    return YES;
+}
+
+#define HOOK_OBJC_METHOD_TYPED(cls, sel, replacement, originalStorage, returnKind, argumentKinds) \
+    do { \
+        IMP capturedOriginal = NULL; \
+        if (HookObjCMethod((cls), (sel), (replacement), &capturedOriginal, (returnKind), (argumentKinds))) { \
+            (originalStorage) = (__typeof__(originalStorage))capturedOriginal; \
+        } \
+    } while (0)
+
+static double MonotonicTimeSeconds(void) {
+    struct timespec now = {0, 0};
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return CFAbsoluteTimeGetCurrent();
+    }
+    return (double)now.tv_sec + ((double)now.tv_nsec / 1000000000.0);
+}
+
+static os_unfair_lock g_configCacheLock = OS_UNFAIR_LOCK_INIT;
+static NSDictionary *g_geoConfigCache = nil;
+static NSDictionary *g_wifiConfigCache = nil;
+static double g_geoConfigCacheUpdatedAt = 0.0;
+static double g_wifiConfigCacheUpdatedAt = 0.0;
+static BOOL g_geoConfigCacheInitialized = NO;
+static BOOL g_wifiConfigCacheInitialized = NO;
+static BOOL g_geoConfigRefreshPending = NO;
+static BOOL g_wifiConfigRefreshPending = NO;
+static const double kConfigCacheRefreshInterval = 3.0;
+
+// The only synchronous reads occur once during constructor initialization,
+// before filesystem hooks are installed. TTL refreshes never block hot paths.
+static NSDictionary *ReadGeoConfigFromDisk(void) {
+    NSDictionary *config = nil;
+    BeginInternalIO();
+    @try {
+        config = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/com.autoiploc.geo.plist"];
+        if (!config) {
+            config = [NSDictionary dictionaryWithContentsOfFile:@"/var/tmp/com.autoiploc.geo.plist"];
+        }
+    } @finally {
+        EndInternalIO();
+    }
+    return config;
+}
+
+static NSDictionary *ReadWiFiConfigFromDisk(void) {
+    NSDictionary *config = nil;
+    BeginInternalIO();
+    @try {
+        config = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/com.autoiploc.wifi.plist"];
+        if (!config) {
+            config = [NSDictionary dictionaryWithContentsOfFile:@"/var/tmp/com.autoiploc.wifi.plist"];
+        }
+    } @finally {
+        EndInternalIO();
+    }
+    return config;
+}
+
+static void InitializeConfigCaches(void) {
+    os_unfair_lock_lock(&g_configCacheLock);
+    const BOOL needGeo = !g_geoConfigCacheInitialized && !g_geoConfigRefreshPending;
+    const BOOL needWiFi = !g_wifiConfigCacheInitialized && !g_wifiConfigRefreshPending;
+    if (needGeo) g_geoConfigRefreshPending = YES;
+    if (needWiFi) g_wifiConfigRefreshPending = YES;
+    os_unfair_lock_unlock(&g_configCacheLock);
+
+    NSDictionary *geo = needGeo ? ReadGeoConfigFromDisk() : nil;
+    NSDictionary *wifi = needWiFi ? ReadWiFiConfigFromDisk() : nil;
+    const double now = MonotonicTimeSeconds();
+
+    os_unfair_lock_lock(&g_configCacheLock);
+    if (needGeo) {
+        g_geoConfigCache = [geo copy];
+        g_geoConfigCacheUpdatedAt = now;
+        g_geoConfigCacheInitialized = YES;
+        g_geoConfigRefreshPending = NO;
+    }
+    if (needWiFi) {
+        g_wifiConfigCache = [wifi copy];
+        g_wifiConfigCacheUpdatedAt = now;
+        g_wifiConfigCacheInitialized = YES;
+        g_wifiConfigRefreshPending = NO;
+    }
+    os_unfair_lock_unlock(&g_configCacheLock);
 }
 
 static NSDictionary *LoadGeoConfig(void) {
-    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/com.autoiploc.geo.plist"];
-    if (!d) d = [NSDictionary dictionaryWithContentsOfFile:@"/var/tmp/com.autoiploc.geo.plist"];
-    return d;
+    NSDictionary *snapshot = nil;
+    BOOL shouldRefresh = NO;
+    const double now = MonotonicTimeSeconds();
+
+    os_unfair_lock_lock(&g_configCacheLock);
+    snapshot = g_geoConfigCache;
+    const BOOL expired = !g_geoConfigCacheInitialized ||
+                         now < g_geoConfigCacheUpdatedAt ||
+                         (now - g_geoConfigCacheUpdatedAt) >= kConfigCacheRefreshInterval;
+    if (expired && !g_geoConfigRefreshPending) {
+        g_geoConfigRefreshPending = YES;
+        shouldRefresh = YES;
+    }
+    os_unfair_lock_unlock(&g_configCacheLock);
+
+    if (shouldRefresh) {
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            @autoreleasepool {
+                NSDictionary *fresh = [ReadGeoConfigFromDisk() copy];
+                const double refreshedAt = MonotonicTimeSeconds();
+                os_unfair_lock_lock(&g_configCacheLock);
+                if (fresh) g_geoConfigCache = fresh;
+                g_geoConfigCacheUpdatedAt = refreshedAt;
+                g_geoConfigCacheInitialized = YES;
+                g_geoConfigRefreshPending = NO;
+                os_unfair_lock_unlock(&g_configCacheLock);
+            }
+        });
+    }
+    return snapshot;
 }
 
 static NSDictionary *LoadWiFiConfig(void) {
-    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/com.autoiploc.wifi.plist"];
-    if (!d) d = [NSDictionary dictionaryWithContentsOfFile:@"/var/tmp/com.autoiploc.wifi.plist"];
-    return d;
+    NSDictionary *snapshot = nil;
+    BOOL shouldRefresh = NO;
+    const double now = MonotonicTimeSeconds();
+
+    os_unfair_lock_lock(&g_configCacheLock);
+    snapshot = g_wifiConfigCache;
+    const BOOL expired = !g_wifiConfigCacheInitialized ||
+                         now < g_wifiConfigCacheUpdatedAt ||
+                         (now - g_wifiConfigCacheUpdatedAt) >= kConfigCacheRefreshInterval;
+    if (expired && !g_wifiConfigRefreshPending) {
+        g_wifiConfigRefreshPending = YES;
+        shouldRefresh = YES;
+    }
+    os_unfair_lock_unlock(&g_configCacheLock);
+
+    if (shouldRefresh) {
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            @autoreleasepool {
+                NSDictionary *fresh = [ReadWiFiConfigFromDisk() copy];
+                const double refreshedAt = MonotonicTimeSeconds();
+                os_unfair_lock_lock(&g_configCacheLock);
+                if (fresh) g_wifiConfigCache = fresh;
+                g_wifiConfigCacheUpdatedAt = refreshedAt;
+                g_wifiConfigCacheInitialized = YES;
+                g_wifiConfigRefreshPending = NO;
+                os_unfair_lock_unlock(&g_configCacheLock);
+            }
+        });
+    }
+    return snapshot;
 }
 
 static NSString *GetTargetCountryCode(void) {
@@ -153,7 +384,8 @@ static BOOL IsSensitiveDylibPath(const char *path) {
 
 static const char *(*orig_dyld_get_image_name)(uint32_t image_index) = NULL;
 static const char *hook_dyld_get_image_name(uint32_t image_index) {
-    const char *name = orig_dyld_get_image_name ? orig_dyld_get_image_name(image_index) : _dyld_get_image_name(image_index);
+    if (!orig_dyld_get_image_name) return NULL;
+    const char *name = orig_dyld_get_image_name(image_index);
     if (IsSensitiveDylibPath(name)) {
         return "/usr/lib/libobjc.A.dylib";
     }
@@ -161,7 +393,8 @@ static const char *hook_dyld_get_image_name(uint32_t image_index) {
 }
 
 static int hook_dladdr(const void *addr, Dl_info *info) {
-    int ret = orig_dladdr ? orig_dladdr(addr, info) : dladdr(addr, info);
+    if (!orig_dladdr) return 0;
+    int ret = orig_dladdr(addr, info);
     if (ret != 0 && info && info->dli_fname && IsSensitiveDylibPath(info->dli_fname)) {
         info->dli_fname = "/usr/lib/libobjc.A.dylib";
     }
@@ -176,7 +409,7 @@ static char *hook_getenv(const char *name) {
                  strcmp(name, "JBROOT") == 0)) {
         return NULL;
     }
-    return orig_getenv ? orig_getenv(name) : getenv(name);
+    return orig_getenv ? orig_getenv(name) : NULL;
 }
 
 static BOOL IsJailbreakPath(const char *path) {
@@ -206,54 +439,64 @@ static BOOL IsJailbreakPath(const char *path) {
             strstr(path, "autoiploc") != NULL);
 }
 
+static BOOL ShouldHidePath(const char *path) {
+    if (g_selfCallDepth > 0) return NO;
+    return IsJailbreakPath(path);
+}
+
 static int (*orig_access)(const char *path, int mode) = NULL;
 static int hook_access(const char *path, int mode) {
-    if (!IsSelfCaller(__builtin_return_address(0)) && IsJailbreakPath(path)) {
+    if (ShouldHidePath(path)) {
         errno = ENOENT;
         return -1;
     }
-    return orig_access ? orig_access(path, mode) : access(path, mode);
+    if (!orig_access) { errno = ENOSYS; return -1; }
+    return orig_access(path, mode);
 }
 
 static int (*orig_stat)(const char *path, struct stat *buf) = NULL;
 static int hook_stat(const char *path, struct stat *buf) {
-    if (!IsSelfCaller(__builtin_return_address(0)) && IsJailbreakPath(path)) {
+    if (ShouldHidePath(path)) {
         errno = ENOENT;
         return -1;
     }
-    return orig_stat ? orig_stat(path, buf) : stat(path, buf);
+    if (!orig_stat) { errno = ENOSYS; return -1; }
+    return orig_stat(path, buf);
 }
 
 static int (*orig_lstat)(const char *path, struct stat *buf) = NULL;
 static int hook_lstat(const char *path, struct stat *buf) {
-    if (!IsSelfCaller(__builtin_return_address(0)) && IsJailbreakPath(path)) {
+    if (ShouldHidePath(path)) {
         errno = ENOENT;
         return -1;
     }
-    return orig_lstat ? orig_lstat(path, buf) : lstat(path, buf);
+    if (!orig_lstat) { errno = ENOSYS; return -1; }
+    return orig_lstat(path, buf);
 }
 
 static FILE *(*orig_fopen)(const char *filename, const char *mode) = NULL;
 static FILE *hook_fopen(const char *filename, const char *mode) {
-    if (!IsSelfCaller(__builtin_return_address(0)) && IsJailbreakPath(filename)) {
+    if (ShouldHidePath(filename)) {
         errno = ENOENT;
         return NULL;
     }
-    return orig_fopen ? orig_fopen(filename, mode) : fopen(filename, mode);
+    if (!orig_fopen) { errno = ENOSYS; return NULL; }
+    return orig_fopen(filename, mode);
 }
 
 static DIR *(*orig_opendir)(const char *filename) = NULL;
 static DIR *hook_opendir(const char *filename) {
-    if (!IsSelfCaller(__builtin_return_address(0)) && IsJailbreakPath(filename)) {
+    if (ShouldHidePath(filename)) {
         errno = ENOENT;
         return NULL;
     }
-    return orig_opendir ? orig_opendir(filename) : opendir(filename);
+    if (!orig_opendir) { errno = ENOSYS; return NULL; }
+    return orig_opendir(filename);
 }
 
 static BOOL (*orig_fileExists)(id self, SEL _cmd, NSString *path) = NULL;
 static BOOL hook_fileExists(id self, SEL _cmd, NSString *path) {
-    if (!IsSelfCaller(__builtin_return_address(0)) && IsJailbreakPath(path.UTF8String)) {
+    if (ShouldHidePath(path.UTF8String)) {
         return NO;
     }
     return orig_fileExists ? orig_fileExists(self, _cmd, path) : NO;
@@ -261,7 +504,8 @@ static BOOL hook_fileExists(id self, SEL _cmd, NSString *path) {
 
 static BOOL (*orig_fileExistsIsDir)(id self, SEL _cmd, NSString *path, BOOL *isDir) = NULL;
 static BOOL hook_fileExistsIsDir(id self, SEL _cmd, NSString *path, BOOL *isDir) {
-    if (!IsSelfCaller(__builtin_return_address(0)) && IsJailbreakPath(path.UTF8String)) {
+    if (ShouldHidePath(path.UTF8String)) {
+        if (isDir) *isDir = NO;
         return NO;
     }
     return orig_fileExistsIsDir ? orig_fileExistsIsDir(self, _cmd, path, isDir) : NO;
@@ -269,7 +513,8 @@ static BOOL hook_fileExistsIsDir(id self, SEL _cmd, NSString *path, BOOL *isDir)
 
 static pid_t (*orig_fork)(void) = NULL;
 static pid_t hook_fork(void) {
-    errno = EPERM;
+    if (orig_fork) return orig_fork();
+    errno = ENOSYS;
     return -1;
 }
 
@@ -310,7 +555,7 @@ static CFTimeZoneRef hook_CFTimeZoneCopySystem(void) {
         CFTimeZoneRef tz = CFTimeZoneCreateWithName(kCFAllocatorDefault, (__bridge CFStringRef)tzName, true);
         if (tz) return tz;
     }
-    return orig_CFTimeZoneCopySystem ? orig_CFTimeZoneCopySystem() : CFTimeZoneCopySystem();
+    return orig_CFTimeZoneCopySystem ? orig_CFTimeZoneCopySystem() : NULL;
 }
 
 static NSString *(*orig_carrierName)(id self, SEL _cmd) = NULL;
@@ -377,10 +622,20 @@ static BOOL hook_returnYES(id self, SEL _cmd) {
     return YES;
 }
 
+static void *StripReturnAddressPAC(void *returnAddress) {
+#if AUTOIPLOC_HAS_PTRAUTH
+    return ptrauth_strip(returnAddress, ptrauth_key_return_address);
+#else
+    return returnAddress;
+#endif
+}
+
 static BOOL IsSystemNetworkingCaller(void *retAddr) {
     if (!retAddr) return NO;
     Dl_info info;
-    int ok = orig_dladdr ? orig_dladdr(retAddr, &info) : dladdr(retAddr, &info);
+    if (!orig_dladdr) return NO;
+    void *normalizedReturnAddress = StripReturnAddressPAC(retAddr);
+    int ok = orig_dladdr(normalizedReturnAddress, &info);
     if (ok != 0 && info.dli_fname != NULL) {
         if (strstr(info.dli_fname, "CFNetwork") != NULL ||
             strstr(info.dli_fname, "WebKit") != NULL ||
@@ -435,24 +690,66 @@ static BOOL IsVirtualVPNInterface(const char *ifname) {
 }
 
 static int (*orig_getifaddrs)(struct ifaddrs **ifap) = NULL;
+static void (*orig_freeifaddrs)(struct ifaddrs *ifap) = NULL;
+
+#define AUTOIPLOC_IFADDRS_MAX_NODES 4096
+
 static int hook_getifaddrs(struct ifaddrs **ifap) {
-    int ret = orig_getifaddrs ? orig_getifaddrs(ifap) : getifaddrs(ifap);
-    if (ret == 0 && ifap && *ifap) {
-        struct ifaddrs *head = *ifap;
-        while (head && IsVirtualVPNInterface(head->ifa_name) && head->ifa_next != NULL) {
-            struct ifaddrs *nextNode = head->ifa_next;
-            memcpy(head, nextNode, sizeof(struct ifaddrs));
-        }
-        struct ifaddrs *curr = head;
-        while (curr && curr->ifa_next != NULL) {
-            if (IsVirtualVPNInterface(curr->ifa_next->ifa_name)) {
-                curr->ifa_next = curr->ifa_next->ifa_next;
-            } else {
-                curr = curr->ifa_next;
-            }
+    if (!ifap) {
+        errno = EFAULT;
+        return -1;
+    }
+    if (!orig_getifaddrs) {
+        errno = ENOSYS;
+        return -1;
+    }
+
+    int ret = orig_getifaddrs(ifap);
+    if (ret != 0 || !*ifap || !orig_freeifaddrs) return ret;
+
+    size_t totalCount = 0;
+    size_t visibleCount = 0;
+    for (struct ifaddrs *node = *ifap; node != NULL; node = node->ifa_next) {
+        if (++totalCount > AUTOIPLOC_IFADDRS_MAX_NODES) return ret;
+        if (!IsVirtualVPNInterface(node->ifa_name)) visibleCount++;
+    }
+
+    // Preserve the original list whenever the existing selection policy does
+    // not produce a non-empty, smaller result.
+    if (visibleCount == 0 || visibleCount == totalCount) return ret;
+    if (visibleCount > SIZE_MAX / sizeof(struct ifaddrs *)) return ret;
+
+    const struct ifaddrs **selectedNodes = calloc(visibleCount, sizeof(*selectedNodes));
+    if (!selectedNodes) return ret;
+
+    size_t index = 0;
+    for (struct ifaddrs *node = *ifap; node != NULL; node = node->ifa_next) {
+        if (!IsVirtualVPNInterface(node->ifa_name)) {
+            selectedNodes[index++] = node;
         }
     }
+
+    struct ifaddrs *registeredHead =
+        AutoIPLocIfaddrsCloneAndRegister(*ifap, selectedNodes, visibleCount);
+    free(selectedNodes);
+    if (!registeredHead) return ret;
+
+    *ifap = registeredHead;
     return ret;
+}
+
+static void hook_freeifaddrs(struct ifaddrs *ifap) {
+    if (!ifap) return;
+
+    if (AutoIPLocIfaddrsReleaseRegistered(ifap, orig_freeifaddrs)) {
+        return;
+    }
+
+    if (orig_freeifaddrs) {
+        orig_freeifaddrs(ifap);
+    } else {
+        errno = ENOSYS;
+    }
 }
 
 static BOOL IsBlockedURLScheme(NSString *scheme) {
@@ -494,12 +791,17 @@ static BOOL hook_returnNO(id self, SEL _cmd) {
     return NO;
 }
 
-static id (*orig_initWithSimState)(id self, SEL _cmd, BOOL isSimulated, BOOL isAccessory) = NULL;
-static id hook_initWithSimState(id self, SEL _cmd, BOOL isSimulated, BOOL isAccessory) {
-    if (orig_initWithSimState) {
-        return orig_initWithSimState(self, _cmd, NO, NO);
-    }
-    return self;
+// Match Objective-C method-family ownership at the C IMP boundary:
+// init consumes self and returns +1; copy returns +1 but does not consume self.
+typedef id AutoIPLocInitWithSimStateIMP(id __attribute__((ns_consumed)), SEL, BOOL, BOOL) __attribute__((ns_returns_retained));
+typedef id AutoIPLocInitWithCoderIMP(id __attribute__((ns_consumed)), SEL, NSCoder *) __attribute__((ns_returns_retained));
+typedef id AutoIPLocCopyWithZoneIMP(id, SEL, NSZone *) __attribute__((ns_returns_retained));
+
+static AutoIPLocInitWithSimStateIMP *orig_initWithSimState = NULL;
+static id hook_initWithSimState(id self __attribute__((ns_consumed)), SEL _cmd, BOOL isSimulated, BOOL isAccessory) __attribute__((ns_returns_retained));
+static id hook_initWithSimState(id self __attribute__((ns_consumed)), SEL _cmd, BOOL isSimulated, BOOL isAccessory) {
+    if (!orig_initWithSimState) return nil;
+    return orig_initWithSimState(self, _cmd, NO, NO);
 }
 
 static id CreateCleanLocationSourceInfo(void) {
@@ -508,19 +810,20 @@ static id CreateCleanLocationSourceInfo(void) {
     SEL initSel = NSSelectorFromString(@"initWithSoftwareSimulationState:externalAccessoryState:");
     id obj = [srcInfoCls alloc];
     if ([obj respondsToSelector:initSel]) {
-        if (orig_initWithSimState) {
-            return orig_initWithSimState(obj, initSel, NO, NO);
-        }
-        return ((id (*)(id, SEL, BOOL, BOOL))objc_msgSend)(obj, initSel, NO, NO);
+        if (!orig_initWithSimState) return nil;
+        return orig_initWithSimState(obj, initSel, NO, NO);
     }
     return [obj init];
 }
 
-static id (*orig_srcInfoInitWithCoder)(id self, SEL _cmd, NSCoder *coder) = NULL;
-static id hook_srcInfoInitWithCoder(id self, SEL _cmd, NSCoder *coder) {
-    id obj = orig_srcInfoInitWithCoder ? orig_srcInfoInitWithCoder(self, _cmd, coder) : self;
+static AutoIPLocInitWithCoderIMP *orig_srcInfoInitWithCoder = NULL;
+static id hook_srcInfoInitWithCoder(id self __attribute__((ns_consumed)), SEL _cmd, NSCoder *coder) __attribute__((ns_returns_retained));
+static id hook_srcInfoInitWithCoder(id self __attribute__((ns_consumed)), SEL _cmd, NSCoder *coder) {
+    if (!orig_srcInfoInitWithCoder) return nil;
+    id decoded = orig_srcInfoInitWithCoder(self, _cmd, coder);
+    if (!decoded) return nil;
     id clean = CreateCleanLocationSourceInfo();
-    return clean ?: obj;
+    return clean ?: decoded;
 }
 
 static id (*orig_sourceInformation)(id self, SEL _cmd) = NULL;
@@ -530,39 +833,83 @@ static id hook_sourceInformation(id self, SEL _cmd) {
     return orig_sourceInformation ? orig_sourceInformation(self, _cmd) : nil;
 }
 
-static id (*orig_srcInfoCopyWithZone)(id self, SEL _cmd, NSZone *zone) = NULL;
+static AutoIPLocCopyWithZoneIMP *orig_srcInfoCopyWithZone = NULL;
+static id hook_srcInfoCopyWithZone(id self, SEL _cmd, NSZone *zone) __attribute__((ns_returns_retained));
 static id hook_srcInfoCopyWithZone(id self, SEL _cmd, NSZone *zone) {
     id clean = CreateCleanLocationSourceInfo();
     if (clean) return clean;
     return orig_srcInfoCopyWithZone ? orig_srcInfoCopyWithZone(self, _cmd, zone) : self;
 }
 
-static id (*orig_locInitWithCoder)(id self, SEL _cmd, NSCoder *coder) = NULL;
-static id hook_locInitWithCoder(id self, SEL _cmd, NSCoder *coder) {
-    id obj = orig_locInitWithCoder ? orig_locInitWithCoder(self, _cmd, coder) : self;
-    if (obj) {
-        Ivar ivar = class_getInstanceVariable([CLLocation class], "_sourceInformation");
-        if (ivar) {
-            id clean = CreateCleanLocationSourceInfo();
-            if (clean) object_setIvar(obj, ivar, clean);
-        }
+static AutoIPLocInitWithCoderIMP *orig_locInitWithCoder = NULL;
+static id hook_locInitWithCoder(id self __attribute__((ns_consumed)), SEL _cmd, NSCoder *coder) __attribute__((ns_returns_retained));
+static id hook_locInitWithCoder(id self __attribute__((ns_consumed)), SEL _cmd, NSCoder *coder) {
+    if (!orig_locInitWithCoder) return nil;
+    id decoded = orig_locInitWithCoder(self, _cmd, coder);
+    if (!decoded) return nil;
+
+    Ivar ivar = class_getInstanceVariable([CLLocation class], "_sourceInformation");
+    const char *ivarType = ivar ? ivar_getTypeEncoding(ivar) : NULL;
+    if (ivar && ObjCTypeCode(ivarType) == '@') {
+        id clean = CreateCleanLocationSourceInfo();
+        if (clean) object_setIvarWithStrongDefault(decoded, ivar, clean);
     }
-    return obj;
+    return decoded;
 }
 
 static NSString *hook_targetCountryCode(id self, SEL _cmd) {
     return GetTargetCountryCode();
 }
 
-static NSArray<NSDictionary *> *GetMockWiFiList(void) {
-    NSDictionary *wifiCfg = LoadWiFiConfig();
-    if ([wifiCfg[@"enabled"] boolValue]) {
-        NSArray *nets = wifiCfg[@"networks"];
-        if ([nets isKindOfClass:[NSArray class]] && nets.count > 0) {
-            return nets;
+static BOOL IsValidWiFiSSIDValue(NSString *ssid) {
+    if (![ssid isKindOfClass:[NSString class]]) return NO;
+    NSData *data = [ssid dataUsingEncoding:NSUTF8StringEncoding allowLossyConversion:NO];
+    return data.length > 0 && data.length <= 32;
+}
+
+static BOOL IsValidWiFiBSSIDValue(NSString *bssid) {
+    if (![bssid isKindOfClass:[NSString class]]) return NO;
+    NSArray<NSString *> *octets = [bssid componentsSeparatedByString:@":"];
+    if (octets.count != 6) return NO;
+
+    NSCharacterSet *nonHex = [[NSCharacterSet characterSetWithCharactersInString:
+        @"0123456789abcdefABCDEF"] invertedSet];
+    for (NSString *octet in octets) {
+        if (octet.length != 2 ||
+            [octet rangeOfCharacterFromSet:nonHex].location != NSNotFound) {
+            return NO;
         }
     }
-    return nil;
+    return YES;
+}
+
+static NSArray<NSDictionary *> *GetMockWiFiList(void) {
+    NSDictionary *wifiCfg = LoadWiFiConfig();
+    id enabledValue = wifiCfg[@"enabled"];
+    id rawNetworks = wifiCfg[@"networks"];
+    if (![enabledValue isKindOfClass:[NSNumber class]] || ![enabledValue boolValue] ||
+        ![rawNetworks isKindOfClass:[NSArray class]]) {
+        return nil;
+    }
+
+    NSArray *nets = (NSArray *)rawNetworks;
+    if (nets.count == 0 || nets.count > 64) return nil;
+
+    NSMutableArray<NSDictionary *> *validated = [NSMutableArray arrayWithCapacity:nets.count];
+    for (id item in nets) {
+        if (![item isKindOfClass:[NSDictionary class]]) return nil;
+        NSDictionary *entry = (NSDictionary *)item;
+        id ssid = entry[@"SSID"];
+        id bssid = entry[@"BSSID"];
+        if (![ssid isKindOfClass:[NSString class]] ||
+            ![bssid isKindOfClass:[NSString class]] ||
+            !IsValidWiFiSSIDValue((NSString *)ssid) ||
+            !IsValidWiFiBSSIDValue((NSString *)bssid)) {
+            return nil;
+        }
+        [validated addObject:@{@"SSID": ssid, @"BSSID": bssid}];
+    }
+    return [validated copy];
 }
 
 static CFArrayRef (*orig_CNCopySupportedInterfaces)(void) = NULL;
@@ -622,6 +969,7 @@ static void AutoIPLocHookEntry(void) {
         dlopen("/System/Library/Frameworks/CoreTelephony.framework/CoreTelephony", RTLD_NOW);
         dlopen("/System/Library/PrivateFrameworks/GeoServices.framework/GeoServices", RTLD_NOW);
         ResolveElleKitRuntime((void *)&AutoIPLocHookEntry);
+        InitializeConfigCaches();
 
         NSString *initTZ = GetTargetTimeZoneName();
         if (initTZ) {
@@ -631,108 +979,128 @@ static void AutoIPLocHookEntry(void) {
         }
         Class tzMeta = objc_getMetaClass("NSTimeZone");
         if (tzMeta) {
-            HookObjCMethod(tzMeta, @selector(systemTimeZone), (IMP)hook_systemTimeZone, (IMP *)&orig_systemTimeZone);
-            HookObjCMethod(tzMeta, @selector(defaultTimeZone), (IMP)hook_defaultTimeZone, (IMP *)&orig_defaultTimeZone);
-            HookObjCMethod(tzMeta, @selector(localTimeZone), (IMP)hook_localTimeZone, (IMP *)&orig_localTimeZone);
+            HOOK_OBJC_METHOD_TYPED(tzMeta, @selector(systemTimeZone), (IMP)hook_systemTimeZone, orig_systemTimeZone, '@', "");
+            HOOK_OBJC_METHOD_TYPED(tzMeta, @selector(defaultTimeZone), (IMP)hook_defaultTimeZone, orig_defaultTimeZone, '@', "");
+            HOOK_OBJC_METHOD_TYPED(tzMeta, @selector(localTimeZone), (IMP)hook_localTimeZone, orig_localTimeZone, '@', "");
         }
 
         Class appCls = objc_getClass("UIApplication");
         if (appCls) {
-            HookObjCMethod(appCls, @selector(canOpenURL:), (IMP)hook_canOpenURL, (IMP *)&orig_canOpenURL);
-            HookObjCMethod(appCls, NSSelectorFromString(@"_canOpenURL:publicURLsOnly:"), (IMP)hook_privCanOpenURL, (IMP *)&orig_privCanOpenURL);
+            HOOK_OBJC_METHOD_TYPED(appCls, @selector(canOpenURL:), (IMP)hook_canOpenURL, orig_canOpenURL, 'B', "@");
+            HOOK_OBJC_METHOD_TYPED(appCls, NSSelectorFromString(@"_canOpenURL:publicURLsOnly:"), (IMP)hook_privCanOpenURL, orig_privCanOpenURL, 'B', "@B");
         }
         Class wsCls = objc_getClass("LSApplicationWorkspace");
         if (wsCls) {
-            HookObjCMethod(wsCls, NSSelectorFromString(@"applicationsAvailableForHandlingURLScheme:"), (IMP)hook_appsForScheme, (IMP *)&orig_appsForScheme);
-            HookObjCMethod(wsCls, NSSelectorFromString(@"URLOverrideForURL:"), (IMP)hook_urlOverride, (IMP *)&orig_urlOverride);
+            HOOK_OBJC_METHOD_TYPED(wsCls, NSSelectorFromString(@"applicationsAvailableForHandlingURLScheme:"), (IMP)hook_appsForScheme, orig_appsForScheme, '@', "@");
+            HOOK_OBJC_METHOD_TYPED(wsCls, NSSelectorFromString(@"URLOverrideForURL:"), (IMP)hook_urlOverride, orig_urlOverride, '@', "@");
         }
         Class fmCls = objc_getClass("NSFileManager");
         if (fmCls) {
-            HookObjCMethod(fmCls, @selector(fileExistsAtPath:), (IMP)hook_fileExists, (IMP *)&orig_fileExists);
-            HookObjCMethod(fmCls, @selector(fileExistsAtPath:isDirectory:), (IMP)hook_fileExistsIsDir, (IMP *)&orig_fileExistsIsDir);
+            HOOK_OBJC_METHOD_TYPED(fmCls, @selector(fileExistsAtPath:), (IMP)hook_fileExists, orig_fileExists, 'B', "@");
+            HOOK_OBJC_METHOD_TYPED(fmCls, @selector(fileExistsAtPath:isDirectory:), (IMP)hook_fileExistsIsDir, orig_fileExistsIsDir, 'B', "@^");
         }
 
         Class sessionCfgCls = objc_getClass("NSURLSessionConfiguration");
         if (sessionCfgCls) {
-            HookObjCMethod(sessionCfgCls, @selector(connectionProxyDictionary), (IMP)hook_connectionProxyDictionary, (IMP *)&orig_connectionProxyDictionary);
+            HOOK_OBJC_METHOD_TYPED(sessionCfgCls, @selector(connectionProxyDictionary), (IMP)hook_connectionProxyDictionary, orig_connectionProxyDictionary, '@', "");
         }
 
         Class carrierCls = objc_getClass("CTCarrier");
         if (carrierCls) {
-            HookObjCMethod(carrierCls, NSSelectorFromString(@"carrierName"), (IMP)hook_carrierName, (IMP *)&orig_carrierName);
-            HookObjCMethod(carrierCls, NSSelectorFromString(@"mobileCountryCode"), (IMP)hook_mobileCountryCode, (IMP *)&orig_mobileCountryCode);
-            HookObjCMethod(carrierCls, NSSelectorFromString(@"mobileNetworkCode"), (IMP)hook_mobileNetworkCode, (IMP *)&orig_mobileNetworkCode);
-            HookObjCMethod(carrierCls, NSSelectorFromString(@"isoCountryCode"), (IMP)hook_isoCountryCode, (IMP *)&orig_isoCountryCode);
-            HookObjCMethod(carrierCls, NSSelectorFromString(@"allowsVOIP"), (IMP)hook_returnYES, NULL);
+            HOOK_OBJC_METHOD_TYPED(carrierCls, NSSelectorFromString(@"carrierName"), (IMP)hook_carrierName, orig_carrierName, '@', "");
+            HOOK_OBJC_METHOD_TYPED(carrierCls, NSSelectorFromString(@"mobileCountryCode"), (IMP)hook_mobileCountryCode, orig_mobileCountryCode, '@', "");
+            HOOK_OBJC_METHOD_TYPED(carrierCls, NSSelectorFromString(@"mobileNetworkCode"), (IMP)hook_mobileNetworkCode, orig_mobileNetworkCode, '@', "");
+            HOOK_OBJC_METHOD_TYPED(carrierCls, NSSelectorFromString(@"isoCountryCode"), (IMP)hook_isoCountryCode, orig_isoCountryCode, '@', "");
+            HookObjCMethod(carrierCls, NSSelectorFromString(@"allowsVOIP"), (IMP)hook_returnYES, NULL, 'B', "");
         }
         Class netInfoCls = objc_getClass("CTTelephonyNetworkInfo");
         if (netInfoCls) {
-            HookObjCMethod(netInfoCls, NSSelectorFromString(@"serviceCurrentRadioAccessTechnology"), (IMP)hook_serviceRadioTech, (IMP *)&orig_serviceRadioTech);
-            HookObjCMethod(netInfoCls, NSSelectorFromString(@"currentRadioAccessTechnology"), (IMP)hook_currentRadioTech, (IMP *)&orig_currentRadioTech);
-            HookObjCMethod(netInfoCls, NSSelectorFromString(@"dataServiceIdentifier"), (IMP)hook_dataServiceIdentifier, (IMP *)&orig_dataServiceIdentifier);
+            HOOK_OBJC_METHOD_TYPED(netInfoCls, NSSelectorFromString(@"serviceCurrentRadioAccessTechnology"), (IMP)hook_serviceRadioTech, orig_serviceRadioTech, '@', "");
+            HOOK_OBJC_METHOD_TYPED(netInfoCls, NSSelectorFromString(@"currentRadioAccessTechnology"), (IMP)hook_currentRadioTech, orig_currentRadioTech, '@', "");
+            HOOK_OBJC_METHOD_TYPED(netInfoCls, NSSelectorFromString(@"dataServiceIdentifier"), (IMP)hook_dataServiceIdentifier, orig_dataServiceIdentifier, '@', "");
         }
 
         Class srcInfoCls = objc_getClass("CLLocationSourceInformation");
         if (srcInfoCls) {
-            HookObjCMethod(srcInfoCls, NSSelectorFromString(@"isSimulatedBySoftware"), (IMP)hook_returnNO, NULL);
-            HookObjCMethod(srcInfoCls, NSSelectorFromString(@"isProducedByAccessory"), (IMP)hook_returnNO, NULL);
-            HookObjCMethod(srcInfoCls, NSSelectorFromString(@"initWithSoftwareSimulationState:externalAccessoryState:"), (IMP)hook_initWithSimState, (IMP *)&orig_initWithSimState);
-            HookObjCMethod(srcInfoCls, @selector(initWithCoder:), (IMP)hook_srcInfoInitWithCoder, (IMP *)&orig_srcInfoInitWithCoder);
-            HookObjCMethod(srcInfoCls, @selector(copyWithZone:), (IMP)hook_srcInfoCopyWithZone, (IMP *)&orig_srcInfoCopyWithZone);
+            HookObjCMethod(srcInfoCls, NSSelectorFromString(@"isSimulatedBySoftware"), (IMP)hook_returnNO, NULL, 'B', "");
+            HookObjCMethod(srcInfoCls, NSSelectorFromString(@"isProducedByAccessory"), (IMP)hook_returnNO, NULL, 'B', "");
+            HOOK_OBJC_METHOD_TYPED(srcInfoCls, NSSelectorFromString(@"initWithSoftwareSimulationState:externalAccessoryState:"), (IMP)hook_initWithSimState, orig_initWithSimState, '@', "BB");
+            HOOK_OBJC_METHOD_TYPED(srcInfoCls, @selector(initWithCoder:), (IMP)hook_srcInfoInitWithCoder, orig_srcInfoInitWithCoder, '@', "@");
+            HOOK_OBJC_METHOD_TYPED(srcInfoCls, @selector(copyWithZone:), (IMP)hook_srcInfoCopyWithZone, orig_srcInfoCopyWithZone, '@', "^");
         }
         Class locCls = objc_getClass("CLLocation");
         if (locCls) {
-            HookObjCMethod(locCls, NSSelectorFromString(@"isSimulatedBySoftware"), (IMP)hook_returnNO, NULL);
-            HookObjCMethod(locCls, NSSelectorFromString(@"_isSimulated"), (IMP)hook_returnNO, NULL);
-            HookObjCMethod(locCls, NSSelectorFromString(@"sourceInformation"), (IMP)hook_sourceInformation, (IMP *)&orig_sourceInformation);
-            HookObjCMethod(locCls, @selector(initWithCoder:), (IMP)hook_locInitWithCoder, (IMP *)&orig_locInitWithCoder);
+            HookObjCMethod(locCls, NSSelectorFromString(@"isSimulatedBySoftware"), (IMP)hook_returnNO, NULL, 'B', "");
+            HookObjCMethod(locCls, NSSelectorFromString(@"_isSimulated"), (IMP)hook_returnNO, NULL, 'B', "");
+            HOOK_OBJC_METHOD_TYPED(locCls, NSSelectorFromString(@"sourceInformation"), (IMP)hook_sourceInformation, orig_sourceInformation, '@', "");
+            HOOK_OBJC_METHOD_TYPED(locCls, @selector(initWithCoder:), (IMP)hook_locInitWithCoder, orig_locInitWithCoder, '@', "@");
         }
 
         Class geoCls = objc_getClass("GEOCountryConfiguration");
         if (geoCls) {
             NSArray *sels = @[@"countryCode", @"_countryCode", @"currentCountryCode", @"sourceCountryCode"];
             for (NSString *selName in sels) {
-                HookObjCMethod(geoCls, NSSelectorFromString(selName), (IMP)hook_targetCountryCode, NULL);
+                HookObjCMethod(geoCls, NSSelectorFromString(selName), (IMP)hook_targetCountryCode, NULL, '@', "");
             }
         }
         Class platformCls = objc_getClass("GEOPlatform");
         if (platformCls) {
-            HookObjCMethod(platformCls, NSSelectorFromString(@"isChina"), (IMP)hook_returnNO, NULL);
+            HookObjCMethod(platformCls, NSSelectorFromString(@"isChina"), (IMP)hook_returnNO, NULL, 'B', "");
         }
 
         if (g_MSHookFunction) {
-            g_MSHookFunction((void *)_dyld_get_image_name, (void *)hook_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
-            g_MSHookFunction((void *)dladdr, (void *)hook_dladdr, (void **)&orig_dladdr);
-            g_MSHookFunction((void *)getenv, (void *)hook_getenv, (void **)&orig_getenv);
-            g_MSHookFunction((void *)access, (void *)hook_access, (void **)&orig_access);
-            g_MSHookFunction((void *)stat, (void *)hook_stat, (void **)&orig_stat);
-            g_MSHookFunction((void *)lstat, (void *)hook_lstat, (void **)&orig_lstat);
-            g_MSHookFunction((void *)fopen, (void *)hook_fopen, (void **)&orig_fopen);
-            g_MSHookFunction((void *)opendir, (void *)hook_opendir, (void **)&orig_opendir);
-            g_MSHookFunction((void *)fork, (void *)hook_fork, (void **)&orig_fork);
+            INSTALL_C_FUNCTION_HOOK(_dyld_get_image_name, hook_dyld_get_image_name, orig_dyld_get_image_name);
+            INSTALL_C_FUNCTION_HOOK(dladdr, hook_dladdr, orig_dladdr);
+            INSTALL_C_FUNCTION_HOOK(getenv, hook_getenv, orig_getenv);
+            INSTALL_C_FUNCTION_HOOK(access, hook_access, orig_access);
+            INSTALL_C_FUNCTION_HOOK(stat, hook_stat, orig_stat);
+            INSTALL_C_FUNCTION_HOOK(lstat, hook_lstat, orig_lstat);
+            INSTALL_C_FUNCTION_HOOK(fopen, hook_fopen, orig_fopen);
+            INSTALL_C_FUNCTION_HOOK(opendir, hook_opendir, orig_opendir);
+            INSTALL_C_FUNCTION_HOOK(fork, hook_fork, orig_fork);
 
             void *symCFTimeZone = dlsym(RTLD_DEFAULT, "CFTimeZoneCopySystem");
-            if (symCFTimeZone) g_MSHookFunction(symCFTimeZone, (void *)hook_CFTimeZoneCopySystem, (void **)&orig_CFTimeZoneCopySystem);
+            if (symCFTimeZone) {
+                INSTALL_C_FUNCTION_HOOK(symCFTimeZone, hook_CFTimeZoneCopySystem, orig_CFTimeZoneCopySystem);
+            }
 
-            g_MSHookFunction((void *)CFNetworkCopySystemProxySettings, (void *)hook_CFNetworkCopySystemProxySettings, (void **)&orig_CFNetworkCopySystemProxySettings);
+            INSTALL_C_FUNCTION_HOOK(CFNetworkCopySystemProxySettings,
+                                    hook_CFNetworkCopySystemProxySettings,
+                                    orig_CFNetworkCopySystemProxySettings);
 
             void *symSCDyn = dlsym(RTLD_DEFAULT, "SCDynamicStoreCopyProxies");
-            if (symSCDyn) g_MSHookFunction(symSCDyn, (void *)hook_SCDynamicStoreCopyProxies, (void **)&orig_SCDynamicStoreCopyProxies);
+            if (symSCDyn) {
+                INSTALL_C_FUNCTION_HOOK(symSCDyn, hook_SCDynamicStoreCopyProxies, orig_SCDynamicStoreCopyProxies);
+            }
 
-            g_MSHookFunction((void *)getifaddrs, (void *)hook_getifaddrs, (void **)&orig_getifaddrs);
-            g_MSHookFunction((void *)CNCopyCurrentNetworkInfo, (void *)hook_CNCopyCurrentNetworkInfo, (void **)&orig_CNCopyCurrentNetworkInfo);
-            g_MSHookFunction((void *)CNCopySupportedInterfaces, (void *)hook_CNCopySupportedInterfaces, (void **)&orig_CNCopySupportedInterfaces);
+            // Install freeifaddrs before exposing filtered getifaddrs lists so
+            // each cloned list has a matching original-list deallocation path.
+            INSTALL_C_FUNCTION_HOOK(freeifaddrs, hook_freeifaddrs, orig_freeifaddrs);
+            INSTALL_C_FUNCTION_HOOK(getifaddrs, hook_getifaddrs, orig_getifaddrs);
+            INSTALL_C_FUNCTION_HOOK(CNCopyCurrentNetworkInfo, hook_CNCopyCurrentNetworkInfo, orig_CNCopyCurrentNetworkInfo);
+            INSTALL_C_FUNCTION_HOOK(CNCopySupportedInterfaces, hook_CNCopySupportedInterfaces, orig_CNCopySupportedInterfaces);
         }
 
+        NSDictionary *geoConfigSnapshot = LoadGeoConfig();
+        NSDictionary *wifiConfigSnapshot = LoadWiFiConfig();
         NSDictionary *status = @{
-            @"active": @YES,
-            @"version": @"4.3.0",
+            @"active": @(g_installedCHookCount > 0 || g_installedObjCHookCount > 0),
+            @"version": @"4.3.6",
             @"lastProc": [NSString stringWithUTF8String:prog],
-            @"cHookReady": @(g_MSHookFunction != NULL && g_MSHookMessageEx != NULL),
+            @"cHookReady": @(orig_dladdr != NULL && orig_getifaddrs != NULL && orig_freeifaddrs != NULL),
+            @"cHookCount": @(g_installedCHookCount),
+            @"objcHookCount": @(g_installedObjCHookCount),
+            @"geoConfigReadable": @(geoConfigSnapshot != nil),
+            @"wifiConfigReadable": @(wifiConfigSnapshot != nil),
             @"timestamp": @([[NSDate date] timeIntervalSince1970])
         };
-        [status writeToFile:@"/var/mobile/Library/Preferences/com.autoiploc.hookstatus.plist" atomically:YES];
-        [status writeToFile:@"/var/tmp/com.autoiploc.hookstatus.plist" atomically:YES];
-        chmod("/var/tmp/com.autoiploc.hookstatus.plist", 0666);
+        BeginInternalIO();
+        @try {
+            [status writeToFile:@"/var/mobile/Library/Preferences/com.autoiploc.hookstatus.plist" atomically:YES];
+            [status writeToFile:@"/var/tmp/com.autoiploc.hookstatus.plist" atomically:YES];
+        } @finally {
+            EndInternalIO();
+        }
+        chmod("/var/tmp/com.autoiploc.hookstatus.plist", 0644);
     }
 }
