@@ -34,6 +34,10 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     @Published var autoSyncOnNetworkChange = true
     @Published var lockSessionGeo = true
     @Published var wifiList: [[String: String]] = []
+    @Published var ipGeoInfo: IPGeoDisplayInfo? = nil
+    @Published var ipGeoAddress = "等待查询 IP 坐标附近的地理位置..."
+    @Published var ipGeoStatusText = "尚未查询 IP 地理信息"
+    @Published var ipGeoUpdatedAt: Date? = nil
 
     private let geoPlistPaths = [
         "/var/mobile/Library/Preferences/com.autoiploc.geo.plist",
@@ -52,7 +56,11 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     private let pathMonitor = NWPathMonitor()
     private let monitorQueue = DispatchQueue(label: "com.autoiploc.netmonitor")
     private let syncStateLock = NSLock()
-    private var lastPathStatus: NWPath.Status?
+    private let ipDisplayStateLock = NSLock()
+    private var lastPathSignature: String?
+    private var activeIPDisplayRequestID = UUID()
+    private var activeIPDisplaySession: URLSession?
+    private var pendingIPDisplayRefresh = false
     private var lockedProfile: GeoProfile?
     private var activeGeocodeRequestID = UUID()
     private var activeSyncRequestID = UUID()
@@ -327,15 +335,17 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             let ver = dict["version"] as? String ?? "未知版本"
             let proc = dict["lastProc"] as? String ?? "未知进程"
             let hookOk = (dict["cHookReady"] as? Bool) ?? false
+            let cCount = dict["cHookCount"] as? Int ?? 0
+            let objcCount = dict["objcHookCount"] as? Int ?? 0
             let ts = (dict["timestamp"] as? Double) ?? 0
             let ageSec = Int(max(0, now - ts))
 
             hookIsActive = false
             if ts > 0 && ageSec <= 300 && hookOk {
-                hookStatusText = "检测到近期加载报告 v\(ver)（\(proc) · \(ageSec)秒前）；仍未证明所有目标进程均已加载"
+                hookStatusText = "\(proc) 在 \(ageSec) 秒前写入 v\(ver) 加载报告（C \(cCount) / ObjC \(objcCount)）；仅能证明该进程写入报告，其他目标进程仍未验证"
                 return
             } else if ts > 0 && ageSec > 300 {
-                hookStatusText = "最近一次加载报告已过 \(ageSec / 60) 分钟；当前目标进程状态未验证"
+                hookStatusText = "最近报告来自 \(proc)，已过 \(ageSec / 60) 分钟（C \(cCount) / ObjC \(objcCount)）；当前目标进程状态未验证"
                 return
             } else {
                 hookStatusText = "检测到加载报告，但关键字段不完整，无法确认实际功能状态"
@@ -352,14 +362,30 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         }
     }
 
+    private func networkPathSignature(_ path: NWPath) -> String {
+        var interfaces: [String] = []
+        if path.usesInterfaceType(.wifi) { interfaces.append("wifi") }
+        if path.usesInterfaceType(.cellular) { interfaces.append("cellular") }
+        if path.usesInterfaceType(.wiredEthernet) { interfaces.append("ethernet") }
+        if path.usesInterfaceType(.loopback) { interfaces.append("loopback") }
+        if path.usesInterfaceType(.other) { interfaces.append("other") }
+        return "\(path.status)|\(interfaces.sorted().joined(separator: ","))|expensive:\(path.isExpensive)|constrained:\(path.isConstrained)"
+    }
+
     private func startNetworkMonitor() {
         pathMonitor.pathUpdateHandler = { [weak self] path in
             guard let self = self else { return }
-            defer { self.lastPathStatus = path.status }
-            guard let prev = self.lastPathStatus, prev != path.status, path.status == .satisfied else { return }
+            let signature = self.networkPathSignature(path)
+            let changed = signature != self.lastPathSignature
+            self.lastPathSignature = signature
+            guard changed, path.status == .satisfied else { return }
+
             DispatchQueue.main.async {
-                if self.autoSyncOnNetworkChange && !(self.lockSessionGeo && self.isSimulating) {
-                    self.syncEnvironment(forceReanchor: false)
+                guard self.autoSyncOnNetworkChange else { return }
+                if self.isSyncing {
+                    self.pendingIPDisplayRefresh = true
+                } else {
+                    self.refreshIPGeoInfo()
                 }
             }
         }
@@ -419,6 +445,182 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             } else {
                 wifiList = []
                 statusError = statusError ?? "已保存的 Wi-Fi 配置格式无效；未加载不完整的网络条目。"
+            }
+        }
+    }
+
+    func refreshIPGeoInfo() {
+        guard !isSyncing else { return }
+        isSyncing = true
+        statusError = nil
+        ipGeoStatusText = "正在查询当前出口 IP 的归属信息..."
+
+        let requestID = UUID()
+        let endpoints = [
+            "https://ipwho.is/",
+            "https://free.freeipapi.com/api/v1/json",
+            "https://ipinfo.io/json",
+            "https://api.ip.sb/geoip"
+        ]
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 12.0
+        configuration.timeoutIntervalForResource = 18.0
+        configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        let session = URLSession(configuration: configuration)
+
+        var requests: [URLRequest] = []
+        for endpoint in endpoints {
+            guard let url = URL(string: endpoint) else { continue }
+            var request = URLRequest(
+                url: url,
+                cachePolicy: .reloadIgnoringLocalAndRemoteCacheData,
+                timeoutInterval: 12.0
+            )
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+            requests.append(request)
+        }
+
+        guard !requests.isEmpty else {
+            finishIPGeoRefresh(error: "没有可用的 IP 地理信息服务地址。")
+            return
+        }
+
+        ipDisplayStateLock.lock()
+        activeIPDisplayRequestID = requestID
+        activeIPDisplaySession = session
+        ipDisplayStateLock.unlock()
+
+        var settled = false
+        var completedCount = 0
+        var lastFailure = "未收到有效响应"
+        let expectedCount = requests.count
+
+        for request in requests {
+            session.dataTask(with: request) { [weak self] data, response, error in
+                guard let self = self else { return }
+
+                let http = response as? HTTPURLResponse
+                let parsedInfo: IPGeoDisplayInfo?
+                if let http, (200...299).contains(http.statusCode), let data {
+                    parsedInfo = IPGeoDisplayInfo.parse(
+                        data: data,
+                        provider: request.url?.host ?? "unknown"
+                    )
+                } else {
+                    parsedInfo = nil
+                }
+
+                self.ipDisplayStateLock.lock()
+                guard self.activeIPDisplayRequestID == requestID, !settled else {
+                    self.ipDisplayStateLock.unlock()
+                    return
+                }
+
+                if let info = parsedInfo {
+                    settled = true
+                    self.activeIPDisplaySession = nil
+                    self.ipDisplayStateLock.unlock()
+                    session.invalidateAndCancel()
+
+                    DispatchQueue.main.async {
+                        self.ipDisplayStateLock.lock()
+                        let stillCurrent = self.activeIPDisplayRequestID == requestID
+                        self.ipDisplayStateLock.unlock()
+                        guard stillCurrent else { return }
+                        self.applyIPGeoDisplay(info)
+                    }
+                    return
+                }
+
+                completedCount += 1
+                if let http {
+                    lastFailure = "HTTP \(http.statusCode)（\(request.url?.host ?? "unknown")）"
+                } else if let error {
+                    lastFailure = "\((error as NSError).localizedDescription)（\(request.url?.host ?? "unknown")）"
+                } else {
+                    lastFailure = "响应字段不包含可验证的 IP 和有效坐标（\(request.url?.host ?? "unknown")）"
+                }
+
+                let allFailed = completedCount >= expectedCount
+                if allFailed {
+                    settled = true
+                    self.activeIPDisplaySession = nil
+                }
+                self.ipDisplayStateLock.unlock()
+
+                if allFailed {
+                    session.finishTasksAndInvalidate()
+                    DispatchQueue.main.async {
+                        self.ipDisplayStateLock.lock()
+                        let stillCurrent = self.activeIPDisplayRequestID == requestID
+                        self.ipDisplayStateLock.unlock()
+                        guard stillCurrent else { return }
+                        self.finishIPGeoRefresh(
+                            error: "未取得有效的 IP 地理坐标：\(lastFailure)"
+                        )
+                    }
+                }
+            }.resume()
+        }
+    }
+
+    private func applyIPGeoDisplay(_ info: IPGeoDisplayInfo) {
+        ipGeoInfo = info
+        ipGeoUpdatedAt = Date()
+        ipGeoStatusText = "已取得 IP 数据库估算结果（\(info.provider)）；不是 GPS 精确位置"
+        statusError = nil
+        reverseGeocodeIPDisplay(info)
+        finishIPGeoRefresh(error: nil)
+    }
+
+    private func finishIPGeoRefresh(error: String?) {
+        isSyncing = false
+        if let error {
+            ipGeoStatusText = error
+            statusError = error
+        }
+
+        if pendingIPDisplayRefresh {
+            pendingIPDisplayRefresh = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) { [weak self] in
+                self?.refreshIPGeoInfo()
+            }
+        }
+    }
+
+    private func reverseGeocodeIPDisplay(_ info: IPGeoDisplayInfo) {
+        let requestID = UUID()
+        activeGeocodeRequestID = requestID
+        ipGeoAddress = "正在查询 IP 估算坐标附近的行政区信息..."
+
+        let location = CLLocation(latitude: info.latitude, longitude: info.longitude)
+        CLGeocoder().reverseGeocodeLocation(location) { [weak self] placemarks, error in
+            guard let self = self else { return }
+            DispatchQueue.main.async {
+                guard self.activeGeocodeRequestID == requestID else { return }
+
+                guard let placemark = placemarks?.first else {
+                    self.ipGeoAddress = error == nil
+                        ? "反向地理编码未返回地点名称；保留 IP 数据库坐标估算"
+                        : "反向地理编码暂不可用；保留 IP 数据库坐标估算"
+                    return
+                }
+
+                let parts = [
+                    placemark.locality,
+                    placemark.subAdministrativeArea,
+                    placemark.administrativeArea,
+                    placemark.country,
+                    placemark.postalCode
+                ].compactMap { value -> String? in
+                    guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+                          !trimmed.isEmpty else { return nil }
+                    return trimmed
+                }
+                self.ipGeoAddress = parts.isEmpty
+                    ? "反向地理编码未返回可显示的行政区名称"
+                    : parts.joined(separator: ", ")
             }
         }
     }
@@ -661,8 +863,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             let resolvedZip = (pm.postalCode?.isEmpty == false) ? pm.postalCode! : fallbackZip
 
             DispatchQueue.main.async {
-                guard self.activeGeocodeRequestID == requestID,
-                      self.isSimulating else { return }
+                guard self.activeGeocodeRequestID == requestID else { return }
 
                 self.streetAddress = resolvedStreet
                 self.zipCode = resolvedZip
@@ -783,6 +984,14 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         activeURLSession = nil
         syncStateLock.unlock()
         sessionToCancel?.invalidateAndCancel()
+
+        ipDisplayStateLock.lock()
+        activeIPDisplayRequestID = UUID()
+        let displaySessionToCancel = activeIPDisplaySession
+        activeIPDisplaySession = nil
+        ipDisplayStateLock.unlock()
+        displaySessionToCancel?.invalidateAndCancel()
+        pendingIPDisplayRefresh = false
         isSyncing = false
 
         guard stopLocationSimulation() else { return }
@@ -830,22 +1039,68 @@ struct ContentView: View {
                             .font(.subheadline.monospaced())
                         Text("目标时区配置: \(engine.timezoneName)")
                             .font(.subheadline)
-                        Text("模拟坐标: \(engine.coordText)")
+                        Text("当前保存的模拟坐标: \(engine.coordText)")
                             .font(.caption.monospaced())
                             .foregroundColor(.secondary)
                         Divider()
-                        HStack {
+                        HStack(alignment: .top) {
                             Circle()
-                                .fill(engine.hookIsActive ? Color.green : Color.orange)
+                                .fill(Color.orange)
                                 .frame(width: 8, height: 8)
-                            Text("Hook 状态报告: \(engine.hookStatusText)")
-                                .font(.caption.bold())
-                                .foregroundColor(engine.hookIsActive ? .green : .orange)
-                            Spacer()
+                                .padding(.top, 4)
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("最近一次 Hook 加载报告")
+                                    .font(.caption.bold())
+                                Text(engine.hookStatusText)
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                Text("单个进程的报告不代表所有目标进程都已加载。")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                            Spacer(minLength: 8)
                             Button("刷新") {
                                 engine.refreshHookStatus()
                             }
                             .font(.caption)
+                        }
+                        Divider()
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text("出口 IP 地理信息（数据库估算）")
+                                .font(.subheadline.bold())
+                            Text(engine.ipGeoStatusText)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            if let info = engine.ipGeoInfo {
+                                Text("出口 IP：\(info.ip)")
+                                    .font(.caption.monospaced())
+                                Text("归属区域：\(info.areaDescription)")
+                                    .font(.subheadline)
+                                Text(String(format: "IP 估算坐标：%.5f, %.5f", info.latitude, info.longitude))
+                                    .font(.caption.monospaced())
+                                Text("IP 数据库时区：\(info.timeZoneIdentifier ?? "未提供唯一时区")")
+                                    .font(.caption)
+                                Text("iPhone 当前系统时区：\(TimeZone.autoupdatingCurrent.identifier)")
+                                    .font(.caption)
+                                if let ipTimeZone = info.timeZoneIdentifier {
+                                    Text(ipTimeZone == TimeZone.autoupdatingCurrent.identifier
+                                         ? "IP 时区与设备时区标识一致"
+                                         : "IP 时区与设备时区不同；此处只报告差异，不更改系统时区")
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                } else {
+                                    Text("服务未提供唯一时区，未从多个时区中猜测。")
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                }
+                                Text("附近行政区：\(engine.ipGeoAddress)")
+                                    .font(.caption)
+                                if let updated = engine.ipGeoUpdatedAt {
+                                    Text("查询时间：\(updated.formatted(date: .abbreviated, time: .shortened)) · 来源：\(info.provider)")
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                }
+                            }
                         }
                         Divider()
                         Text("IP 坐标附近的反向地理编码结果（不保证为住宅地址）")
@@ -873,22 +1128,23 @@ struct ContentView: View {
                     .cornerRadius(14)
 
                     VStack(spacing: 10) {
-                        Toggle("网络连接状态变化时自动重新探测 IP 与定位信息", isOn: $engine.autoSyncOnNetworkChange)
+                        Toggle("网络接口变化时自动刷新出口 IP 地理信息", isOn: $engine.autoSyncOnNetworkChange)
                             .font(.subheadline)
-                        Toggle("防旋转 IP 跳变锁定（同会话固定坐标与时区）", isOn: $engine.lockSessionGeo)
-                            .font(.subheadline)
+                        Text("自动刷新只更新 IP 信息展示，不会更改 iPhone 系统定位或系统时区。")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
                     }
                     .padding()
                     .background(Color(.secondarySystemBackground))
                     .cornerRadius(14)
 
-                    Button(action: { engine.syncEnvironment(forceReanchor: true) }) {
+                    Button(action: { engine.refreshIPGeoInfo() }) {
                         HStack(spacing: 8) {
                             if engine.isSyncing {
                                 ProgressView()
                                     .progressViewStyle(CircularProgressViewStyle(tint: .white))
                             }
-                            Text(engine.isSyncing ? "正在探测当前出口 IP..." : "立即同步当前 IP 定位与全局环境")
+                            Text(engine.isSyncing ? "正在查询当前出口 IP..." : "查询当前出口 IP 地理信息")
                                 .font(.headline)
                         }
                         .foregroundColor(.white)
