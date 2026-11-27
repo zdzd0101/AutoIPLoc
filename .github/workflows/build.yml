@@ -63,9 +63,15 @@ jobs:
           <dict>
               <key>Filter</key>
               <dict>
+                  <key>Mode</key>
+                  <string>Any</string>
                   <key>Bundles</key>
                   <array>
                       <string>com.apple.UIKit</string>
+                  </array>
+                  <key>Executables</key>
+                  <array>
+                      <string>geod</string>
                   </array>
               </dict>
           </dict>
@@ -84,7 +90,7 @@ jobs:
           EOF
 
           INSTALLED_SIZE=$(du -sk deb_pkg/var | cut -f1)
-          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 4.5.1\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Fat arm64+arm64e stealth hook v4.5.1 with GeoServices/MapKit proxy bypass, sandbox-safe status write, ARC-safe XPC scrub & NSLocale spoof\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
+          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 5.0.0\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Fat arm64+arm64e stealth hook v5.0.0 with geod Maps fix, jbroot sandbox config, Darwin IPC heartbeat, full VPN/Proxy/JB stealth & NSLocale spoof\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
 
           chmod 0755 deb_pkg/DEBIAN
           chmod 0755 deb_pkg/DEBIAN/postinst
