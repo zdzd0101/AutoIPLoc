@@ -19,6 +19,15 @@
 #import <stdio.h>
 #import <stdint.h>
 #import <pthread.h>
+#import <time.h>
+#import <os/lock.h>
+
+#if __has_feature(ptrauth_calls)
+#import <ptrauth.h>
+#define AUTOIPLOC_HAS_PTRAUTH 1
+#else
+#define AUTOIPLOC_HAS_PTRAUTH 0
+#endif
 
 typedef void (*MSHookFunction_t)(void *symbol, void *replace, void **result);
 typedef void (*MSHookMessageEx_t)(Class _class, SEL message, IMP hook, IMP *old);
@@ -28,14 +37,16 @@ static MSHookMessageEx_t g_MSHookMessageEx = NULL;
 static int (*orig_dladdr)(const void *addr, Dl_info *info) = NULL;
 static unsigned int g_installedCHookCount = 0;
 static unsigned int g_installedObjCHookCount = 0;
-static __thread unsigned int g_internalIODepth = 0;
+static _Thread_local int g_selfCallDepth = 0;
 
 static void BeginInternalIO(void) {
-    g_internalIODepth++;
+    ++g_selfCallDepth;
 }
 
 static void EndInternalIO(void) {
-    if (g_internalIODepth > 0) g_internalIODepth--;
+    if (g_selfCallDepth > 0) {
+        --g_selfCallDepth;
+    }
 }
 
 #define INSTALL_C_FUNCTION_HOOK(target, replacement, originalStorage) \
@@ -199,40 +210,81 @@ static BOOL HookObjCMethod(Class cls, SEL sel, IMP newImp, IMP *oldImp,
         } \
     } while (0)
 
-static BOOL IsSelfCaller(void *retAddr) {
-    if (!retAddr || !orig_dladdr) return NO;
-    Dl_info info;
-    int ok = orig_dladdr(retAddr, &info);
-    if (ok != 0 && info.dli_fname != NULL) {
-        if (strstr(info.dli_fname, "AutoIPLocHook") != NULL) {
-            return YES;
-        }
+static double MonotonicTimeSeconds(void) {
+    struct timespec now = {0, 0};
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return CFAbsoluteTimeGetCurrent();
     }
-    return NO;
+    return (double)now.tv_sec + ((double)now.tv_nsec / 1000000000.0);
 }
 
+static os_unfair_lock g_configCacheLock = OS_UNFAIR_LOCK_INIT;
+static NSDictionary *g_geoConfigCache = nil;
+static NSDictionary *g_wifiConfigCache = nil;
+static double g_geoConfigCacheUpdatedAt = 0.0;
+static double g_wifiConfigCacheUpdatedAt = 0.0;
+static BOOL g_geoConfigCacheInitialized = NO;
+static BOOL g_wifiConfigCacheInitialized = NO;
+static const double kConfigCacheRefreshInterval = 3.0;
+
 static NSDictionary *LoadGeoConfig(void) {
-    NSDictionary *config = nil;
-    BeginInternalIO();
+    os_unfair_lock_lock(&g_configCacheLock);
     @try {
-        config = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/com.autoiploc.geo.plist"];
-        if (!config) config = [NSDictionary dictionaryWithContentsOfFile:@"/var/tmp/com.autoiploc.geo.plist"];
+        const double now = MonotonicTimeSeconds();
+        if (g_geoConfigCacheInitialized &&
+            (now - g_geoConfigCacheUpdatedAt) >= 0.0 &&
+            (now - g_geoConfigCacheUpdatedAt) < kConfigCacheRefreshInterval) {
+            return g_geoConfigCache;
+        }
+
+        NSDictionary *config = nil;
+        BeginInternalIO();
+        @try {
+            config = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/com.autoiploc.geo.plist"];
+            if (!config) {
+                config = [NSDictionary dictionaryWithContentsOfFile:@"/var/tmp/com.autoiploc.geo.plist"];
+            }
+        } @finally {
+            EndInternalIO();
+        }
+
+        g_geoConfigCache = config;
+        g_geoConfigCacheUpdatedAt = now;
+        g_geoConfigCacheInitialized = YES;
+        return g_geoConfigCache;
     } @finally {
-        EndInternalIO();
+        os_unfair_lock_unlock(&g_configCacheLock);
     }
-    return config;
 }
 
 static NSDictionary *LoadWiFiConfig(void) {
-    NSDictionary *config = nil;
-    BeginInternalIO();
+    os_unfair_lock_lock(&g_configCacheLock);
     @try {
-        config = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/com.autoiploc.wifi.plist"];
-        if (!config) config = [NSDictionary dictionaryWithContentsOfFile:@"/var/tmp/com.autoiploc.wifi.plist"];
+        const double now = MonotonicTimeSeconds();
+        if (g_wifiConfigCacheInitialized &&
+            (now - g_wifiConfigCacheUpdatedAt) >= 0.0 &&
+            (now - g_wifiConfigCacheUpdatedAt) < kConfigCacheRefreshInterval) {
+            return g_wifiConfigCache;
+        }
+
+        NSDictionary *config = nil;
+        BeginInternalIO();
+        @try {
+            config = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/com.autoiploc.wifi.plist"];
+            if (!config) {
+                config = [NSDictionary dictionaryWithContentsOfFile:@"/var/tmp/com.autoiploc.wifi.plist"];
+            }
+        } @finally {
+            EndInternalIO();
+        }
+
+        g_wifiConfigCache = config;
+        g_wifiConfigCacheUpdatedAt = now;
+        g_wifiConfigCacheInitialized = YES;
+        return g_wifiConfigCache;
     } @finally {
-        EndInternalIO();
+        os_unfair_lock_unlock(&g_configCacheLock);
     }
-    return config;
 }
 
 static NSString *GetTargetCountryCode(void) {
@@ -319,14 +371,14 @@ static BOOL IsJailbreakPath(const char *path) {
             strstr(path, "autoiploc") != NULL);
 }
 
-static BOOL ShouldHidePath(const char *path, void *returnAddress) {
-    if (g_internalIODepth > 0 || IsSelfCaller(returnAddress)) return NO;
+static BOOL ShouldHidePath(const char *path) {
+    if (g_selfCallDepth > 0) return NO;
     return IsJailbreakPath(path);
 }
 
 static int (*orig_access)(const char *path, int mode) = NULL;
 static int hook_access(const char *path, int mode) {
-    if (ShouldHidePath(path, __builtin_return_address(0))) {
+    if (ShouldHidePath(path)) {
         errno = ENOENT;
         return -1;
     }
@@ -336,7 +388,7 @@ static int hook_access(const char *path, int mode) {
 
 static int (*orig_stat)(const char *path, struct stat *buf) = NULL;
 static int hook_stat(const char *path, struct stat *buf) {
-    if (ShouldHidePath(path, __builtin_return_address(0))) {
+    if (ShouldHidePath(path)) {
         errno = ENOENT;
         return -1;
     }
@@ -346,7 +398,7 @@ static int hook_stat(const char *path, struct stat *buf) {
 
 static int (*orig_lstat)(const char *path, struct stat *buf) = NULL;
 static int hook_lstat(const char *path, struct stat *buf) {
-    if (ShouldHidePath(path, __builtin_return_address(0))) {
+    if (ShouldHidePath(path)) {
         errno = ENOENT;
         return -1;
     }
@@ -356,7 +408,7 @@ static int hook_lstat(const char *path, struct stat *buf) {
 
 static FILE *(*orig_fopen)(const char *filename, const char *mode) = NULL;
 static FILE *hook_fopen(const char *filename, const char *mode) {
-    if (ShouldHidePath(filename, __builtin_return_address(0))) {
+    if (ShouldHidePath(filename)) {
         errno = ENOENT;
         return NULL;
     }
@@ -366,7 +418,7 @@ static FILE *hook_fopen(const char *filename, const char *mode) {
 
 static DIR *(*orig_opendir)(const char *filename) = NULL;
 static DIR *hook_opendir(const char *filename) {
-    if (ShouldHidePath(filename, __builtin_return_address(0))) {
+    if (ShouldHidePath(filename)) {
         errno = ENOENT;
         return NULL;
     }
@@ -376,7 +428,7 @@ static DIR *hook_opendir(const char *filename) {
 
 static BOOL (*orig_fileExists)(id self, SEL _cmd, NSString *path) = NULL;
 static BOOL hook_fileExists(id self, SEL _cmd, NSString *path) {
-    if (ShouldHidePath(path.UTF8String, __builtin_return_address(0))) {
+    if (ShouldHidePath(path.UTF8String)) {
         return NO;
     }
     return orig_fileExists ? orig_fileExists(self, _cmd, path) : NO;
@@ -384,7 +436,7 @@ static BOOL hook_fileExists(id self, SEL _cmd, NSString *path) {
 
 static BOOL (*orig_fileExistsIsDir)(id self, SEL _cmd, NSString *path, BOOL *isDir) = NULL;
 static BOOL hook_fileExistsIsDir(id self, SEL _cmd, NSString *path, BOOL *isDir) {
-    if (ShouldHidePath(path.UTF8String, __builtin_return_address(0))) {
+    if (ShouldHidePath(path.UTF8String)) {
         if (isDir) *isDir = NO;
         return NO;
     }
@@ -502,11 +554,20 @@ static BOOL hook_returnYES(id self, SEL _cmd) {
     return YES;
 }
 
+static void *StripReturnAddressPAC(void *returnAddress) {
+#if AUTOIPLOC_HAS_PTRAUTH
+    return ptrauth_strip(returnAddress, ptrauth_key_return_address);
+#else
+    return returnAddress;
+#endif
+}
+
 static BOOL IsSystemNetworkingCaller(void *retAddr) {
     if (!retAddr) return NO;
     Dl_info info;
     if (!orig_dladdr) return NO;
-    int ok = orig_dladdr(retAddr, &info);
+    void *normalizedReturnAddress = StripReturnAddressPAC(retAddr);
+    int ok = orig_dladdr(normalizedReturnAddress, &info);
     if (ok != 0 && info.dli_fname != NULL) {
         if (strstr(info.dli_fname, "CFNetwork") != NULL ||
             strstr(info.dli_fname, "WebKit") != NULL ||
@@ -696,6 +757,8 @@ static BOOL hook_returnNO(id self, SEL _cmd) {
     return NO;
 }
 
+// Match Objective-C method-family ownership at the C IMP boundary:
+// init consumes self and returns +1; copy returns +1 but does not consume self.
 typedef id AutoIPLocInitWithSimStateIMP(id __attribute__((ns_consumed)), SEL, BOOL, BOOL) __attribute__((ns_returns_retained));
 typedef id AutoIPLocInitWithCoderIMP(id __attribute__((ns_consumed)), SEL, NSCoder *) __attribute__((ns_returns_retained));
 typedef id AutoIPLocCopyWithZoneIMP(id, SEL, NSZone *) __attribute__((ns_returns_retained));
@@ -945,7 +1008,7 @@ static void AutoIPLocHookEntry(void) {
 
         NSDictionary *status = @{
             @"active": @(g_installedCHookCount > 0 || g_installedObjCHookCount > 0),
-            @"version": @"4.3.2",
+            @"version": @"4.3.3",
             @"lastProc": [NSString stringWithUTF8String:prog],
             @"cHookReady": @(orig_dladdr != NULL && orig_getifaddrs != NULL && orig_freeifaddrs != NULL),
             @"cHookCount": @(g_installedCHookCount),

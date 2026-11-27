@@ -60,6 +60,18 @@ jobs:
           grep -Fq "MethodHasExpectedSignature" Tweak/AutoIPLocHook.m
           grep -Fq "object_setIvarWithStrongDefault" Tweak/AutoIPLocHook.m
           grep -Fq "ns_consumed" Tweak/AutoIPLocHook.m
+          grep -Fq "ns_returns_retained" Tweak/AutoIPLocHook.m
+          grep -Fq "_Thread_local int g_selfCallDepth" Tweak/AutoIPLocHook.m
+          grep -Fq "if (g_selfCallDepth > 0) return NO;" Tweak/AutoIPLocHook.m
+          if grep -Fq "IsSelfCaller" Tweak/AutoIPLocHook.m; then
+            echo "Legacy return-address self-caller detection remains" >&2
+            exit 1
+          fi
+          grep -Fq "ptrauth_strip(returnAddress, ptrauth_key_return_address)" Tweak/AutoIPLocHook.m
+          grep -Fq "os_unfair_lock g_configCacheLock" Tweak/AutoIPLocHook.m
+          grep -Fq "kConfigCacheRefreshInterval = 3.0" Tweak/AutoIPLocHook.m
+          grep -Fq "g_geoConfigCacheInitialized" Tweak/AutoIPLocHook.m
+          grep -Fq "g_wifiConfigCacheInitialized" Tweak/AutoIPLocHook.m
           grep -Fq "methodMatchesSignature" main.swift
           grep -Fq "method_copyArgumentType" main.swift
           grep -Fq "hook_freeifaddrs" Tweak/AutoIPLocHook.m
@@ -148,7 +160,7 @@ jobs:
           EOF
 
           INSTALLED_SIZE=$(du -sk deb_pkg/var | cut -f1)
-          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 4.3.2\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Fat arm64+arm64e XPC-level CLLocationSourceInformation scrub & RootHide ElleKit stealth hook\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
+          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 4.3.3\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Fat arm64+arm64e XPC-level CLLocationSourceInformation scrub & RootHide ElleKit stealth hook\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
 
           chmod 0755 deb_pkg/DEBIAN
           chmod 0755 deb_pkg/DEBIAN/postinst
