@@ -43,6 +43,19 @@ jobs:
           plutil -lint Info.plist
           plutil -lint entitlements.plist
           plutil -lint Tweak/AutoIPLocHook.plist
+          echo "Checking App transport and input validation invariants..."
+          if grep -Fq "http://" main.swift; then
+            echo "Insecure HTTP endpoint found in main.swift" >&2
+            exit 1
+          fi
+          if grep -Fq "NSAllowsArbitraryLoads" Info.plist; then
+            echo "Unrestricted App Transport Security exception found" >&2
+            exit 1
+          fi
+          grep -Fq "inet_pton(AF_INET" main.swift
+          grep -Fq "inet_pton(AF_INET6" main.swift
+          grep -Fq "isValidGeoProfile(profile)" main.swift
+          grep -Fq "reports.max(by:" main.swift
           echo "Checking Hook source safety invariants..."
           grep -Fq "MethodHasExpectedSignature" Tweak/AutoIPLocHook.m
           grep -Fq "object_setIvarWithStrongDefault" Tweak/AutoIPLocHook.m
@@ -59,10 +72,6 @@ jobs:
             echo "Aliased typed function-pointer storage passed to hook API" >&2
             exit 1
           fi
-
-          /usr/libexec/PlistBuddy -c "Delete :NSAppTransportSecurity" Payload/AutoIPLoc.app/Info.plist 2>/dev/null || true
-          /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity dict" Payload/AutoIPLoc.app/Info.plist
-          /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSAllowsArbitraryLoads bool true" Payload/AutoIPLoc.app/Info.plist
 
           curl -fsSL https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_macosx_x86_64 -o ldid
           chmod +x ldid

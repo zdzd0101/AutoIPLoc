@@ -21,11 +21,6 @@
         <string>audio</string>
         <string>location</string>
     </array>
-    <key>NSAppTransportSecurity</key>
-    <dict>
-        <key>NSAllowsArbitraryLoads</key>
-        <true/>
-    </dict>
     <key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
     <string>用于同步出口IP经纬度定位与周边环境</string>
     <key>NSLocationWhenInUseUsageDescription</key>

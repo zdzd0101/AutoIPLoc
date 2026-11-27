@@ -86,28 +86,87 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     }
 
     private func writeSharedPlist(_ dict: [String: Any], paths: [String]) {
-        let nsDict = dict as NSDictionary
+        let serialized: Data
+        do {
+            serialized = try PropertyListSerialization.data(
+                fromPropertyList: dict,
+                format: .xml,
+                options: 0
+            )
+        } catch {
+            statusError = "共享配置序列化失败：\\(error.localizedDescription)"
+            return
+        }
+
         var successfulWrites = 0
         var failedPaths: [String] = []
+        let fileManager = FileManager.default
 
         for path in paths {
-            guard nsDict.write(toFile: path, atomically: true) else {
-                failedPaths.append(path)
-                continue
-            }
+            let url = URL(fileURLWithPath: path)
+            do {
+                try fileManager.createDirectory(
+                    at: url.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                try serialized.write(to: url, options: .atomic)
+                guard path.withCString({ Darwin.chmod($0, 0o600) }) == 0 else {
+                    throw NSError(
+                        domain: NSPOSIXErrorDomain,
+                        code: Int(errno),
+                        userInfo: [NSLocalizedDescriptionKey: String(cString: strerror(errno))]
+                    )
+                }
 
-            guard Darwin.chmod(path, 0o600) == 0 else {
-                failedPaths.append(path)
-                continue
+                let readBack = try Data(contentsOf: url)
+                let decoded = try PropertyListSerialization.propertyList(
+                    from: readBack,
+                    options: [],
+                    format: nil
+                )
+                guard decoded is [String: Any] else {
+                    throw NSError(
+                        domain: "AutoIPLoc.Configuration",
+                        code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "写入后配置格式验证失败"]
+                    )
+                }
+                successfulWrites += 1
+            } catch {
+                failedPaths.append("\\(path): \\(error.localizedDescription)")
             }
-            successfulWrites += 1
         }
 
         if successfulWrites == 0 {
-            statusError = "共享配置写入失败，所有配置路径均不可写：\(failedPaths.joined(separator: ", "))"
+            statusError = "共享配置写入失败，所有配置路径均不可写：\\(failedPaths.joined(separator: "；"))"
         } else if !failedPaths.isEmpty {
-            statusError = "共享配置仅写入 \(successfulWrites) 个位置；部分备用路径不可写。"
+            statusError = "共享配置仅写入\\(successfulWrites)个位置；失败路径：\\(failedPaths.joined(separator: "；"))"
         }
+    }
+
+    private func isValidIPAddress(_ rawValue: String) -> Bool {
+        let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return false }
+
+        var ipv4 = in_addr()
+        if value.withCString({ inet_pton(AF_INET, $0, &ipv4) == 1 }) {
+            return true
+        }
+
+        var ipv6 = in6_addr()
+        return value.withCString({ inet_pton(AF_INET6, $0, &ipv6) == 1 })
+    }
+
+    private func isValidGeoProfile(_ profile: GeoProfile) -> Bool {
+        let country = profile.countryCode.uppercased()
+        return isValidIPAddress(profile.ip) &&
+            country.utf8.count == 2 &&
+            country.utf8.allSatisfy { (65...90).contains(Int($0)) } &&
+            TimeZone(identifier: profile.timezone) != nil &&
+            profile.latitude.isFinite &&
+            profile.longitude.isFinite &&
+            (-90.0...90.0).contains(profile.latitude) &&
+            (-180.0...180.0).contains(profile.longitude)
     }
 
     private func methodTypeCode(_ rawType: UnsafeMutablePointer<CChar>?) -> CChar? {
@@ -260,42 +319,37 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
 
     func refreshHookStatus() {
         let now = Date().timeIntervalSince1970
-        for path in hookStatusPaths {
-            if let dict = readSharedPlist(paths: [path]),
-               let active = dict["active"] as? Bool, active {
-                let ver = dict["version"] as? String ?? "未知版本"
-                let proc = dict["lastProc"] as? String ?? "未知进程"
-                let hookOk = (dict["cHookReady"] as? Bool) ?? false
-                let ts = (dict["timestamp"] as? Double) ?? 0
-                let ageSec = Int(max(0, now - ts))
+        let reports = hookStatusPaths.compactMap { readSharedPlist(paths: [$0]) }
+        let activeReports = reports.filter { ($0["active"] as? Bool) == true }
 
-                self.hookIsActive = false
-                if ts > 0 && ageSec <= 300 && hookOk {
-                    self.hookStatusText = "检测到近期加载报告 v\(ver)（\(proc) · \(ageSec)秒前）；函数入口可用不代表全部 Hook 已生效"
-                    return
-                } else if ts > 0 && ageSec > 300 {
-                    self.hookStatusText = "最近一次加载报告已过 \(ageSec / 60) 分钟；尚未验证当前目标进程状态"
-                    return
-                } else {
-                    self.hookStatusText = "检测到加载报告，但报告字段不完整，无法确认实际功能状态"
-                    return
-                }
+        if let dict = activeReports.max(by: {
+            ($0["timestamp"] as? Double ?? 0) < ($1["timestamp"] as? Double ?? 0)
+        }) {
+            let ver = dict["version"] as? String ?? "未知版本"
+            let proc = dict["lastProc"] as? String ?? "未知进程"
+            let hookOk = (dict["cHookReady"] as? Bool) ?? false
+            let ts = (dict["timestamp"] as? Double) ?? 0
+            let ageSec = Int(max(0, now - ts))
+
+            hookIsActive = false
+            if ts > 0 && ageSec <= 300 && hookOk {
+                hookStatusText = "检测到近期加载报告 v\\(ver)（\\(proc) · \\(ageSec)秒前）；仍未证明所有目标进程均已加载"
+                return
+            } else if ts > 0 && ageSec > 300 {
+                hookStatusText = "最近一次加载报告已过 \\(ageSec / 60) 分钟；当前目标进程状态未验证"
+                return
+            } else {
+                hookStatusText = "检测到加载报告，但关键字段不完整，无法确认实际功能状态"
+                return
             }
         }
 
-        if let dylibPath = findInstalledHookDylib() {
-            if let handle = dlopen(dylibPath, RTLD_NOW) {
-                dlclose(handle)
-                self.hookIsActive = false
-                self.hookStatusText = "动态库可由当前主程序加载；这不证明目标 App 已安装或执行 Hook"
-            } else {
-                let errStr = dlerror().map { String(cString: $0) } ?? "未知加载错误"
-                self.hookIsActive = false
-                self.hookStatusText = "加载失败: \(errStr)"
-            }
+        if findInstalledHookDylib() != nil {
+            hookIsActive = false
+            hookStatusText = "已找到 Hook 动态库文件；未验证目标进程加载或实际执行"
         } else {
-            self.hookIsActive = false
-            self.hookStatusText = "未找到 AutoIPLocHook.dylib（请用 RootHide Patcher 安装）"
+            hookIsActive = false
+            hookStatusText = "未找到 AutoIPLocHook.dylib（请检查 RootHide 安装路径）"
         }
     }
 
@@ -315,36 +369,54 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
 
     private func loadSavedState() {
         if let dict = readSharedPlist(paths: geoPlistPaths),
-           let enabled = dict["enabled"] as? Bool, enabled,
-           let ip = dict["ip"] as? String,
-           let cc = dict["countryCode"] as? String,
-           let tz = dict["timezone"] as? String,
-           let lat = dict["lat"] as? Double,
-           let lon = dict["lon"] as? Double {
-            let street = dict["street"] as? String ?? "未提供街道地址"
-            let zip = dict["zip"] as? String ?? "--"
-            let city = dict["city"] as? String ?? ""
-            let region = dict["region"] as? String ?? ""
-            let isp = dict["isp"] as? String ?? ""
-            let profile = GeoProfile(
-                ip: ip, countryCode: cc, region: region, city: city,
-                timezone: tz, latitude: lat, longitude: lon,
-                street: street, zip: zip, isp: isp
-            )
-            self.lockedProfile = profile
-            self.isSimulating = startLocationSimulation(for: profile)
-            self.exitIP = "\(ip) [\(cc)]"
-            self.timezoneName = tz
-            self.coordText = String(format: "%.5f, %.5f", lat, lon)
-            self.streetAddress = street
-            self.zipCode = zip
-            if !self.isSimulating && self.statusError == nil {
-                self.statusError = "已加载保存的定位配置，但系统未确认定位模拟已启动。"
+           (dict["enabled"] as? Bool) == true {
+            if let ip = dict["ip"] as? String,
+               let cc = dict["countryCode"] as? String,
+               let tz = dict["timezone"] as? String,
+               let lat = dict["lat"] as? Double,
+               let lon = dict["lon"] as? Double {
+                let profile = GeoProfile(
+                    ip: ip,
+                    countryCode: cc,
+                    region: dict["region"] as? String ?? "",
+                    city: dict["city"] as? String ?? "",
+                    timezone: tz,
+                    latitude: lat,
+                    longitude: lon,
+                    street: dict["street"] as? String ?? "未提供街道地址",
+                    zip: dict["zip"] as? String ?? "--",
+                    isp: dict["isp"] as? String ?? ""
+                )
+
+                if isValidGeoProfile(profile) {
+                    lockedProfile = profile
+                    isSimulating = startLocationSimulation(for: profile)
+                    exitIP = "\\(ip) [\\(cc)]"
+                    timezoneName = tz
+                    coordText = String(format: "%.5f, %.5f", lat, lon)
+                    streetAddress = profile.street
+                    zipCode = profile.zip
+                    if !isSimulating {
+                        lockedProfile = nil
+                        if statusError == nil {
+                            statusError = "已加载保存的定位配置，但系统未确认定位模拟已启动。"
+                        }
+                    }
+                } else {
+                    lockedProfile = nil
+                    isSimulating = false
+                    statusError = "已保存的定位配置包含无效 IP、国家码、时区或坐标，未启动模拟。"
+                }
+            } else {
+                lockedProfile = nil
+                isSimulating = false
+                statusError = "已保存的定位配置字段不完整，未启动模拟。"
             }
         }
+
         if let wDict = readSharedPlist(paths: wifiPlistPaths),
            let nets = wDict["networks"] as? [[String: String]] {
-            self.wifiList = nets
+            wifiList = nets
         }
     }
 
@@ -356,7 +428,6 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
 
         let requestID = UUID()
         let endpoints = [
-            "http://ip-api.com/json/?fields=status,countryCode,regionName,city,zip,lat,lon,timezone,isp,query",
             "https://ipwho.is/",
             "https://freeipapi.com/api/json",
             "https://ipinfo.io/json",
@@ -470,11 +541,12 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         if let status = json["status"] as? String, status.lowercased() == "fail" { return nil }
         if let success = json["success"] as? Bool, !success { return nil }
 
-        let ip = (json["query"] as? String)
+        let rawIP = (json["query"] as? String)
             ?? (json["ip"] as? String)
             ?? (json["ipAddress"] as? String)
             ?? ""
-        guard !ip.isEmpty else { return nil }
+        let ip = rawIP.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard isValidIPAddress(ip) else { return nil }
 
         let rawCountryCode = (json["countryCode"] as? String)
             ?? (json["country_code"] as? String)
@@ -513,21 +585,21 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         guard let timezone = tz,
               TimeZone(identifier: timezone) != nil else { return nil }
 
-        var lat = (json["lat"] as? Double)
-            ?? (json["latitude"] as? Double)
-            ?? 0.0
-        var lon = (json["lon"] as? Double)
-            ?? (json["longitude"] as? Double)
-            ?? 0.0
-        if (json["lat"] == nil || json["latitude"] == nil ||
-            json["lon"] == nil || json["longitude"] == nil),
-           let locStr = json["loc"] as? String {
+        var coordinates: (Double, Double)?
+        if let lat = (json["lat"] as? Double) ?? (json["latitude"] as? Double),
+           let lon = (json["lon"] as? Double) ?? (json["longitude"] as? Double) {
+            coordinates = (lat, lon)
+        } else if let locStr = json["loc"] as? String {
             let parts = locStr.split(separator: ",")
-            if parts.count == 2, let la = Double(parts[0]), let lo = Double(parts[1]) {
-                lat = la
-                lon = lo
+            if parts.count == 2,
+               let lat = Double(parts[0].trimmingCharacters(in: .whitespaces)),
+               let lon = Double(parts[1].trimmingCharacters(in: .whitespaces)) {
+                coordinates = (lat, lon)
             }
         }
+        guard let resolvedCoordinates = coordinates else { return nil }
+        let lat = resolvedCoordinates.0
+        let lon = resolvedCoordinates.1
         guard lat.isFinite, lon.isFinite,
               (-90.0...90.0).contains(lat),
               (-180.0...180.0).contains(lon) else { return nil }
@@ -547,8 +619,11 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             return
         }
 
-        let jitterLat = raw.latitude + Double.random(in: -0.0065...0.0065)
-        let jitterLon = raw.longitude + Double.random(in: -0.0065...0.0065)
+        let jitterLat = min(90.0, max(-90.0, raw.latitude + Double.random(in: -0.0065...0.0065)))
+        let unwrappedLongitude = raw.longitude + Double.random(in: -0.0065...0.0065)
+        let jitterLon = ((unwrappedLongitude + 180.0)
+            .truncatingRemainder(dividingBy: 360.0) + 360.0)
+            .truncatingRemainder(dividingBy: 360.0) - 180.0
         let loc = CLLocation(latitude: jitterLat, longitude: jitterLon)
 
         let fallbackStreet = "IP 定位坐标附近；街道地址尚未由地理编码服务确认"
@@ -632,6 +707,9 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
 
         let simulationStarted = startLocationSimulation(for: profile)
         self.isSimulating = simulationStarted
+        if !simulationStarted {
+            self.lockedProfile = nil
+        }
         writeGeoPlist(profile, enabled: simulationStarted)
         saveWiFiPlist(enabled: simulationStarted)
         if !simulationStarted && self.statusError == nil {
@@ -788,7 +866,7 @@ struct ContentView: View {
                     .cornerRadius(14)
 
                     VStack(spacing: 10) {
-                        Toggle("网络与代理切换自动同步 IP + 时区 + Wi-Fi", isOn: $engine.autoSyncOnNetworkChange)
+                        Toggle("网络连接状态变化时自动重新探测 IP 与定位信息", isOn: $engine.autoSyncOnNetworkChange)
                             .font(.subheadline)
                         Toggle("防旋转 IP 跳变锁定（同会话固定坐标与时区）", isOn: $engine.lockSessionGeo)
                             .font(.subheadline)
@@ -803,7 +881,7 @@ struct ContentView: View {
                                 ProgressView()
                                     .progressViewStyle(CircularProgressViewStyle(tint: .white))
                             }
-                            Text(engine.isSyncing ? "正在探测当前美国出口 IP..." : "立即同步当前 IP 定位与全局环境")
+                            Text(engine.isSyncing ? "正在探测当前出口 IP..." : "立即同步当前 IP 定位与全局环境")
                                 .font(.headline)
                         }
                         .foregroundColor(.white)
