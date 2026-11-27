@@ -4,6 +4,15 @@ import CoreLocation
 import Network
 import Darwin
 
+@_silgen_name("notify_register_check")
+private func c_notify_register_check(_ name: UnsafePointer<CChar>, _ outToken: UnsafeMutablePointer<Int32>) -> UInt32
+
+@_silgen_name("notify_get_state")
+private func c_notify_get_state(_ token: Int32, _ state64: UnsafeMutablePointer<UInt64>) -> UInt32
+
+@_silgen_name("notify_cancel")
+private func c_notify_cancel(_ token: Int32) -> UInt32
+
 struct GeoProfile: Codable {
     var ip: String
     var countryCode: String
@@ -29,11 +38,13 @@ struct AuditItem: Identifiable {
 
 final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegate {
     static let shared = LocationEngine()
+    static let expectedHookVersion = "5.0.0"
 
     @Published var isSimulating = false
     @Published var isSyncing = false
     @Published var isAuditing = false
     @Published var statusError: String? = nil
+    @Published var versionMismatchWarning: String? = nil
     @Published var mapResetMessage: String? = nil
     @Published var exitIP = "未获取 [--]"
     @Published var ispText = "--"
@@ -52,6 +63,9 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     @Published var spoofCarrier = true {
         didSet { persistCurrentGeoIfActive() }
     }
+    @Published var spoofProxy = true {
+        didSet { persistCurrentGeoIfActive() }
+    }
     @Published var naturalGpsJitter = true {
         didSet {
             if isSimulating {
@@ -61,19 +75,6 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     }
     @Published var wifiList: [[String: String]] = []
     @Published var auditItems: [AuditItem] = []
-
-    private let geoPlistPaths = [
-        "/var/tmp/com.autoiploc.geo.plist",
-        "/var/mobile/Library/Preferences/com.autoiploc.geo.plist"
-    ]
-    private let wifiPlistPaths = [
-        "/var/tmp/com.autoiploc.wifi.plist",
-        "/var/mobile/Library/Preferences/com.autoiploc.wifi.plist"
-    ]
-    private let hookStatusPaths = [
-        "/var/tmp/com.autoiploc.hookstatus.plist",
-        "/var/mobile/Library/Preferences/com.autoiploc.hookstatus.plist"
-    ]
 
     private let locationManager = CLLocationManager()
     private lazy var simManager = CLSimulationManager()
@@ -92,6 +93,54 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         loadSavedState()
         refreshHookStatus()
         startNetworkMonitor()
+    }
+
+    private func findTweakDirectory() -> String? {
+        let fm = FileManager.default
+        let baseDir = "/var/containers/Bundle/Application"
+        if let items = try? fm.contentsOfDirectory(atPath: baseDir) {
+            for item in items where item.hasPrefix(".jbroot-") {
+                let dir = "\(baseDir)/\(item)/Library/MobileSubstrate/DynamicLibraries"
+                if fm.fileExists(atPath: dir) {
+                    return dir
+                }
+            }
+        }
+        let fallbackDir = "/var/jb/Library/MobileSubstrate/DynamicLibraries"
+        return fm.fileExists(atPath: fallbackDir) ? fallbackDir : nil
+    }
+
+    private var geoPlistPaths: [String] {
+        var paths = [
+            "/var/tmp/com.autoiploc.geo.plist",
+            "/var/mobile/Library/Preferences/com.autoiploc.geo.plist"
+        ]
+        if let dir = findTweakDirectory() {
+            paths.insert("\(dir)/AutoIPLoc.geo.plist", at: 0)
+        }
+        return paths
+    }
+
+    private var wifiPlistPaths: [String] {
+        var paths = [
+            "/var/tmp/com.autoiploc.wifi.plist",
+            "/var/mobile/Library/Preferences/com.autoiploc.wifi.plist"
+        ]
+        if let dir = findTweakDirectory() {
+            paths.insert("\(dir)/AutoIPLoc.wifi.plist", at: 0)
+        }
+        return paths
+    }
+
+    private var hookStatusPaths: [String] {
+        var paths = [
+            "/var/tmp/com.autoiploc.hookstatus.plist",
+            "/var/mobile/Library/Preferences/com.autoiploc.hookstatus.plist"
+        ]
+        if let dir = findTweakDirectory() {
+            paths.insert("\(dir)/AutoIPLoc.hookstatus.plist", at: 0)
+        }
+        return paths
     }
 
     private func ensureWritableHookStatusFiles() {
@@ -155,18 +204,30 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     }
 
     private func findInstalledHookDylib() -> String? {
-        let fm = FileManager.default
-        let baseDir = "/var/containers/Bundle/Application"
-        if let items = try? fm.contentsOfDirectory(atPath: baseDir) {
-            for item in items where item.hasPrefix(".jbroot-") {
-                let candidate = "\(baseDir)/\(item)/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib"
-                if fm.fileExists(atPath: candidate) {
-                    return candidate
-                }
+        if let dir = findTweakDirectory() {
+            let candidate = "\(dir)/AutoIPLocHook.dylib"
+            if FileManager.default.fileExists(atPath: candidate) {
+                return candidate
             }
         }
-        let fallback = "/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib"
-        return fm.fileExists(atPath: fallback) ? fallback : nil
+        return nil
+    }
+
+    private func readDarwinHeartbeat() -> (version: String, cHookReady: Bool, timestamp: Double)? {
+        var token: Int32 = 0
+        let status = "com.autoiploc.hook.heartbeat".withCString { c_notify_register_check($0, &token) }
+        guard status == 0 else { return nil }
+        defer { _ = c_notify_cancel(token) }
+
+        var state: UInt64 = 0
+        guard c_notify_get_state(token, &state) == 0, state != 0 else { return nil }
+        let major = (state >> 56) & 0xFF
+        let minor = (state >> 48) & 0xFF
+        let patch = (state >> 41) & 0x7F
+        let cHookReady = ((state >> 40) & 0x1) == 1
+        let ts = Double(state & 0xFFFFFFFFFF)
+        guard major > 0, ts > 1_700_000_000 else { return nil }
+        return ("\(major).\(minor).\(patch)", cHookReady, ts)
     }
 
     private func formatAgeText(_ ageSec: Int) -> String {
@@ -181,47 +242,69 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
 
     func refreshHookStatus() {
         let now = Date().timeIntervalSince1970
-        var latestDict: [String: Any]? = nil
-        var latestTS: Double = -1
+        var bestVer: String? = nil
+        var bestProc: String = "沙盒应用"
+        var bestHookOk = false
+        var bestTS: Double = -1
 
+        // 1. 优先读取跨沙盒 Darwin IPC 心跳
+        if let hb = readDarwinHeartbeat() {
+            bestVer = hb.version
+            bestHookOk = hb.cHookReady
+            bestTS = hb.timestamp
+        }
+
+        // 2. 合并多路径 plist（获取具体进程名或更新的时间戳）
         for path in hookStatusPaths {
             if let dict = NSDictionary(contentsOfFile: path) as? [String: Any],
                let active = dict["active"] as? Bool, active {
                 let ts = (dict["timestamp"] as? Double) ?? 0
-                if ts > latestTS {
-                    latestTS = ts
-                    latestDict = dict
+                let ver = dict["version"] as? String ?? "0.0.0"
+                let proc = dict["lastProc"] as? String ?? "目标应用"
+                let hookOk = (dict["cHookReady"] as? Bool) ?? false
+
+                if ts > bestTS {
+                    bestTS = ts
+                    bestVer = ver
+                    bestProc = proc
+                    bestHookOk = hookOk
+                } else if abs(ts - bestTS) <= 2.0, ver == bestVer {
+                    bestProc = proc
                 }
             }
         }
 
-        if let dict = latestDict {
-            let ver = dict["version"] as? String ?? "4.5.1"
-            let proc = dict["lastProc"] as? String ?? "目标应用"
-            let hookOk = (dict["cHookReady"] as? Bool) ?? false
-            let ageSec = Int(max(0, now - latestTS))
+        if let ver = bestVer, bestTS > 0 {
+            let ageSec = Int(max(0, now - bestTS))
             let ageText = formatAgeText(ageSec)
 
-            if latestTS > 0 && ageSec <= 86400 && hookOk {
-                self.hookIsActive = true
-                self.hookStatusText = "已实时激活 v\(ver) · arm64e就绪（\(proc) · \(ageText)）"
+            if ver != Self.expectedHookVersion {
+                self.versionMismatchWarning = "检测到手机正在运行旧版插件 v\(ver)（当前应为 v\(Self.expectedHookVersion)）。请用 RootHide Patcher 转换新版 AutoIPLocHook.deb 覆盖安装，并在 Dopamine 执行 Userspace Reboot！"
+            } else {
+                self.versionMismatchWarning = nil
+            }
+
+            if ageSec <= 86400 && bestHookOk {
+                self.hookIsActive = (ver == Self.expectedHookVersion)
+                self.hookStatusText = "已激活 v\(ver) · arm64e就绪（\(bestProc) · \(ageText)）"
                 return
-            } else if latestTS > 0 && !hookOk {
+            } else if !bestHookOk {
                 self.hookIsActive = false
-                self.hookStatusText = "v\(ver) 仅 OC 生效，C 层 Hook 未就绪（\(proc)）"
+                self.hookStatusText = "v\(ver) 仅 OC 生效，C 层 Hook 未就绪（\(bestProc)）"
                 return
-            } else if latestTS > 0 && ageSec > 86400 {
+            } else {
                 self.hookIsActive = false
                 self.hookStatusText = "上次注入已超过 24 小时（请重开目标 App 刷新状态）"
                 return
             }
         }
 
+        self.versionMismatchWarning = nil
         if let dylibPath = findInstalledHookDylib() {
             if let handle = dlopen(dylibPath, RTLD_NOW) {
                 dlclose(handle)
                 self.hookIsActive = false
-                self.hookStatusText = "插件就绪（请开启 Dopamine 插件注入并重开检测 App）"
+                self.hookStatusText = "插件文件已就绪（请开启 Dopamine 插件注入并重开目标 App）"
             } else {
                 let errStr = dlerror().map { String(cString: $0) } ?? "未知加载错误"
                 self.hookIsActive = false
@@ -251,6 +334,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         if let dict = readSharedPlist(paths: geoPlistPaths) {
             if let sl = dict["spoofLocale"] as? Bool { self.spoofLocale = sl }
             if let sc = dict["spoofCarrier"] as? Bool { self.spoofCarrier = sc }
+            if let sp = dict["spoofProxy"] as? Bool { self.spoofProxy = sp }
 
             if let enabled = dict["enabled"] as? Bool, enabled,
                let ip = dict["ip"] as? String,
@@ -280,6 +364,8 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
                 self.streetAddress = street
                 self.zipCode = zip
                 self.updateMappedProfileSummary(for: cc)
+                // 同步一次到 jbroot 插件目录，确保沙盒 App 立即能读到
+                self.writeGeoPlist(profile)
                 if self.naturalGpsJitter {
                     self.startGpsDriftTimer()
                 }
@@ -288,6 +374,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         if let wDict = readSharedPlist(paths: wifiPlistPaths),
            let nets = wDict["networks"] as? [[String: String]] {
             self.wifiList = nets
+            self.saveWiFiPlist(enabled: isSimulating)
         }
     }
 
@@ -492,6 +579,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             "enabled": true,
             "spoofLocale": spoofLocale,
             "spoofCarrier": spoofCarrier,
+            "spoofProxy": spoofProxy,
             "ip": profile.ip,
             "countryCode": profile.countryCode,
             "region": profile.region,
@@ -660,10 +748,10 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             var results: [AuditItem] = []
 
             results.append(AuditItem(
-                title: "底层隐身插件 (v4.5.1)",
-                detail: self.hookStatusText,
-                passed: self.hookIsActive,
-                isWarning: !self.hookIsActive
+                title: "底层隐身插件 (目标 v\(Self.expectedHookVersion))",
+                detail: self.versionMismatchWarning ?? self.hookStatusText,
+                passed: self.hookIsActive && self.versionMismatchWarning == nil,
+                isWarning: !self.hookIsActive || self.versionMismatchWarning != nil
             ))
 
             results.append(AuditItem(
@@ -710,6 +798,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             "/var/mobile/Library/Caches/com.apple.Maps",
             "/var/mobile/Library/Caches/com.apple.geod",
             "/var/mobile/Library/Caches/GeoServices",
+            "/var/mobile/Library/GeoServices",
             "/var/mobile/Library/Preferences/com.apple.GEO.plist"
         ]
         var cleared = 0
@@ -718,12 +807,16 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
                 do {
                     try fm.removeItem(atPath: p)
                     cleared += 1
-                } catch {
-                    // 忽略无权限或已清理的路径
-                }
+                } catch {}
             }
         }
-        mapResetMessage = "已清理 \(cleared) 处地图与地理缓存；请确认苹果地图域名走海外节点，并在 Dopamine 中执行 Userspace Reboot 后重开地图。"
+        // 同步抹除 cfprefsd 内存中的国内高德配置键
+        let targetCC = (lockedProfile?.countryCode ?? "US") as CFString
+        CFPreferencesSetValue("CountryProviders" as CFString, nil, "com.apple.GEO" as CFString, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
+        CFPreferencesSetValue("GEOCountryConfigurationCountryCode" as CFString, targetCC, "com.apple.GEO" as CFString, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
+        CFPreferencesSynchronize("com.apple.GEO" as CFString, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
+
+        mapResetMessage = "已彻底清理 \(cleared) 处地图/geod缓存并重置 cfprefsd 地区键为 \(targetCC)。请确认 Shadowrocket 中苹果 IPv6 规则已设为 REJECT，并在 Dopamine 执行 Userspace Reboot 后重开地图。"
     }
 
     func stopSimulation() {
@@ -748,7 +841,8 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         let geoDict: [String: Any] = [
             "enabled": false,
             "spoofLocale": spoofLocale,
-            "spoofCarrier": spoofCarrier
+            "spoofCarrier": spoofCarrier,
+            "spoofProxy": spoofProxy
         ]
         writeSharedPlist(geoDict, paths: geoPlistPaths)
         saveWiFiPlist(enabled: false)
@@ -762,6 +856,16 @@ struct ContentView: View {
         NavigationView {
             ScrollView {
                 VStack(spacing: 14) {
+                    if let mismatch = engine.versionMismatchWarning {
+                        Text("🚨 \(mismatch)")
+                            .font(.footnote.bold())
+                            .foregroundColor(.white)
+                            .padding(12)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Color.orange)
+                            .cornerRadius(12)
+                    }
+
                     if let err = engine.statusError {
                         Text("⚠️ \(err)")
                             .font(.footnote.bold())
@@ -869,7 +973,7 @@ struct ContentView: View {
                             .disabled(engine.isAuditing)
                         }
                         if engine.auditItems.isEmpty {
-                            Text("点击“开始体检”检测 IP 机房风险、IPv6 泄露及插件注入状态。")
+                            Text("点击“开始体检”检测插件版本、IP 机房风险及 IPv6 泄露状态。")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         } else {
@@ -904,6 +1008,8 @@ struct ContentView: View {
                             .font(.subheadline)
                         Toggle("伪造运营商与 SIM 卡信息 (CTCarrier)", isOn: $engine.spoofCarrier)
                             .font(.subheadline)
+                        Toggle("隐藏系统代理特征 (Proxy Stealth)", isOn: $engine.spoofProxy)
+                            .font(.subheadline)
                         Toggle("GPS 自然精度与微幅漂移保活（45秒刷新）", isOn: $engine.naturalGpsJitter)
                             .font(.subheadline)
                     }
@@ -932,10 +1038,10 @@ struct ContentView: View {
                     .background(Color(.secondarySystemBackground))
                     .cornerRadius(14)
 
-                    // 清除高德缓存按钮与回执提示
+                    // 彻底重置地图与 geod 缓存
                     VStack(alignment: .leading, spacing: 6) {
                         Button(action: { engine.resetAppleMapsCache() }) {
-                            Text("重置并恢复苹果国际原生地图（清除高德缓存）")
+                            Text("彻底重置苹果国际地图（清除高德与 geod 缓存）")
                                 .font(.subheadline.bold())
                                 .foregroundColor(.blue)
                                 .frame(maxWidth: .infinity)
