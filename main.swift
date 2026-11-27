@@ -2,7 +2,6 @@ import SwiftUI
 import UIKit
 import CoreLocation
 import Network
-import AVFoundation
 import Darwin
 
 struct GeoProfile: Codable {
@@ -49,6 +48,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     ]
 
     private let locationManager = CLLocationManager()
+    private lazy var simManager = CLSimulationManager()
     private let pathMonitor = NWPathMonitor()
     private let monitorQueue = DispatchQueue(label: "com.autoiploc.netmonitor")
     private var lastPathStatus: NWPath.Status?
@@ -71,6 +71,15 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         }
     }
 
+    private func readSharedPlist(paths: [String]) -> [String: Any]? {
+        for path in paths {
+            if let dict = NSDictionary(contentsOfFile: path) as? [String: Any] {
+                return dict
+            }
+        }
+        return nil
+    }
+
     private func findInstalledHookDylib() -> String? {
         let fm = FileManager.default
         let baseDir = "/var/containers/Bundle/Application"
@@ -91,7 +100,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         for path in hookStatusPaths {
             if let dict = NSDictionary(contentsOfFile: path) as? [String: Any],
                let active = dict["active"] as? Bool, active {
-                let ver = dict["version"] as? String ?? "4.3.0"
+                let ver = dict["version"] as? String ?? "4.4.0"
                 let proc = dict["lastProc"] as? String ?? "目标应用"
                 let hookOk = (dict["cHookReady"] as? Bool) ?? false
                 let ts = (dict["timestamp"] as? Double) ?? 0
@@ -140,7 +149,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     }
 
     private func loadSavedState() {
-        if let dict = NSDictionary(contentsOfFile: geoPlistPaths[0]) as? [String: Any],
+        if let dict = readSharedPlist(paths: geoPlistPaths),
            let enabled = dict["enabled"] as? Bool, enabled,
            let ip = dict["ip"] as? String,
            let cc = dict["countryCode"] as? String,
@@ -165,7 +174,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             self.streetAddress = street
             self.zipCode = zip
         }
-        if let wDict = NSDictionary(contentsOfFile: wifiPlistPaths[0]) as? [String: Any],
+        if let wDict = readSharedPlist(paths: wifiPlistPaths),
            let nets = wDict["networks"] as? [[String: String]] {
             self.wifiList = nets
         }
@@ -401,7 +410,6 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             speed: 0,
             timestamp: Date()
         )
-        let simManager = CLSimulationManager()
         simManager.stopLocationSimulation()
         simManager.clearSimulatedLocations()
         simManager.appendSimulatedLocation(simLocation)
@@ -452,7 +460,6 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     }
 
     func stopSimulation() {
-        let simManager = CLSimulationManager()
         simManager.stopLocationSimulation()
         simManager.clearSimulatedLocations()
         simManager.flush()
@@ -493,7 +500,7 @@ struct ContentView: View {
                         HStack {
                             Image(systemName: engine.isSimulating ? "checkmark.circle.fill" : "stop.circle.fill")
                                 .foregroundColor(engine.isSimulating ? .green : .gray)
-                            Text(engine.isSimulating ? "正在模拟美国住宅环境" : "已停止模拟")
+                            Text(engine.isSimulating ? "正在模拟海外住宅环境" : "已停止模拟")
                                 .font(.headline)
                         }
                         Text("出口 IP: \(engine.exitIP)")
@@ -558,7 +565,7 @@ struct ContentView: View {
                                 ProgressView()
                                     .progressViewStyle(CircularProgressViewStyle(tint: .white))
                             }
-                            Text(engine.isSyncing ? "正在探测当前美国出口 IP..." : "立即同步当前 IP 定位与全局环境")
+                            Text(engine.isSyncing ? "正在探测当前海外出口 IP..." : "立即同步当前 IP 定位与全局环境")
                                 .font(.headline)
                         }
                         .foregroundColor(.white)
