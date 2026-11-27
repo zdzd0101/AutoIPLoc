@@ -59,9 +59,9 @@ Do not manually delete any `.jbroot-*` directory. Remove the Hook package throug
 Current audited source: `dcf860baa2a0ad877150d362fe9ca26f16ac8184`.
 A UI-only follow-up commit `0e1885688cdf9be20fc9a97fd9085edf025bde9e` makes private location simulation request status explicit; it does not change Hook targets or the private API call sequence.
 
-### Confirmed RootHide packaging blocker
+### CI package format versus the device-side RootHide Patcher step
 
-The current workflow manually stages the Hook under `deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries`, sets the install name to `/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib`, and emits DEB metadata with `Architecture: iphoneos-arm64`. It does not build through the RootHide Theos package scheme. RootHide's developer documentation describes a randomized jbroot, `@loader_path/.jbroot/...` dependency paths, and the RootHide package scheme / `jbroot()` path API. Therefore the current artifact has not been demonstrated to be a native RootHide package. Do not treat Build #193 or #194 as proof of RootHide installation compatibility.
+The CI workflow produces a conventional rootless input package under `deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries` with `Architecture: iphoneos-arm64`; it does not itself use the RootHide Theos package scheme. This alone does not establish that the package cannot be installed on the user's device, because the user's phone has RootHide Patcher installed and the observed 4.3.5 files strongly match the Patcher's AutoPatches conversion layout (see the correction section below). Do not treat a raw CI artifact as a tested RootHide installation until the exact device-side conversion mode and resulting live file paths are verified.
 
 ### Runtime root-selection mismatch
 
@@ -241,3 +241,29 @@ stat -f '%N type=%HT owner=%Su group=%Sg mode=%Lp' /var/containers/Bundle/Applic
 ```
 
 No package remove/reinstall, permission change, global injection toggle, or filesystem cleanup is authorized as part of this diagnostic step.
+
+
+## 2026-11-27 — missing Geo/Wi-Fi plist call-graph finding
+
+Static call-site inspection of the current `main.swift` found:
+
+- `syncEnvironment(forceReanchor:)` is defined but has no call site in `main.swift`.
+- The visible "查询当前出口 IP 地理信息" button calls only `refreshIPGeoInfo()`; that path fetches and displays IP database information and does not write Geo/Wi-Fi configuration files.
+- `commitSimulation()` (which writes the Geo plist and Wi-Fi plist) is called only by `syncEnvironment()`.
+- The visible `stopSimulation()` control can write disabled Geo/Wi-Fi state, but it only does so after the stop method returns success.
+- The Wi-Fi "换一批" action calls `regenerateWiFiList(save: true)`, which can write the Wi-Fi plist independently.
+
+Therefore the missing Geo plist is not, by itself, proof of cross-process permission failure: the current visible app UI has no active start/sync control reaching the Geo write path. This is a control-flow/UI reachability finding. It must be kept separate from the missing Hook status report, which is expected from a successfully initialized target process and remains unexplained.
+
+This audit does not reconnect or expose the previous profile-generation pipeline, does not add a new simulation trigger, and does not enable existing identity/network-obfuscation behavior. The user-facing IP database display remains a separate factual read-only path.
+
+## 2026-11-27 — RootHide file-mirror namespace caution
+
+RootHide's developer `filemirror.md` identifies `/var/containers` and `/var/mobile/Containers` as paths mirrored from the original iOS root filesystem into jbroot; it does not list `/var/mobile/Library` as one of those mirrored paths. Therefore, in a RootHide jbroot context, `/var/mobile/Library/Preferences` and `/var/mobile/Library/Logs` must not automatically be assumed to be the same directory as the original root filesystem's corresponding path. Verify both jbroot and `/rootfs` paths before concluding that configuration or crash-log files do not exist.
+
+Read-only comparison:
+- `/var/mobile/Library/Preferences` versus `/rootfs/var/mobile/Library/Preferences`
+- `/var/mobile/Library/Logs` versus `/rootfs/var/mobile/Library/Logs`
+- `/var/tmp` versus `/rootfs/var/tmp`
+
+This is a path-namespace hypothesis grounded in RootHide's file-mirror list, not yet a diagnosis of the current device.
