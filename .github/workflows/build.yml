@@ -72,6 +72,12 @@ jobs:
           grep -Fq "kConfigCacheRefreshInterval = 3.0" Tweak/AutoIPLocHook.m
           grep -Fq "g_geoConfigCacheInitialized" Tweak/AutoIPLocHook.m
           grep -Fq "g_wifiConfigCacheInitialized" Tweak/AutoIPLocHook.m
+          grep -Fq "g_geoConfigRefreshPending" Tweak/AutoIPLocHook.m
+          grep -Fq "g_wifiConfigRefreshPending" Tweak/AutoIPLocHook.m
+          grep -Fq "ReadGeoConfigFromDisk" Tweak/AutoIPLocHook.m
+          grep -Fq "ReadWiFiConfigFromDisk" Tweak/AutoIPLocHook.m
+          grep -Fq "InitializeConfigCaches();" Tweak/AutoIPLocHook.m
+          grep -Fq "dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0)" Tweak/AutoIPLocHook.m
           grep -Fq "methodMatchesSignature" main.swift
           grep -Fq "method_copyArgumentType" main.swift
           grep -Fq "hook_freeifaddrs" Tweak/AutoIPLocHook.m
@@ -160,7 +166,7 @@ jobs:
           EOF
 
           INSTALLED_SIZE=$(du -sk deb_pkg/var | cut -f1)
-          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 4.3.3\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Fat arm64+arm64e XPC-level CLLocationSourceInformation scrub & RootHide ElleKit stealth hook\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
+          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 4.3.4\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Fat arm64+arm64e XPC-level CLLocationSourceInformation scrub & RootHide ElleKit stealth hook\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
 
           chmod 0755 deb_pkg/DEBIAN
           chmod 0755 deb_pkg/DEBIAN/postinst

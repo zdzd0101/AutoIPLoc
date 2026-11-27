@@ -21,6 +21,7 @@
 #import <pthread.h>
 #import <time.h>
 #import <os/lock.h>
+#import <dispatch/dispatch.h>
 
 #if __has_feature(ptrauth_calls)
 #import <ptrauth.h>
@@ -225,66 +226,132 @@ static double g_geoConfigCacheUpdatedAt = 0.0;
 static double g_wifiConfigCacheUpdatedAt = 0.0;
 static BOOL g_geoConfigCacheInitialized = NO;
 static BOOL g_wifiConfigCacheInitialized = NO;
+static BOOL g_geoConfigRefreshPending = NO;
+static BOOL g_wifiConfigRefreshPending = NO;
 static const double kConfigCacheRefreshInterval = 3.0;
 
-static NSDictionary *LoadGeoConfig(void) {
-    os_unfair_lock_lock(&g_configCacheLock);
+// The only synchronous reads occur once during constructor initialization,
+// before filesystem hooks are installed. TTL refreshes never block hot paths.
+static NSDictionary *ReadGeoConfigFromDisk(void) {
+    NSDictionary *config = nil;
+    BeginInternalIO();
     @try {
-        const double now = MonotonicTimeSeconds();
-        if (g_geoConfigCacheInitialized &&
-            (now - g_geoConfigCacheUpdatedAt) >= 0.0 &&
-            (now - g_geoConfigCacheUpdatedAt) < kConfigCacheRefreshInterval) {
-            return g_geoConfigCache;
+        config = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/com.autoiploc.geo.plist"];
+        if (!config) {
+            config = [NSDictionary dictionaryWithContentsOfFile:@"/var/tmp/com.autoiploc.geo.plist"];
         }
+    } @finally {
+        EndInternalIO();
+    }
+    return config;
+}
 
-        NSDictionary *config = nil;
-        BeginInternalIO();
-        @try {
-            config = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/com.autoiploc.geo.plist"];
-            if (!config) {
-                config = [NSDictionary dictionaryWithContentsOfFile:@"/var/tmp/com.autoiploc.geo.plist"];
-            }
-        } @finally {
-            EndInternalIO();
+static NSDictionary *ReadWiFiConfigFromDisk(void) {
+    NSDictionary *config = nil;
+    BeginInternalIO();
+    @try {
+        config = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/com.autoiploc.wifi.plist"];
+        if (!config) {
+            config = [NSDictionary dictionaryWithContentsOfFile:@"/var/tmp/com.autoiploc.wifi.plist"];
         }
+    } @finally {
+        EndInternalIO();
+    }
+    return config;
+}
 
-        g_geoConfigCache = config;
+static void InitializeConfigCaches(void) {
+    os_unfair_lock_lock(&g_configCacheLock);
+    const BOOL needGeo = !g_geoConfigCacheInitialized && !g_geoConfigRefreshPending;
+    const BOOL needWiFi = !g_wifiConfigCacheInitialized && !g_wifiConfigRefreshPending;
+    if (needGeo) g_geoConfigRefreshPending = YES;
+    if (needWiFi) g_wifiConfigRefreshPending = YES;
+    os_unfair_lock_unlock(&g_configCacheLock);
+
+    NSDictionary *geo = needGeo ? ReadGeoConfigFromDisk() : nil;
+    NSDictionary *wifi = needWiFi ? ReadWiFiConfigFromDisk() : nil;
+    const double now = MonotonicTimeSeconds();
+
+    os_unfair_lock_lock(&g_configCacheLock);
+    if (needGeo) {
+        g_geoConfigCache = [geo copy];
         g_geoConfigCacheUpdatedAt = now;
         g_geoConfigCacheInitialized = YES;
-        return g_geoConfigCache;
-    } @finally {
-        os_unfair_lock_unlock(&g_configCacheLock);
+        g_geoConfigRefreshPending = NO;
     }
+    if (needWiFi) {
+        g_wifiConfigCache = [wifi copy];
+        g_wifiConfigCacheUpdatedAt = now;
+        g_wifiConfigCacheInitialized = YES;
+        g_wifiConfigRefreshPending = NO;
+    }
+    os_unfair_lock_unlock(&g_configCacheLock);
+}
+
+static NSDictionary *LoadGeoConfig(void) {
+    NSDictionary *snapshot = nil;
+    BOOL shouldRefresh = NO;
+    const double now = MonotonicTimeSeconds();
+
+    os_unfair_lock_lock(&g_configCacheLock);
+    snapshot = g_geoConfigCache;
+    const BOOL expired = !g_geoConfigCacheInitialized ||
+                         now < g_geoConfigCacheUpdatedAt ||
+                         (now - g_geoConfigCacheUpdatedAt) >= kConfigCacheRefreshInterval;
+    if (expired && !g_geoConfigRefreshPending) {
+        g_geoConfigRefreshPending = YES;
+        shouldRefresh = YES;
+    }
+    os_unfair_lock_unlock(&g_configCacheLock);
+
+    if (shouldRefresh) {
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            @autoreleasepool {
+                NSDictionary *fresh = [ReadGeoConfigFromDisk() copy];
+                const double refreshedAt = MonotonicTimeSeconds();
+                os_unfair_lock_lock(&g_configCacheLock);
+                if (fresh) g_geoConfigCache = fresh;
+                g_geoConfigCacheUpdatedAt = refreshedAt;
+                g_geoConfigCacheInitialized = YES;
+                g_geoConfigRefreshPending = NO;
+                os_unfair_lock_unlock(&g_configCacheLock);
+            }
+        });
+    }
+    return snapshot;
 }
 
 static NSDictionary *LoadWiFiConfig(void) {
+    NSDictionary *snapshot = nil;
+    BOOL shouldRefresh = NO;
+    const double now = MonotonicTimeSeconds();
+
     os_unfair_lock_lock(&g_configCacheLock);
-    @try {
-        const double now = MonotonicTimeSeconds();
-        if (g_wifiConfigCacheInitialized &&
-            (now - g_wifiConfigCacheUpdatedAt) >= 0.0 &&
-            (now - g_wifiConfigCacheUpdatedAt) < kConfigCacheRefreshInterval) {
-            return g_wifiConfigCache;
-        }
-
-        NSDictionary *config = nil;
-        BeginInternalIO();
-        @try {
-            config = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/com.autoiploc.wifi.plist"];
-            if (!config) {
-                config = [NSDictionary dictionaryWithContentsOfFile:@"/var/tmp/com.autoiploc.wifi.plist"];
-            }
-        } @finally {
-            EndInternalIO();
-        }
-
-        g_wifiConfigCache = config;
-        g_wifiConfigCacheUpdatedAt = now;
-        g_wifiConfigCacheInitialized = YES;
-        return g_wifiConfigCache;
-    } @finally {
-        os_unfair_lock_unlock(&g_configCacheLock);
+    snapshot = g_wifiConfigCache;
+    const BOOL expired = !g_wifiConfigCacheInitialized ||
+                         now < g_wifiConfigCacheUpdatedAt ||
+                         (now - g_wifiConfigCacheUpdatedAt) >= kConfigCacheRefreshInterval;
+    if (expired && !g_wifiConfigRefreshPending) {
+        g_wifiConfigRefreshPending = YES;
+        shouldRefresh = YES;
     }
+    os_unfair_lock_unlock(&g_configCacheLock);
+
+    if (shouldRefresh) {
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            @autoreleasepool {
+                NSDictionary *fresh = [ReadWiFiConfigFromDisk() copy];
+                const double refreshedAt = MonotonicTimeSeconds();
+                os_unfair_lock_lock(&g_configCacheLock);
+                if (fresh) g_wifiConfigCache = fresh;
+                g_wifiConfigCacheUpdatedAt = refreshedAt;
+                g_wifiConfigCacheInitialized = YES;
+                g_wifiConfigRefreshPending = NO;
+                os_unfair_lock_unlock(&g_configCacheLock);
+            }
+        });
+    }
+    return snapshot;
 }
 
 static NSString *GetTargetCountryCode(void) {
@@ -895,6 +962,7 @@ static void AutoIPLocHookEntry(void) {
         dlopen("/System/Library/Frameworks/CoreTelephony.framework/CoreTelephony", RTLD_NOW);
         dlopen("/System/Library/PrivateFrameworks/GeoServices.framework/GeoServices", RTLD_NOW);
         ResolveElleKitRuntime((void *)&AutoIPLocHookEntry);
+        InitializeConfigCaches();
 
         NSString *initTZ = GetTargetTimeZoneName();
         if (initTZ) {
@@ -1008,7 +1076,7 @@ static void AutoIPLocHookEntry(void) {
 
         NSDictionary *status = @{
             @"active": @(g_installedCHookCount > 0 || g_installedObjCHookCount > 0),
-            @"version": @"4.3.3",
+            @"version": @"4.3.4",
             @"lastProc": [NSString stringWithUTF8String:prog],
             @"cHookReady": @(orig_dladdr != NULL && orig_getifaddrs != NULL && orig_freeifaddrs != NULL),
             @"cHookCount": @(g_installedCHookCount),
