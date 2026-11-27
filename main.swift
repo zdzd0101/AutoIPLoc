@@ -94,7 +94,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
                 options: 0
             )
         } catch {
-            statusError = "共享配置序列化失败：\\(error.localizedDescription)"
+            statusError = "共享配置序列化失败：\(error.localizedDescription)"
             return
         }
 
@@ -133,14 +133,14 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
                 }
                 successfulWrites += 1
             } catch {
-                failedPaths.append("\\(path): \\(error.localizedDescription)")
+                failedPaths.append("\(path): \(error.localizedDescription)")
             }
         }
 
         if successfulWrites == 0 {
-            statusError = "共享配置写入失败，所有配置路径均不可写：\\(failedPaths.joined(separator: "；"))"
+            statusError = "共享配置写入失败，所有配置路径均不可写：\(failedPaths.joined(separator: "；"))"
         } else if !failedPaths.isEmpty {
-            statusError = "共享配置仅写入\\(successfulWrites)个位置；失败路径：\\(failedPaths.joined(separator: "；"))"
+            statusError = "共享配置仅写入\(successfulWrites)个位置；失败路径：\(failedPaths.joined(separator: "；"))"
         }
     }
 
@@ -333,10 +333,10 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
 
             hookIsActive = false
             if ts > 0 && ageSec <= 300 && hookOk {
-                hookStatusText = "检测到近期加载报告 v\\(ver)（\\(proc) · \\(ageSec)秒前）；仍未证明所有目标进程均已加载"
+                hookStatusText = "检测到近期加载报告 v\(ver)（\(proc) · \(ageSec)秒前）；仍未证明所有目标进程均已加载"
                 return
             } else if ts > 0 && ageSec > 300 {
-                hookStatusText = "最近一次加载报告已过 \\(ageSec / 60) 分钟；当前目标进程状态未验证"
+                hookStatusText = "最近一次加载报告已过 \(ageSec / 60) 分钟；当前目标进程状态未验证"
                 return
             } else {
                 hookStatusText = "检测到加载报告，但关键字段不完整，无法确认实际功能状态"
@@ -391,7 +391,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
                 if isValidGeoProfile(profile) {
                     lockedProfile = profile
                     isSimulating = startLocationSimulation(for: profile)
-                    exitIP = "\\(ip) [\\(cc)]"
+                    exitIP = "\(ip) [\(cc)]"
                     timezoneName = tz
                     coordText = String(format: "%.5f, %.5f", lat, lon)
                     streetAddress = profile.street
