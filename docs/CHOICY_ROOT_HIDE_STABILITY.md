@@ -20,7 +20,7 @@ On the device, verify in Sileo (same RootHide repository/bootstrap):
 4. No duplicate Choicy packages are installed from different repositories.
 5. After package changes, close Settings completely and reopen it. Do not leave global tweak injection enabled if it causes application crashes.
 
-RootHide's package index has listed Choicy 1.5.4 for arm64e with dependencies on mobilesubstrate, AltList, and PreferenceLoader. Choicy's upstream changelog lists 1.5.4-2 (12 August 2026) and notes earlier iOS 16 preference fixes in 1.5.3-2. Use the version provided for the installed RootHide bootstrap rather than mixing a normal-rootless package with a RootHide package.
+The RootHide package index currently surfaces a Choicy 1.5.4 arm64e package, while Choicy's upstream changelog lists 1.5.4-2 dated 12 August 2026. The upstream package declares dependencies on mobilesubstrate, PreferenceLoader, and AltList (com.opa334.altlist >= 1.0.4). The exact installed package and source on the device are unknown; verify them in Sileo rather than assuming the latest upstream release is installed. Do not mix a conventional rootless package with a RootHide package.
 
 ## Tweak Injection crash isolation
 
@@ -52,3 +52,54 @@ It intentionally preserves:
 - `com.autoiploc.wifi.plist`
 
 Do not manually delete any `.jbroot-*` directory. Remove the Hook package through Sileo and the app through TrollStore separately. Keep a copy of the last working TIPA/DEB before upgrading. Real-device removal and rollback still require device testing.
+
+
+## Re-audit against the current branch HEAD (2026-11-27)
+
+Current audited source: `dcf860baa2a0ad877150d362fe9ca26f16ac8184`.
+A UI-only follow-up commit `0e1885688cdf9be20fc9a97fd9085edf025bde9e` makes private location simulation request status explicit; it does not change Hook targets or the private API call sequence.
+
+### Confirmed RootHide packaging blocker
+
+The current workflow manually stages the Hook under `deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries`, sets the install name to `/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib`, and emits DEB metadata with `Architecture: iphoneos-arm64`. It does not build through the RootHide Theos package scheme. RootHide's developer documentation describes a randomized jbroot, `@loader_path/.jbroot/...` dependency paths, and the RootHide package scheme / `jbroot()` path API. Therefore the current artifact has not been demonstrated to be a native RootHide package. Do not treat Build #193 or #194 as proof of RootHide installation compatibility.
+
+### Runtime root-selection mismatch
+
+The package `postinst` writes every discovered `.jbroot-*` directory to `/var/tmp/com.autoiploc.jbroot.txt`. The Hook's `ResolveElleKitRuntime()` tries the saved list before deriving a root from the currently loaded Hook image with `dladdr()`. The main app's new resolver only reports candidate files; it does not control or validate this runtime loader sequence. Thus the app can report root ambiguity while the Hook may still attempt roots in saved-list order. This is a verified code-path mismatch, not proof that a particular device loaded the wrong library.
+
+This re-audit does not change the runtime loader or broaden injection. The loader is part of the pre-existing Hook behavior and requires a separate, safety-scoped compatibility decision before any change.
+
+### RootHide Bootstrap injection constraints
+
+If the device is running the official RootHide Bootstrap model, its README says third-party app injection is off by default and controlled per application from App List; it also says injection into SpringBoard or daemons is not supported by its official mechanism. AutoIPLoc's filter lists `com.apple.geod` and `com.apple.locationd`, which are system services. First identify the exact installed RootHide/Dopamine product and version. Do not enable a broad global injection switch as a workaround, and do not assume that app injection permission enables daemon injection.
+
+### File-access evidence still missing
+
+- The app's `writeSharedPlist` sets configuration files to mode `0600` and validates by reading them back as the app. This proves app-side read-back only.
+- Hook processes read fixed paths under `/var/mobile/Library/Preferences` and `/var/tmp`; their real UID/GID and access result must be confirmed on the device.
+- The Hook records Geo/Wi-Fi readability per reporting process, but its two status-file `writeToFile` return values are currently ignored. A missing status file is therefore not a complete diagnosis of why reporting failed.
+- Do not relax configuration permissions to world-readable without confirming the target service identities and data-sharing requirement.
+
+### Private API and geod state semantics
+
+- `CLSimulationManager` methods are signature-checked as void methods. The current code submits start/stop/clear calls but receives no success result from those calls. The app UI follow-up now says that a request was sent and the system effect is unverified; it does not claim successful simulation.
+- Cache maintenance deletes only the Maps and GeoServices cache directories. No service restart, fresh location read-back, or recovery of `geod` is verified by this action.
+- A successful host-side build cannot perform either device-level verification.
+
+### Choicy package verification
+
+Choicy upstream 1.5.4-2 is listed in its changelog (12 August 2026); the RootHide package index may expose a different package build/version. Verify the installed package ID, version, architecture, source, PreferenceLoader, and AltList dependency on the device. The current AutoIPLoc filter does not explicitly list `com.apple.Preferences`, and the constructor returns for process name `Preferences`; this reduces evidence for a direct AutoIPLoc Settings hook but does not identify the cause of the reported crashes. Obtain the Settings and affected-app crash logs before attributing them to AutoIPLoc.
+
+### Acceptance status
+
+The C helper tests cover clone ownership, out-of-order releases, duplicate release, and concurrent registry lifecycle. The CI workflow runs ASan/UBSan with `ASAN_OPTIONS=detect_leaks=0`; therefore leak detection itself is not established by that job. CI also does not exercise RootHide's package manager, real process credentials, private CoreLocation simulation, geod recovery, Choicy pane loading, or on-device crash stability.
+
+Keep PR #1 Draft. Required device evidence remains: installed RootHide/Dopamine version and package scheme; Choicy/PreferenceLoader/AltList package metadata; per-process injection state; file owner/mode and read test from each target; Settings and app crash reports; fresh CoreLocation read-back after a simulation request; post-cache-cleanup location recovery; and install/upgrade/uninstall/rollback results.
+
+### Primary references
+
+- RootHide developer path and package guidance: https://github.com/RootHide/Developer/blob/main/roothide.md
+- RootHide path API: https://github.com/RootHide/Developer/blob/main/interface.md
+- RootHide Bootstrap injection model: https://github.com/RootHide/Bootstrap#usage
+- Choicy source constants for PreferenceLoader and Preferences: https://github.com/opa334/Choicy/blob/master/Shared.h
+- Choicy upstream changelog: https://opa334.github.io/depic/Choicy/changelog.html
