@@ -55,7 +55,7 @@ jobs:
           grep -Fq "inet_pton(AF_INET" main.swift
           grep -Fq "inet_pton(AF_INET6" main.swift
           grep -Fq "isValidGeoProfile(profile)" main.swift
-          grep -Fq "reports.max(by:" main.swift
+          grep -Fq "activeReports.max(by:" main.swift
           echo "Checking Hook source safety invariants..."
           grep -Fq "MethodHasExpectedSignature" Tweak/AutoIPLocHook.m
           grep -Fq "object_setIvarWithStrongDefault" Tweak/AutoIPLocHook.m
