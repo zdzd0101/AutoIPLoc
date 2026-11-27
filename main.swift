@@ -15,6 +15,16 @@ struct GeoProfile: Codable {
     var street: String
     var zip: String
     var isp: String
+    var isProxy: Bool?
+    var isHosting: Bool?
+}
+
+struct AuditItem: Identifiable {
+    let id = UUID()
+    let title: String
+    let detail: String
+    let passed: Bool
+    let isWarning: Bool
 }
 
 final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegate {
@@ -22,17 +32,34 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
 
     @Published var isSimulating = false
     @Published var isSyncing = false
+    @Published var isAuditing = false
     @Published var statusError: String? = nil
     @Published var exitIP = "未获取 [--]"
+    @Published var ispText = "--"
     @Published var timezoneName = "- (待同步)"
     @Published var coordText = "- (0.0000, 0.0000)"
+    @Published var mappedProfileText = "待同步"
     @Published var streetAddress = "等待同步解析附近精确街道地址..."
     @Published var zipCode = "--"
     @Published var hookStatusText = "正在检测插件状态..."
     @Published var hookIsActive = false
     @Published var autoSyncOnNetworkChange = true
     @Published var lockSessionGeo = true
+    @Published var spoofLocale = true {
+        didSet { persistCurrentGeoIfActive() }
+    }
+    @Published var spoofCarrier = true {
+        didSet { persistCurrentGeoIfActive() }
+    }
+    @Published var naturalGpsJitter = true {
+        didSet {
+            if isSimulating {
+                if naturalGpsJitter { startGpsDriftTimer() } else { stopGpsDriftTimer() }
+            }
+        }
+    }
     @Published var wifiList: [[String: String]] = []
+    @Published var auditItems: [AuditItem] = []
 
     private let geoPlistPaths = [
         "/var/mobile/Library/Preferences/com.autoiploc.geo.plist",
@@ -53,6 +80,8 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     private let monitorQueue = DispatchQueue(label: "com.autoiploc.netmonitor")
     private var lastPathStatus: NWPath.Status?
     private var lockedProfile: GeoProfile?
+    private var lastWiFiCountry: String = "US"
+    private var gpsDriftTimer: Timer?
 
     override init() {
         super.init()
@@ -61,6 +90,13 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         loadSavedState()
         refreshHookStatus()
         startNetworkMonitor()
+    }
+
+    private func persistCurrentGeoIfActive() {
+        if isSimulating, let profile = lockedProfile {
+            writeGeoPlist(profile)
+            updateMappedProfileSummary(for: profile.countryCode)
+        }
     }
 
     private func writeSharedPlist(_ dict: [String: Any], paths: [String]) {
@@ -78,6 +114,29 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             }
         }
         return nil
+    }
+
+    private func updateMappedProfileSummary(for cc: String) {
+        let map: [String: (String, String)] = [
+            "US": ("T-Mobile (310/260)", "en_US"),
+            "GB": ("Vodafone UK (234/15)", "en_GB"),
+            "CA": ("Rogers (302/720)", "en_CA"),
+            "AU": ("Telstra (505/01)", "en_AU"),
+            "JP": ("NTT DOCOMO (440/10)", "ja_JP"),
+            "DE": ("Telekom.de (262/01)", "de_DE"),
+            "FR": ("Orange F (208/01)", "fr_FR"),
+            "SG": ("Singtel (525/01)", "en_SG"),
+            "KR": ("SKTelecom (450/05)", "ko_KR"),
+            "TW": ("Chunghwa (466/92)", "zh_TW"),
+            "NL": ("KPN (204/08)", "nl_NL"),
+            "IT": ("TIM (222/01)", "it_IT"),
+            "ES": ("Movistar (214/07)", "es_ES"),
+            "BR": ("Vivo (724/06)", "pt_BR")
+        ]
+        let (carrier, locale) = map[cc.uppercased()] ?? ("T-Mobile (310/260)", "en_US")
+        let carrierPart = spoofCarrier ? carrier : "原机运营商"
+        let localePart = spoofLocale ? locale : "原机语言区"
+        self.mappedProfileText = "\(carrierPart) · \(localePart)"
     }
 
     private func findInstalledHookDylib() -> String? {
@@ -100,7 +159,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         for path in hookStatusPaths {
             if let dict = NSDictionary(contentsOfFile: path) as? [String: Any],
                let active = dict["active"] as? Bool, active {
-                let ver = dict["version"] as? String ?? "4.4.0"
+                let ver = dict["version"] as? String ?? "4.5.0"
                 let proc = dict["lastProc"] as? String ?? "目标应用"
                 let hookOk = (dict["cHookReady"] as? Bool) ?? false
                 let ts = (dict["timestamp"] as? Double) ?? 0
@@ -112,7 +171,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
                     return
                 } else if ts > 0 && ageSec > 300 {
                     self.hookIsActive = false
-                    self.hookStatusText = "上次注入已过 \(ageSec / 60) 分钟（请确认 Dopamine 插件注入已开启并重开目标 App）"
+                    self.hookStatusText = "上次注入已过 \(ageSec / 60) 分钟（请确认插件注入已开启并重开目标 App）"
                     return
                 }
             }
@@ -149,30 +208,42 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     }
 
     private func loadSavedState() {
-        if let dict = readSharedPlist(paths: geoPlistPaths),
-           let enabled = dict["enabled"] as? Bool, enabled,
-           let ip = dict["ip"] as? String,
-           let cc = dict["countryCode"] as? String,
-           let tz = dict["timezone"] as? String,
-           let lat = dict["lat"] as? Double,
-           let lon = dict["lon"] as? Double {
-            let street = dict["street"] as? String ?? "742 Evergreen Terrace"
-            let zip = dict["zip"] as? String ?? "10001"
-            let city = dict["city"] as? String ?? ""
-            let region = dict["region"] as? String ?? ""
-            let isp = dict["isp"] as? String ?? ""
-            let profile = GeoProfile(
-                ip: ip, countryCode: cc, region: region, city: city,
-                timezone: tz, latitude: lat, longitude: lon,
-                street: street, zip: zip, isp: isp
-            )
-            self.lockedProfile = profile
-            self.isSimulating = true
-            self.exitIP = "\(ip) [\(cc)]"
-            self.timezoneName = tz
-            self.coordText = String(format: "%.5f, %.5f", lat, lon)
-            self.streetAddress = street
-            self.zipCode = zip
+        if let dict = readSharedPlist(paths: geoPlistPaths) {
+            if let sl = dict["spoofLocale"] as? Bool { self.spoofLocale = sl }
+            if let sc = dict["spoofCarrier"] as? Bool { self.spoofCarrier = sc }
+
+            if let enabled = dict["enabled"] as? Bool, enabled,
+               let ip = dict["ip"] as? String,
+               let cc = dict["countryCode"] as? String,
+               let tz = dict["timezone"] as? String,
+               let lat = dict["lat"] as? Double,
+               let lon = dict["lon"] as? Double {
+                let street = dict["street"] as? String ?? "742 Evergreen Terrace"
+                let zip = dict["zip"] as? String ?? "10001"
+                let city = dict["city"] as? String ?? ""
+                let region = dict["region"] as? String ?? ""
+                let isp = dict["isp"] as? String ?? "Residential Broadband"
+                let profile = GeoProfile(
+                    ip: ip, countryCode: cc, region: region, city: city,
+                    timezone: tz, latitude: lat, longitude: lon,
+                    street: street, zip: zip, isp: isp,
+                    isProxy: dict["isProxy"] as? Bool,
+                    isHosting: dict["isHosting"] as? Bool
+                )
+                self.lockedProfile = profile
+                self.lastWiFiCountry = cc
+                self.isSimulating = true
+                self.exitIP = "\(ip) [\(cc)]"
+                self.ispText = isp
+                self.timezoneName = tz
+                self.coordText = String(format: "%.5f, %.5f", lat, lon)
+                self.streetAddress = street
+                self.zipCode = zip
+                self.updateMappedProfileSummary(for: cc)
+                if self.naturalGpsJitter {
+                    self.startGpsDriftTimer()
+                }
+            }
         }
         if let wDict = readSharedPlist(paths: wifiPlistPaths),
            let nets = wDict["networks"] as? [[String: String]] {
@@ -187,7 +258,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         statusError = nil
 
         let endpoints = [
-            "http://ip-api.com/json/?fields=status,countryCode,regionName,city,zip,lat,lon,timezone,isp,query",
+            "http://ip-api.com/json/?fields=status,countryCode,regionName,city,zip,lat,lon,timezone,isp,org,proxy,hosting,query",
             "https://ipwho.is/",
             "https://freeipapi.com/api/json",
             "https://ipinfo.io/json",
@@ -287,6 +358,11 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             ?? (json["zipCode"] as? String)
             ?? ""
 
+        let isProxy = (json["proxy"] as? Bool)
+            ?? ((json["security"] as? [String: Any])?["proxy"] as? Bool)
+        let isHosting = (json["hosting"] as? Bool)
+            ?? ((json["security"] as? [String: Any])?["hosting"] as? Bool)
+
         var tz = "America/New_York"
         if let tzDict = json["timezone"] as? [String: Any], let tzId = tzDict["id"] as? String, !tzId.isEmpty {
             tz = tzId
@@ -317,7 +393,8 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         return GeoProfile(
             ip: ip, countryCode: cc, region: region, city: city,
             timezone: tz, latitude: lat, longitude: lon,
-            street: "", zip: zip, isp: isp
+            street: "", zip: zip, isp: isp,
+            isProxy: isProxy, isHosting: isHosting
         )
     }
 
@@ -325,6 +402,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         if lockSessionGeo, isSimulating, let locked = lockedProfile,
            locked.countryCode == raw.countryCode, locked.timezone == raw.timezone, !forceReanchor {
             self.exitIP = "\(raw.ip) [\(raw.countryCode)]"
+            self.ispText = raw.isp
             self.isSyncing = false
             return
         }
@@ -333,14 +411,17 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         let jitterLon = raw.longitude + Double.random(in: -0.0065...0.0065)
         let loc = CLLocation(latitude: jitterLat, longitude: jitterLon)
 
-        let fallbackStreet = "\(Int.random(in: 112...4890)) Oakridge Ave, \(raw.city.isEmpty ? "Austin" : raw.city), \(raw.region.isEmpty ? "TX" : raw.region)"
+        let fallbackCity = raw.city.isEmpty ? (raw.countryCode == "US" ? "Austin" : raw.countryCode) : raw.city
+        let fallbackRegion = raw.region.isEmpty ? raw.countryCode : raw.region
+        let fallbackStreet = "\(Int.random(in: 112...4890)) Oakridge Ave, \(fallbackCity), \(fallbackRegion)"
         let fallbackZip = raw.zip.isEmpty ? String(Int.random(in: 10001...98199)) : raw.zip
 
         let finalized = GeoProfile(
             ip: raw.ip, countryCode: raw.countryCode, region: raw.region,
             city: raw.city, timezone: raw.timezone,
             latitude: jitterLat, longitude: jitterLon,
-            street: fallbackStreet, zip: fallbackZip, isp: raw.isp
+            street: fallbackStreet, zip: fallbackZip, isp: raw.isp,
+            isProxy: raw.isProxy, isHosting: raw.isHosting
         )
         self.commitSimulation(finalized)
 
@@ -348,8 +429,8 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             guard let self = self, let pm = placemarks?.first else { return }
             let num = pm.subThoroughfare ?? "\(Int.random(in: 105...3980))"
             let road = pm.thoroughfare ?? "Maple Creek Dr"
-            let c = pm.locality ?? (raw.city.isEmpty ? "Dallas" : raw.city)
-            let st = pm.administrativeArea ?? (raw.region.isEmpty ? "TX" : raw.region)
+            let c = pm.locality ?? fallbackCity
+            let st = pm.administrativeArea ?? fallbackRegion
             let resolvedStreet = "\(num) \(road), \(c), \(st)"
             let resolvedZip = (pm.postalCode?.isEmpty == false) ? pm.postalCode! : fallbackZip
 
@@ -367,8 +448,10 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     }
 
     private func writeGeoPlist(_ profile: GeoProfile) {
-        let geoDict: [String: Any] = [
+        var geoDict: [String: Any] = [
             "enabled": true,
+            "spoofLocale": spoofLocale,
+            "spoofCarrier": spoofCarrier,
             "ip": profile.ip,
             "countryCode": profile.countryCode,
             "region": profile.region,
@@ -380,32 +463,19 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             "zip": profile.zip,
             "isp": profile.isp
         ]
+        if let proxy = profile.isProxy { geoDict["isProxy"] = proxy }
+        if let hosting = profile.isHosting { geoDict["isHosting"] = hosting }
         writeSharedPlist(geoDict, paths: geoPlistPaths)
     }
 
-    private func commitSimulation(_ profile: GeoProfile) {
-        self.lockedProfile = profile
-        self.isSimulating = true
-        self.isSyncing = false
-        self.statusError = nil
-        self.exitIP = "\(profile.ip) [\(profile.countryCode)]"
-        self.timezoneName = profile.timezone
-        self.coordText = String(format: "%.5f, %.5f", profile.latitude, profile.longitude)
-        self.streetAddress = profile.street
-        self.zipCode = profile.zip
-
-        if self.wifiList.isEmpty {
-            regenerateWiFiList(save: false)
-        }
-
-        writeGeoPlist(profile)
-        saveWiFiPlist(enabled: true)
-
+    private func pushSimulatedCoordinate(lat: Double, lon: Double) {
+        let hAcc = naturalGpsJitter ? Double.random(in: 5.5...14.5) : 5.0
+        let vAcc = naturalGpsJitter ? Double.random(in: 4.0...11.0) : 8.0
         let simLocation = CLLocation(
-            coordinate: CLLocationCoordinate2D(latitude: profile.latitude, longitude: profile.longitude),
+            coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lon),
             altitude: Double.random(in: 18.0...145.0),
-            horizontalAccuracy: 5.0,
-            verticalAccuracy: 8.0,
+            horizontalAccuracy: hAcc,
+            verticalAccuracy: vAcc,
             course: -1,
             speed: 0,
             timestamp: Date()
@@ -417,11 +487,60 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         simManager.startLocationSimulation()
     }
 
-    func regenerateWiFiList(save: Bool = true) {
-        let prefixes = [
-            "Xfinity", "SpectrumSetup", "ATT-FIBER", "Fios",
-            "MySpectrumWiFi", "NETGEAR", "Linksys", "HOME-WIFI"
+    private func startGpsDriftTimer() {
+        stopGpsDriftTimer()
+        gpsDriftTimer = Timer.scheduledTimer(withTimeInterval: 45.0, repeats: true) { [weak self] _ in
+            guard let self = self, self.isSimulating, self.naturalGpsJitter, let anchor = self.lockedProfile else { return }
+            let dLat = anchor.latitude + Double.random(in: -0.000025...0.000025)
+            let dLon = anchor.longitude + Double.random(in: -0.000025...0.000025)
+            self.pushSimulatedCoordinate(lat: dLat, lon: dLon)
+        }
+    }
+
+    private func stopGpsDriftTimer() {
+        gpsDriftTimer?.invalidate()
+        gpsDriftTimer = nil
+    }
+
+    private func commitSimulation(_ profile: GeoProfile) {
+        self.lockedProfile = profile
+        self.isSimulating = true
+        self.isSyncing = false
+        self.statusError = nil
+        self.exitIP = "\(profile.ip) [\(profile.countryCode)]"
+        self.ispText = profile.isp
+        self.timezoneName = profile.timezone
+        self.coordText = String(format: "%.5f, %.5f", profile.latitude, profile.longitude)
+        self.streetAddress = profile.street
+        self.zipCode = profile.zip
+        self.updateMappedProfileSummary(for: profile.countryCode)
+
+        if self.wifiList.isEmpty || self.lastWiFiCountry != profile.countryCode {
+            self.lastWiFiCountry = profile.countryCode
+            regenerateWiFiList(for: profile.countryCode, save: false)
+        }
+
+        writeGeoPlist(profile)
+        saveWiFiPlist(enabled: true)
+        pushSimulatedCoordinate(lat: profile.latitude, lon: profile.longitude)
+        if naturalGpsJitter {
+            startGpsDriftTimer()
+        }
+    }
+
+    func regenerateWiFiList(for countryCode: String? = nil, save: Bool = true) {
+        let cc = (countryCode ?? lockedProfile?.countryCode ?? lastWiFiCountry).uppercased()
+        let prefixMap: [String: [String]] = [
+            "US": ["Xfinity", "SpectrumSetup", "ATT-FIBER", "Fios", "MySpectrumWiFi", "NETGEAR", "Linksys"],
+            "GB": ["BTWi-fi", "SKY", "VM", "TalkTalk", "Plusnet", "Vodafone", "EE-Hub"],
+            "JP": ["aterm", "Buffalo-A", "elecom", "docomo", "SoftBank", "TP-Link"],
+            "DE": ["FRITZ!Box", "WLAN", "Vodafone", "o2-WLAN", "Telekom"],
+            "CA": ["BELL", "ROGERS", "TELUS", "Shaw", "Videotron"],
+            "AU": ["Telstra", "Optus", "TPG", "Belong", "AussieBB"],
+            "SG": ["Singtel", "StarHub", "M1-Fibre", "MyRepublic", "ASUS"],
+            "KR": ["KT_GiGA", "SK_WiFiGIGA", "U+Net", "iptime"]
         ]
+        let prefixes = prefixMap[cc] ?? ["NETGEAR", "TP-Link", "ASUS", "Linksys", "HOME-WIFI"]
         let ouis = ["20:4E:7F", "00:26:F2", "E4:F0:42", "B8:3A:08", "C8:D7:19", "44:E9:DD"]
         var generated: [[String: String]] = []
 
@@ -434,6 +553,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             generated.append(["SSID": "\(p)-\(suffix)\(band)", "BSSID": mac])
         }
         self.wifiList = generated
+        self.lastWiFiCountry = cc
         if save {
             saveWiFiPlist(enabled: isSimulating)
         }
@@ -445,6 +565,103 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             "networks": wifiList
         ]
         writeSharedPlist(dict, paths: wifiPlistPaths)
+    }
+
+    func runEnvironmentAudit() {
+        guard !isAuditing else { return }
+        isAuditing = true
+        refreshHookStatus()
+
+        let group = DispatchGroup()
+        var ipv6LeakedIP: String? = nil
+        var ipRiskDetail = "未同步节点，请先点击同步"
+        var ipRiskPassed = false
+        var ipRiskWarn = true
+
+        if let p = lockedProfile {
+            if p.isHosting == true || p.isProxy == true {
+                let tags = [p.isHosting == true ? "机房(Hosting)" : nil, p.isProxy == true ? "代理(Proxy)" : nil].compactMap { $0 }.joined(separator: " / ")
+                ipRiskDetail = "\(p.ip) · 检测到风险标签: \(tags)（ISP: \(p.isp)）"
+                ipRiskPassed = false
+                ipRiskWarn = true
+            } else if p.isHosting == false && p.isProxy == false {
+                ipRiskDetail = "\(p.ip) · 住宅/非机房特征良好（ISP: \(p.isp)）"
+                ipRiskPassed = true
+                ipRiskWarn = false
+            } else {
+                ipRiskDetail = "\(p.ip) · ISP: \(p.isp)（当前接口未返回风险标签）"
+                ipRiskPassed = true
+                ipRiskWarn = true
+            }
+        }
+
+        group.enter()
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest = 3.5
+        cfg.timeoutIntervalForResource = 4.0
+        let session = URLSession(configuration: cfg)
+        if let v6Url = URL(string: "https://api6.ipify.org?format=json") {
+            session.dataTask(with: v6Url) { data, response, _ in
+                if let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
+                   let data = data,
+                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let ip = obj["ip"] as? String, ip.contains(":") {
+                    ipv6LeakedIP = ip
+                }
+                session.finishTasksAndInvalidate()
+                group.leave()
+            }.resume()
+        } else {
+            group.leave()
+        }
+
+        group.notify(queue: .main) { [weak self] in
+            guard let self = self else { return }
+            var results: [AuditItem] = []
+
+            results.append(AuditItem(
+                title: "底层隐身插件 (v4.5.0)",
+                detail: self.hookStatusText,
+                passed: self.hookIsActive,
+                isWarning: !self.hookIsActive
+            ))
+
+            results.append(AuditItem(
+                title: "出口 IP 纯净度",
+                detail: ipRiskDetail,
+                passed: ipRiskPassed,
+                isWarning: ipRiskWarn
+            ))
+
+            if let v6 = ipv6LeakedIP {
+                results.append(AuditItem(
+                    title: "IPv6 防泄露检测",
+                    detail: "检测到活跃 IPv6 出口 (\(v6))，建议在路由器或代理中关闭 IPv6 防止真实地址泄露",
+                    passed: false,
+                    isWarning: true
+                ))
+            } else {
+                results.append(AuditItem(
+                    title: "IPv6 防泄露检测",
+                    detail: "已阻断或无活跃 IPv6 泄露，纯 IPv4 出口正常",
+                    passed: true,
+                    isWarning: false
+                ))
+            }
+
+            let consistencyOk = self.isSimulating && self.lockedProfile != nil
+            results.append(AuditItem(
+                title: "定位 / 时区 / 运营商 / 语言联动",
+                detail: consistencyOk
+                    ? "\(self.lockedProfile!.countryCode) · \(self.timezoneName) · \(self.mappedProfileText)"
+                    : "尚未开启模拟，目标 App 将读取本机真实参数",
+                passed: consistencyOk,
+                isWarning: !consistencyOk
+            ))
+
+            self.auditItems = results
+            self.isAuditing = false
+        }
     }
 
     func resetAppleMapsCache() {
@@ -460,6 +677,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     }
 
     func stopSimulation() {
+        stopGpsDriftTimer()
         simManager.stopLocationSimulation()
         simManager.clearSimulatedLocations()
         simManager.flush()
@@ -467,13 +685,20 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         isSimulating = false
         lockedProfile = nil
         exitIP = "未获取 [--]"
+        ispText = "--"
         timezoneName = "- (待同步)"
         coordText = "- (0.0000, 0.0000)"
+        mappedProfileText = "已恢复原机参数"
         streetAddress = "等待同步解析附近精确街道地址..."
         zipCode = "--"
         statusError = nil
+        auditItems = []
 
-        let geoDict: [String: Any] = ["enabled": false]
+        let geoDict: [String: Any] = [
+            "enabled": false,
+            "spoofLocale": spoofLocale,
+            "spoofCarrier": spoofCarrier
+        ]
         writeSharedPlist(geoDict, paths: geoPlistPaths)
         saveWiFiPlist(enabled: false)
     }
@@ -496,6 +721,7 @@ struct ContentView: View {
                             .cornerRadius(10)
                     }
 
+                    // 核心状态卡片
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
                             Image(systemName: engine.isSimulating ? "checkmark.circle.fill" : "stop.circle.fill")
@@ -505,8 +731,14 @@ struct ContentView: View {
                         }
                         Text("出口 IP: \(engine.exitIP)")
                             .font(.subheadline.monospaced())
+                        Text("运营商/ISP: \(engine.ispText)")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
                         Text("全局时区: \(engine.timezoneName)")
                             .font(.subheadline)
+                        Text("伪造身份: \(engine.mappedProfileText)")
+                            .font(.caption.bold())
+                            .foregroundColor(.blue)
                         Text("模拟坐标: \(engine.coordText)")
                             .font(.caption.monospaced())
                             .foregroundColor(.secondary)
@@ -549,16 +781,7 @@ struct ContentView: View {
                     .background(Color(.secondarySystemBackground))
                     .cornerRadius(14)
 
-                    VStack(spacing: 10) {
-                        Toggle("网络与代理切换自动同步 IP + 时区 + Wi-Fi", isOn: $engine.autoSyncOnNetworkChange)
-                            .font(.subheadline)
-                        Toggle("防旋转 IP 跳变锁定（同会话固定坐标与时区）", isOn: $engine.lockSessionGeo)
-                            .font(.subheadline)
-                    }
-                    .padding()
-                    .background(Color(.secondarySystemBackground))
-                    .cornerRadius(14)
-
+                    // 主同步按钮
                     Button(action: { engine.syncEnvironment(forceReanchor: true) }) {
                         HStack(spacing: 8) {
                             if engine.isSyncing {
@@ -576,16 +799,68 @@ struct ContentView: View {
                     }
                     .disabled(engine.isSyncing)
 
-                    Button(action: { engine.resetAppleMapsCache() }) {
-                        Text("重置并恢复苹果国际原生地图（清除高德缓存）")
-                            .font(.subheadline.bold())
-                            .foregroundColor(.blue)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 12)
-                            .background(Color.blue.opacity(0.12))
-                            .cornerRadius(12)
+                    // 一键环境与防泄露体检
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            Text("环境一致性与防泄露体检")
+                                .font(.subheadline.bold())
+                            Spacer()
+                            Button(action: { engine.runEnvironmentAudit() }) {
+                                HStack(spacing: 4) {
+                                    if engine.isAuditing {
+                                        ProgressView().scaleEffect(0.75)
+                                    }
+                                    Text(engine.isAuditing ? "检测中..." : "开始体检")
+                                        .font(.caption.bold())
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(engine.isAuditing)
+                        }
+                        if engine.auditItems.isEmpty {
+                            Text("点击“开始体检”检测 IP 机房风险、IPv6 泄露及插件注入状态。")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        } else {
+                            ForEach(engine.auditItems) { item in
+                                HStack(alignment: .top, spacing: 8) {
+                                    Image(systemName: item.passed ? "checkmark.shield.fill" : (item.isWarning ? "exclamationmark.triangle.fill" : "xmark.octagon.fill"))
+                                        .foregroundColor(item.passed ? .green : (item.isWarning ? .orange : .red))
+                                        .font(.subheadline)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(item.title)
+                                            .font(.caption.bold())
+                                        Text(item.detail)
+                                            .font(.caption2)
+                                            .foregroundColor(.secondary)
+                                    }
+                                }
+                            }
+                        }
                     }
+                    .padding()
+                    .background(Color(.secondarySystemBackground))
+                    .cornerRadius(14)
 
+                    // 模块化风控开关
+                    VStack(spacing: 10) {
+                        Toggle("网络与代理切换自动同步 IP + 时区 + Wi-Fi", isOn: $engine.autoSyncOnNetworkChange)
+                            .font(.subheadline)
+                        Toggle("防旋转 IP 跳变锁定（同会话固定坐标与时区）", isOn: $engine.lockSessionGeo)
+                            .font(.subheadline)
+                        Divider()
+                        Toggle("伪造目标 App 语言与区域 (NSLocale)", isOn: $engine.spoofLocale)
+                            .font(.subheadline)
+                        Toggle("伪造运营商与 SIM 卡信息 (CTCarrier)", isOn: $engine.spoofCarrier)
+                            .font(.subheadline)
+                        Toggle("GPS 自然精度与微幅漂移保活（45秒刷新）", isOn: $engine.naturalGpsJitter)
+                            .font(.subheadline)
+                    }
+                    .padding()
+                    .background(Color(.secondarySystemBackground))
+                    .cornerRadius(14)
+
+                    // 周边 Wi-Fi 卡片
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
                             Text("已注入周边 Wi-Fi（\(engine.wifiList.count) 个）")
@@ -606,6 +881,16 @@ struct ContentView: View {
                     .background(Color(.secondarySystemBackground))
                     .cornerRadius(14)
 
+                    Button(action: { engine.resetAppleMapsCache() }) {
+                        Text("重置并恢复苹果国际原生地图（清除高德缓存）")
+                            .font(.subheadline.bold())
+                            .foregroundColor(.blue)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 12)
+                            .background(Color.blue.opacity(0.12))
+                            .cornerRadius(12)
+                    }
+
                     Button(action: { engine.stopSimulation() }) {
                         Text("一键停止模拟并立即恢复真实定位")
                             .font(.subheadline)
@@ -620,6 +905,7 @@ struct ContentView: View {
                 engine.refreshHookStatus()
             }
         }
+        .navigationViewStyle(StackNavigationViewStyle())
     }
 }
 
