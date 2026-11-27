@@ -22,6 +22,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     static let shared = LocationEngine()
 
     @Published var isSimulating = false
+    @Published var simulationStatusText = "系统定位模拟状态尚未验证"
     @Published var isSyncing = false
     @Published var statusError: String? = nil
     @Published var exitIP = "未获取 [--]"
@@ -272,6 +273,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         manager.appendSimulatedLocation(location)
         manager.flush()
         manager.startLocationSimulation()
+        simulationStatusText = "已发送启动调用；私有 API 未返回可验证的执行结果，系统定位效果尚未验证。"
         return true
     }
 
@@ -287,6 +289,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         manager.stopLocationSimulation()
         manager.clearSimulatedLocations()
         manager.flush()
+        simulationStatusText = "已发送停止和清理调用；系统定位停止状态尚未通过位置回读验证。"
         return true
     }
 
@@ -908,6 +911,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         let simulationStarted = startLocationSimulation(for: profile)
         self.isSimulating = simulationStarted
         if !simulationStarted {
+            self.simulationStatusText = "未能提交定位模拟启动调用；请检查错误信息。"
             self.lockedProfile = nil
         }
         writeGeoPlist(profile, enabled: simulationStarted)
@@ -1029,11 +1033,14 @@ struct ContentView: View {
 
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
-                            Image(systemName: engine.isSimulating ? "checkmark.circle.fill" : "stop.circle.fill")
-                                .foregroundColor(engine.isSimulating ? .green : .gray)
-                            Text(engine.isSimulating ? "正在模拟已解析的定位环境" : "已停止模拟")
+                            Image(systemName: engine.isSimulating ? "hourglass" : "stop.circle")
+                                .foregroundColor(engine.isSimulating ? .orange : .secondary)
+                            Text(engine.isSimulating ? "已提交定位模拟启动请求（未验证生效）" : "未标记为模拟运行")
                                 .font(.headline)
                         }
+                        Text(engine.simulationStatusText)
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
                         Text("出口 IP: \(engine.exitIP)")
                             .font(.subheadline.monospaced())
                         Text("目标时区配置: \(engine.timezoneName)")
