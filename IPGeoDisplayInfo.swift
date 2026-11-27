@@ -58,12 +58,17 @@ struct IPGeoDisplayInfo: Equatable {
         }
 
         let rawCountryCode = string(["countryCode", "country_code"], in: dictionaries)
-        let countryCode = rawCountryCode?.uppercased().flatMap { value -> String? in
-            guard value.utf8.count == 2,
-                  value.utf8.allSatisfy({ (65...90).contains(Int($0)) }) else {
-                return nil
+        let countryCode: String?
+        if let rawCountryCode {
+            let value = rawCountryCode.uppercased()
+            if value.utf8.count == 2 &&
+                value.utf8.allSatisfy({ (65...90).contains(Int($0)) }) {
+                countryCode = value
+            } else {
+                countryCode = nil
             }
-            return value
+        } else {
+            countryCode = nil
         }
         let countryCandidate = string(["countryName", "country_name", "country"], in: dictionaries)
         let countryName: String?
