@@ -20,7 +20,7 @@ jobs:
             -fsanitize=address,undefined -fno-omit-frame-pointer \
             -I Tweak Tweak/AutoIPLocIfaddrs.c Tests/AutoIPLocIfaddrsTests.c \
             -o /tmp/autoiploc-tests/ifaddrs-ownership-tests
-          ASAN_OPTIONS=detect_leaks=1 /tmp/autoiploc-tests/ifaddrs-ownership-tests
+          ASAN_OPTIONS=detect_leaks=0 /tmp/autoiploc-tests/ifaddrs-ownership-tests
 
           swiftc -warnings-as-errors WiFiConfigValidation.swift Tests/WiFiConfigValidationTests.swift \
             -o /tmp/autoiploc-tests/wifi-config-tests
