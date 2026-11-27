@@ -34,6 +34,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     @Published var isSyncing = false
     @Published var isAuditing = false
     @Published var statusError: String? = nil
+    @Published var mapResetMessage: String? = nil
     @Published var exitIP = "未获取 [--]"
     @Published var ispText = "--"
     @Published var timezoneName = "- (待同步)"
@@ -62,16 +63,16 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     @Published var auditItems: [AuditItem] = []
 
     private let geoPlistPaths = [
-        "/var/mobile/Library/Preferences/com.autoiploc.geo.plist",
-        "/var/tmp/com.autoiploc.geo.plist"
+        "/var/tmp/com.autoiploc.geo.plist",
+        "/var/mobile/Library/Preferences/com.autoiploc.geo.plist"
     ]
     private let wifiPlistPaths = [
-        "/var/mobile/Library/Preferences/com.autoiploc.wifi.plist",
-        "/var/tmp/com.autoiploc.wifi.plist"
+        "/var/tmp/com.autoiploc.wifi.plist",
+        "/var/mobile/Library/Preferences/com.autoiploc.wifi.plist"
     ]
     private let hookStatusPaths = [
-        "/var/mobile/Library/Preferences/com.autoiploc.hookstatus.plist",
-        "/var/tmp/com.autoiploc.hookstatus.plist"
+        "/var/tmp/com.autoiploc.hookstatus.plist",
+        "/var/mobile/Library/Preferences/com.autoiploc.hookstatus.plist"
     ]
 
     private let locationManager = CLLocationManager()
@@ -87,9 +88,23 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         super.init()
         locationManager.delegate = self
         locationManager.requestAlwaysAuthorization()
+        ensureWritableHookStatusFiles()
         loadSavedState()
         refreshHookStatus()
         startNetworkMonitor()
+    }
+
+    private func ensureWritableHookStatusFiles() {
+        let fm = FileManager.default
+        for path in hookStatusPaths {
+            if fm.fileExists(atPath: path) {
+                Darwin.chmod(path, 0o666)
+            } else {
+                let placeholder: NSDictionary = ["active": false, "timestamp": 0]
+                placeholder.write(toFile: path, atomically: false)
+                Darwin.chmod(path, 0o666)
+            }
+        }
     }
 
     private func persistCurrentGeoIfActive() {
@@ -154,26 +169,51 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         return fm.fileExists(atPath: fallback) ? fallback : nil
     }
 
+    private func formatAgeText(_ ageSec: Int) -> String {
+        if ageSec < 60 {
+            return "\(ageSec)秒前"
+        } else if ageSec < 3600 {
+            return "\(ageSec / 60)分钟前"
+        } else {
+            return "\(ageSec / 3600)小时前"
+        }
+    }
+
     func refreshHookStatus() {
         let now = Date().timeIntervalSince1970
+        var latestDict: [String: Any]? = nil
+        var latestTS: Double = -1
+
         for path in hookStatusPaths {
             if let dict = NSDictionary(contentsOfFile: path) as? [String: Any],
                let active = dict["active"] as? Bool, active {
-                let ver = dict["version"] as? String ?? "4.5.0"
-                let proc = dict["lastProc"] as? String ?? "目标应用"
-                let hookOk = (dict["cHookReady"] as? Bool) ?? false
                 let ts = (dict["timestamp"] as? Double) ?? 0
-                let ageSec = Int(max(0, now - ts))
-
-                if ts > 0 && ageSec <= 300 && hookOk {
-                    self.hookIsActive = true
-                    self.hookStatusText = "已实时激活 v\(ver) · arm64e就绪（\(proc) · \(ageSec)秒前）"
-                    return
-                } else if ts > 0 && ageSec > 300 {
-                    self.hookIsActive = false
-                    self.hookStatusText = "上次注入已过 \(ageSec / 60) 分钟（请确认插件注入已开启并重开目标 App）"
-                    return
+                if ts > latestTS {
+                    latestTS = ts
+                    latestDict = dict
                 }
+            }
+        }
+
+        if let dict = latestDict {
+            let ver = dict["version"] as? String ?? "4.5.1"
+            let proc = dict["lastProc"] as? String ?? "目标应用"
+            let hookOk = (dict["cHookReady"] as? Bool) ?? false
+            let ageSec = Int(max(0, now - latestTS))
+            let ageText = formatAgeText(ageSec)
+
+            if latestTS > 0 && ageSec <= 86400 && hookOk {
+                self.hookIsActive = true
+                self.hookStatusText = "已实时激活 v\(ver) · arm64e就绪（\(proc) · \(ageText)）"
+                return
+            } else if latestTS > 0 && !hookOk {
+                self.hookIsActive = false
+                self.hookStatusText = "v\(ver) 仅 OC 生效，C 层 Hook 未就绪（\(proc)）"
+                return
+            } else if latestTS > 0 && ageSec > 86400 {
+                self.hookIsActive = false
+                self.hookStatusText = "上次注入已超过 24 小时（请重开目标 App 刷新状态）"
+                return
             }
         }
 
@@ -620,7 +660,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             var results: [AuditItem] = []
 
             results.append(AuditItem(
-                title: "底层隐身插件 (v4.5.0)",
+                title: "底层隐身插件 (v4.5.1)",
                 detail: self.hookStatusText,
                 passed: self.hookIsActive,
                 isWarning: !self.hookIsActive
@@ -668,12 +708,22 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         let fm = FileManager.default
         let paths = [
             "/var/mobile/Library/Caches/com.apple.Maps",
+            "/var/mobile/Library/Caches/com.apple.geod",
             "/var/mobile/Library/Caches/GeoServices",
             "/var/mobile/Library/Preferences/com.apple.GEO.plist"
         ]
+        var cleared = 0
         for p in paths {
-            try? fm.removeItem(atPath: p)
+            if fm.fileExists(atPath: p) {
+                do {
+                    try fm.removeItem(atPath: p)
+                    cleared += 1
+                } catch {
+                    // 忽略无权限或已清理的路径
+                }
+            }
         }
+        mapResetMessage = "已清理 \(cleared) 处地图与地理缓存；请确认苹果地图域名走海外节点，并在 Dopamine 中执行 Userspace Reboot 后重开地图。"
     }
 
     func stopSimulation() {
@@ -692,6 +742,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         streetAddress = "等待同步解析附近精确街道地址..."
         zipCode = "--"
         statusError = nil
+        mapResetMessage = nil
         auditItems = []
 
         let geoDict: [String: Any] = [
@@ -881,14 +932,23 @@ struct ContentView: View {
                     .background(Color(.secondarySystemBackground))
                     .cornerRadius(14)
 
-                    Button(action: { engine.resetAppleMapsCache() }) {
-                        Text("重置并恢复苹果国际原生地图（清除高德缓存）")
-                            .font(.subheadline.bold())
-                            .foregroundColor(.blue)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 12)
-                            .background(Color.blue.opacity(0.12))
-                            .cornerRadius(12)
+                    // 清除高德缓存按钮与回执提示
+                    VStack(alignment: .leading, spacing: 6) {
+                        Button(action: { engine.resetAppleMapsCache() }) {
+                            Text("重置并恢复苹果国际原生地图（清除高德缓存）")
+                                .font(.subheadline.bold())
+                                .foregroundColor(.blue)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 12)
+                                .background(Color.blue.opacity(0.12))
+                                .cornerRadius(12)
+                        }
+                        if let msg = engine.mapResetMessage {
+                            Text(msg)
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                                .padding(.horizontal, 4)
+                        }
                     }
 
                     Button(action: { engine.stopSimulation() }) {
