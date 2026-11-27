@@ -110,6 +110,38 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         }
     }
 
+    private func methodTypeCode(_ rawType: UnsafeMutablePointer<CChar>?) -> CChar? {
+        guard let rawType else { return nil }
+        defer { free(UnsafeMutableRawPointer(rawType)) }
+
+        let qualifiers: Set<CChar> = [114, 110, 78, 111, 79, 82, 86] // r, n, N, o, O, R, V
+        var cursor = rawType
+        while qualifiers.contains(cursor.pointee) {
+            cursor = cursor.advanced(by: 1)
+        }
+        return cursor.pointee
+    }
+
+    private func methodMatchesSignature(_ method: Method, explicitArgumentTypes: [CChar]) -> Bool {
+        guard method_getNumberOfArguments(method) == UInt32(explicitArgumentTypes.count + 2),
+              methodTypeCode(method_copyReturnType(method)) == 118 else { // void
+            return false
+        }
+
+        let selfType = methodTypeCode(method_copyArgumentType(method, 0))
+        let selectorType = methodTypeCode(method_copyArgumentType(method, 1))
+        guard selfType == 64 || selfType == 35, selectorType == 58 else { // @/# and :
+            return false
+        }
+
+        for (index, expectedType) in explicitArgumentTypes.enumerated() {
+            guard methodTypeCode(method_copyArgumentType(method, UInt32(index + 2))) == expectedType else {
+                return false
+            }
+        }
+        return true
+    }
+
     private func makeSimulationManager(requiredSelectors: [String]) -> CLSimulationManager? {
         guard let managerClass = NSClassFromString("CLSimulationManager") else {
             statusError = "当前系统未提供 CLSimulationManager，无法确认定位模拟已启动。"
@@ -118,8 +150,24 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
 
         for name in requiredSelectors {
             let selector = NSSelectorFromString(name)
-            guard class_getInstanceMethod(managerClass, selector) != nil else {
+            guard let method = class_getInstanceMethod(managerClass, selector) else {
                 statusError = "当前系统的 CLSimulationManager 缺少接口：\(name)"
+                return nil
+            }
+
+            let expectedArguments: [CChar]
+            switch name {
+            case "appendSimulatedLocation:":
+                expectedArguments = [64] // CLLocation * (Objective-C object)
+            case "stopLocationSimulation", "clearSimulatedLocations", "flush", "startLocationSimulation":
+                expectedArguments = []
+            default:
+                statusError = "未登记 CLSimulationManager 接口签名：\(name)"
+                return nil
+            }
+
+            guard methodMatchesSignature(method, explicitArgumentTypes: expectedArguments) else {
+                statusError = "当前系统的 CLSimulationManager 接口签名不兼容：\(name)"
                 return nil
             }
         }
