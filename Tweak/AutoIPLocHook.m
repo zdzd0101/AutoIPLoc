@@ -696,13 +696,13 @@ static BOOL hook_returnNO(id self, SEL _cmd) {
     return NO;
 }
 
-typedef id AutoIPLocInitWithSimStateIMP(id, SEL, BOOL, BOOL) __attribute__((ns_returns_retained));
-typedef id AutoIPLocInitWithCoderIMP(id, SEL, NSCoder *) __attribute__((ns_returns_retained));
+typedef id AutoIPLocInitWithSimStateIMP(id __attribute__((ns_consumed)), SEL, BOOL, BOOL) __attribute__((ns_returns_retained));
+typedef id AutoIPLocInitWithCoderIMP(id __attribute__((ns_consumed)), SEL, NSCoder *) __attribute__((ns_returns_retained));
 typedef id AutoIPLocCopyWithZoneIMP(id, SEL, NSZone *) __attribute__((ns_returns_retained));
 
 static AutoIPLocInitWithSimStateIMP *orig_initWithSimState = NULL;
-static id hook_initWithSimState(id self, SEL _cmd, BOOL isSimulated, BOOL isAccessory) __attribute__((ns_returns_retained));
-static id hook_initWithSimState(id self, SEL _cmd, BOOL isSimulated, BOOL isAccessory) {
+static id hook_initWithSimState(id self __attribute__((ns_consumed)), SEL _cmd, BOOL isSimulated, BOOL isAccessory) __attribute__((ns_returns_retained));
+static id hook_initWithSimState(id self __attribute__((ns_consumed)), SEL _cmd, BOOL isSimulated, BOOL isAccessory) {
     if (!orig_initWithSimState) return nil;
     return orig_initWithSimState(self, _cmd, NO, NO);
 }
@@ -720,8 +720,8 @@ static id CreateCleanLocationSourceInfo(void) {
 }
 
 static AutoIPLocInitWithCoderIMP *orig_srcInfoInitWithCoder = NULL;
-static id hook_srcInfoInitWithCoder(id self, SEL _cmd, NSCoder *coder) __attribute__((ns_returns_retained));
-static id hook_srcInfoInitWithCoder(id self, SEL _cmd, NSCoder *coder) {
+static id hook_srcInfoInitWithCoder(id self __attribute__((ns_consumed)), SEL _cmd, NSCoder *coder) __attribute__((ns_returns_retained));
+static id hook_srcInfoInitWithCoder(id self __attribute__((ns_consumed)), SEL _cmd, NSCoder *coder) {
     if (!orig_srcInfoInitWithCoder) return nil;
     id decoded = orig_srcInfoInitWithCoder(self, _cmd, coder);
     if (!decoded) return nil;
@@ -745,8 +745,8 @@ static id hook_srcInfoCopyWithZone(id self, SEL _cmd, NSZone *zone) {
 }
 
 static AutoIPLocInitWithCoderIMP *orig_locInitWithCoder = NULL;
-static id hook_locInitWithCoder(id self, SEL _cmd, NSCoder *coder) __attribute__((ns_returns_retained));
-static id hook_locInitWithCoder(id self, SEL _cmd, NSCoder *coder) {
+static id hook_locInitWithCoder(id self __attribute__((ns_consumed)), SEL _cmd, NSCoder *coder) __attribute__((ns_returns_retained));
+static id hook_locInitWithCoder(id self __attribute__((ns_consumed)), SEL _cmd, NSCoder *coder) {
     if (!orig_locInitWithCoder) return nil;
     id decoded = orig_locInitWithCoder(self, _cmd, coder);
     if (!decoded) return nil;
@@ -945,7 +945,7 @@ static void AutoIPLocHookEntry(void) {
 
         NSDictionary *status = @{
             @"active": @(g_installedCHookCount > 0 || g_installedObjCHookCount > 0),
-            @"version": @"4.3.1",
+            @"version": @"4.3.2",
             @"lastProc": [NSString stringWithUTF8String:prog],
             @"cHookReady": @(orig_dladdr != NULL && orig_getifaddrs != NULL && orig_freeifaddrs != NULL),
             @"cHookCount": @(g_installedCHookCount),
