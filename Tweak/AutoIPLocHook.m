@@ -51,6 +51,7 @@ static inline void *StripFunctionPointerPAC(void *addr) {
 
 static _Thread_local int g_selfCallDepth = 0;
 static _Thread_local int g_localeHookDepth = 0;
+static _Thread_local int g_defaultsHookDepth = 0;
 
 // ============================================================================
 // 2. ElleKit / Substrate 动态解析
@@ -148,7 +149,7 @@ static void HookObjCMethod(Class cls, SEL sel, IMP newImp, IMP *oldImp) {
 }
 
 // ============================================================================
-// 3. 带内存缓存与 TLS 放行的配置读取（3秒 TTL，无锁内磁盘 I/O）
+// 3. 带内存缓存与 TLS 放行的配置读取（3秒 TTL，锁外磁盘 I/O）
 // ============================================================================
 
 static os_unfair_lock g_cfgLock = OS_UNFAIR_LOCK_INIT;
@@ -207,6 +208,20 @@ static BOOL IsGeoSpoofEnabled(void) {
     return cfg && [cfg[@"enabled"] boolValue];
 }
 
+static BOOL IsLocaleSpoofEnabled(void) {
+    NSDictionary *cfg = LoadGeoConfig();
+    if (!cfg || ![cfg[@"enabled"] boolValue]) return NO;
+    id flag = cfg[@"spoofLocale"];
+    return (flag == nil) ? YES : [flag boolValue];
+}
+
+static BOOL IsCarrierSpoofEnabled(void) {
+    NSDictionary *cfg = LoadGeoConfig();
+    if (!cfg || ![cfg[@"enabled"] boolValue]) return NO;
+    id flag = cfg[@"spoofCarrier"];
+    return (flag == nil) ? YES : [flag boolValue];
+}
+
 static NSString *GetTargetCountryCode(void) {
     NSDictionary *cfg = LoadGeoConfig();
     NSString *cc = cfg[@"countryCode"];
@@ -227,7 +242,7 @@ static NSString *GetTargetTimeZoneName(void) {
 }
 
 // ============================================================================
-// 4. 国家 -> 运营商 & 语言区域联合映射表
+// 4. 国家 -> 运营商 & 语言区域联合映射表（14个常见地区）
 // ============================================================================
 
 typedef struct {
@@ -318,11 +333,16 @@ static BOOL IsJailbreakPath(const char *path) {
             strstr(path, "roothide") != NULL ||
             strstr(path, "RootHide") != NULL ||
             strstr(path, "Bootstrap") != NULL ||
+            strstr(path, "procursus") != NULL ||
             strstr(path, "MobileSubstrate") != NULL ||
             strstr(path, "CydiaSubstrate") != NULL ||
             strstr(path, "libsubstrate") != NULL ||
+            strstr(path, "Substitute") != NULL ||
+            strstr(path, "libhooker") != NULL ||
             strstr(path, "ellekit") != NULL ||
             strstr(path, "TweakInject") != NULL ||
+            strstr(path, "Choicy") != NULL ||
+            strstr(path, "Shadow.dylib") != NULL ||
             strstr(path, "Cydia.app") != NULL ||
             strstr(path, "Sileo.app") != NULL ||
             strstr(path, "Zebra.app") != NULL ||
@@ -331,6 +351,9 @@ static BOOL IsJailbreakPath(const char *path) {
             strstr(path, "Dopamine") != NULL ||
             strstr(path, "Crane") != NULL ||
             strstr(path, "Geranium") != NULL ||
+            strstr(path, "var/lib/dpkg") != NULL ||
+            strstr(path, "var/lib/apt") != NULL ||
+            strstr(path, "var/cache/apt") != NULL ||
             strstr(path, "/usr/bin/sshd") != NULL ||
             strstr(path, "/etc/apt") != NULL ||
             strstr(path, "/bin/bash") != NULL ||
@@ -406,66 +429,76 @@ static pid_t hook_fork(void) {
 }
 
 // ============================================================================
-// 6. 全局时区伪造
+// 6. 全局时区伪造（带 g_selfCallDepth 防递归守卫）
 // ============================================================================
 
 static NSTimeZone *(*orig_systemTimeZone)(id self, SEL _cmd) = NULL;
 static NSTimeZone *hook_systemTimeZone(id self, SEL _cmd) {
-    NSString *tzName = GetTargetTimeZoneName();
-    if (tzName) {
-        NSTimeZone *tz = [NSTimeZone timeZoneWithName:tzName];
-        if (tz) return tz;
+    if (g_selfCallDepth == 0) {
+        NSString *tzName = GetTargetTimeZoneName();
+        if (tzName) {
+            NSTimeZone *tz = [NSTimeZone timeZoneWithName:tzName];
+            if (tz) return tz;
+        }
     }
     return orig_systemTimeZone ? orig_systemTimeZone(self, _cmd) : [NSTimeZone timeZoneWithName:@"America/New_York"];
 }
 
 static NSTimeZone *(*orig_defaultTimeZone)(id self, SEL _cmd) = NULL;
 static NSTimeZone *hook_defaultTimeZone(id self, SEL _cmd) {
-    NSString *tzName = GetTargetTimeZoneName();
-    if (tzName) {
-        NSTimeZone *tz = [NSTimeZone timeZoneWithName:tzName];
-        if (tz) return tz;
+    if (g_selfCallDepth == 0) {
+        NSString *tzName = GetTargetTimeZoneName();
+        if (tzName) {
+            NSTimeZone *tz = [NSTimeZone timeZoneWithName:tzName];
+            if (tz) return tz;
+        }
     }
     return orig_defaultTimeZone ? orig_defaultTimeZone(self, _cmd) : [NSTimeZone timeZoneWithName:@"America/New_York"];
 }
 
 static NSTimeZone *(*orig_localTimeZone)(id self, SEL _cmd) = NULL;
 static NSTimeZone *hook_localTimeZone(id self, SEL _cmd) {
-    NSString *tzName = GetTargetTimeZoneName();
-    if (tzName) {
-        NSTimeZone *tz = [NSTimeZone timeZoneWithName:tzName];
-        if (tz) return tz;
+    if (g_selfCallDepth == 0) {
+        NSString *tzName = GetTargetTimeZoneName();
+        if (tzName) {
+            NSTimeZone *tz = [NSTimeZone timeZoneWithName:tzName];
+            if (tz) return tz;
+        }
     }
     return orig_localTimeZone ? orig_localTimeZone(self, _cmd) : [NSTimeZone timeZoneWithName:@"America/New_York"];
 }
 
 static CFTimeZoneRef (*orig_CFTimeZoneCopySystem)(void) = NULL;
 static CFTimeZoneRef hook_CFTimeZoneCopySystem(void) {
-    NSString *tzName = GetTargetTimeZoneName();
-    if (tzName) {
-        CFTimeZoneRef tz = CFTimeZoneCreateWithName(kCFAllocatorDefault, (__bridge CFStringRef)tzName, true);
-        if (tz) return tz;
+    if (g_selfCallDepth == 0) {
+        NSString *tzName = GetTargetTimeZoneName();
+        if (tzName) {
+            CFTimeZoneRef tz = CFTimeZoneCreateWithName(kCFAllocatorDefault, (__bridge CFStringRef)tzName, true);
+            if (tz) return tz;
+        }
     }
     return orig_CFTimeZoneCopySystem ? orig_CFTimeZoneCopySystem() : CFTimeZoneCopySystem();
 }
 
 static CFTimeZoneRef (*orig_CFTimeZoneCopyDefault)(void) = NULL;
 static CFTimeZoneRef hook_CFTimeZoneCopyDefault(void) {
-    NSString *tzName = GetTargetTimeZoneName();
-    if (tzName) {
-        CFTimeZoneRef tz = CFTimeZoneCreateWithName(kCFAllocatorDefault, (__bridge CFStringRef)tzName, true);
-        if (tz) return tz;
+    if (g_selfCallDepth == 0) {
+        NSString *tzName = GetTargetTimeZoneName();
+        if (tzName) {
+            CFTimeZoneRef tz = CFTimeZoneCreateWithName(kCFAllocatorDefault, (__bridge CFStringRef)tzName, true);
+            if (tz) return tz;
+        }
     }
     return orig_CFTimeZoneCopyDefault ? orig_CFTimeZoneCopyDefault() : CFTimeZoneCopyDefault();
 }
 
 // ============================================================================
-// 7. 语言与区域伪造（NSLocale & CFLocale，带防递归守卫）
+// 7. 语言与区域伪造（NSLocale + CFLocale + NSUserDefaults 闭环，带防递归）
 // ============================================================================
 
 static NSLocale *(*orig_currentLocale)(id self, SEL _cmd) = NULL;
 static NSLocale *hook_currentLocale(id self, SEL _cmd) {
-    if (g_localeHookDepth == 0 && IsGeoSpoofEnabled()) {
+    if (g_selfCallDepth == 0 && g_localeHookDepth == 0 && IsLocaleSpoofEnabled()) {
         const CountryProfilePreset *p = GetCountryPresetForTarget();
         g_localeHookDepth++;
         NSLocale *loc = [NSLocale localeWithLocaleIdentifier:[NSString stringWithUTF8String:p->localeId]];
@@ -477,7 +510,7 @@ static NSLocale *hook_currentLocale(id self, SEL _cmd) {
 
 static NSLocale *(*orig_autoupdatingCurrentLocale)(id self, SEL _cmd) = NULL;
 static NSLocale *hook_autoupdatingCurrentLocale(id self, SEL _cmd) {
-    if (g_localeHookDepth == 0 && IsGeoSpoofEnabled()) {
+    if (g_selfCallDepth == 0 && g_localeHookDepth == 0 && IsLocaleSpoofEnabled()) {
         const CountryProfilePreset *p = GetCountryPresetForTarget();
         g_localeHookDepth++;
         NSLocale *loc = [NSLocale localeWithLocaleIdentifier:[NSString stringWithUTF8String:p->localeId]];
@@ -489,7 +522,7 @@ static NSLocale *hook_autoupdatingCurrentLocale(id self, SEL _cmd) {
 
 static NSArray<NSString *> *(*orig_preferredLanguages)(id self, SEL _cmd) = NULL;
 static NSArray<NSString *> *hook_preferredLanguages(id self, SEL _cmd) {
-    if (g_localeHookDepth == 0 && IsGeoSpoofEnabled()) {
+    if (g_selfCallDepth == 0 && g_localeHookDepth == 0 && IsLocaleSpoofEnabled()) {
         const CountryProfilePreset *p = GetCountryPresetForTarget();
         NSString *primary = [NSString stringWithUTF8String:p->langCode];
         return [primary isEqualToString:@"en-US"] ? @[primary] : @[primary, @"en-US"];
@@ -499,7 +532,7 @@ static NSArray<NSString *> *hook_preferredLanguages(id self, SEL _cmd) {
 
 static CFLocaleRef (*orig_CFLocaleCopyCurrent)(void) = NULL;
 static CFLocaleRef hook_CFLocaleCopyCurrent(void) {
-    if (g_localeHookDepth == 0 && IsGeoSpoofEnabled()) {
+    if (g_selfCallDepth == 0 && g_localeHookDepth == 0 && IsLocaleSpoofEnabled()) {
         const CountryProfilePreset *p = GetCountryPresetForTarget();
         g_localeHookDepth++;
         CFStringRef locStr = CFStringCreateWithCString(kCFAllocatorDefault, p->localeId, kCFStringEncodingUTF8);
@@ -513,7 +546,7 @@ static CFLocaleRef hook_CFLocaleCopyCurrent(void) {
 
 static CFArrayRef (*orig_CFLocaleCopyPreferredLanguages)(void) = NULL;
 static CFArrayRef hook_CFLocaleCopyPreferredLanguages(void) {
-    if (g_localeHookDepth == 0 && IsGeoSpoofEnabled()) {
+    if (g_selfCallDepth == 0 && g_localeHookDepth == 0 && IsLocaleSpoofEnabled()) {
         const CountryProfilePreset *p = GetCountryPresetForTarget();
         NSString *primary = [NSString stringWithUTF8String:p->langCode];
         NSArray<NSString *> *langs = [primary isEqualToString:@"en-US"] ? @[primary] : @[primary, @"en-US"];
@@ -522,13 +555,35 @@ static CFArrayRef hook_CFLocaleCopyPreferredLanguages(void) {
     return orig_CFLocaleCopyPreferredLanguages ? orig_CFLocaleCopyPreferredLanguages() : CFLocaleCopyPreferredLanguages();
 }
 
+static id (*orig_defaultsObjectForKey)(id self, SEL _cmd, NSString *defaultName) = NULL;
+static id hook_defaultsObjectForKey(id self, SEL _cmd, NSString *defaultName) {
+    if (g_selfCallDepth == 0 && g_defaultsHookDepth == 0 && defaultName) {
+        BOOL isLang = [defaultName isEqualToString:@"AppleLanguages"];
+        BOOL isLoc = !isLang && [defaultName isEqualToString:@"AppleLocale"];
+        if (isLang || isLoc) {
+            g_defaultsHookDepth++;
+            BOOL enabled = IsLocaleSpoofEnabled();
+            const CountryProfilePreset *p = enabled ? GetCountryPresetForTarget() : NULL;
+            g_defaultsHookDepth--;
+            if (enabled && p) {
+                if (isLang) {
+                    NSString *primary = [NSString stringWithUTF8String:p->langCode];
+                    return [primary isEqualToString:@"en-US"] ? @[primary] : @[primary, @"en-US"];
+                }
+                return [NSString stringWithUTF8String:p->localeId];
+            }
+        }
+    }
+    return orig_defaultsObjectForKey ? orig_defaultsObjectForKey(self, _cmd, defaultName) : nil;
+}
+
 // ============================================================================
-// 8. 运营商伪造（按目标国家码动态映射，联动启停开关）
+// 8. 运营商伪造（14国动态映射 + 无 SIM 卡设备兜底）
 // ============================================================================
 
 static NSString *(*orig_carrierName)(id self, SEL _cmd) = NULL;
 static NSString *hook_carrierName(id self, SEL _cmd) {
-    if (IsGeoSpoofEnabled()) {
+    if (g_selfCallDepth == 0 && IsCarrierSpoofEnabled()) {
         const CountryProfilePreset *p = GetCountryPresetForTarget();
         return [NSString stringWithUTF8String:p->carrier];
     }
@@ -537,7 +592,7 @@ static NSString *hook_carrierName(id self, SEL _cmd) {
 
 static NSString *(*orig_mobileCountryCode)(id self, SEL _cmd) = NULL;
 static NSString *hook_mobileCountryCode(id self, SEL _cmd) {
-    if (IsGeoSpoofEnabled()) {
+    if (g_selfCallDepth == 0 && IsCarrierSpoofEnabled()) {
         const CountryProfilePreset *p = GetCountryPresetForTarget();
         return [NSString stringWithUTF8String:p->mcc];
     }
@@ -546,7 +601,7 @@ static NSString *hook_mobileCountryCode(id self, SEL _cmd) {
 
 static NSString *(*orig_mobileNetworkCode)(id self, SEL _cmd) = NULL;
 static NSString *hook_mobileNetworkCode(id self, SEL _cmd) {
-    if (IsGeoSpoofEnabled()) {
+    if (g_selfCallDepth == 0 && IsCarrierSpoofEnabled()) {
         const CountryProfilePreset *p = GetCountryPresetForTarget();
         return [NSString stringWithUTF8String:p->mnc];
     }
@@ -555,16 +610,42 @@ static NSString *hook_mobileNetworkCode(id self, SEL _cmd) {
 
 static NSString *(*orig_isoCountryCode)(id self, SEL _cmd) = NULL;
 static NSString *hook_isoCountryCode(id self, SEL _cmd) {
-    if (IsGeoSpoofEnabled()) {
+    if (g_selfCallDepth == 0 && IsCarrierSpoofEnabled()) {
         return GetTargetCountryCode().lowercaseString;
     }
     return orig_isoCountryCode ? orig_isoCountryCode(self, _cmd) : nil;
 }
 
+static NSDictionary<NSString *, CTCarrier *> *(*orig_serviceProviders)(id self, SEL _cmd) = NULL;
+static NSDictionary<NSString *, CTCarrier *> *hook_serviceProviders(id self, SEL _cmd) {
+    NSDictionary<NSString *, CTCarrier *> *orig = orig_serviceProviders ? orig_serviceProviders(self, _cmd) : nil;
+    if (orig.count > 0 || g_selfCallDepth > 0 || !IsCarrierSpoofEnabled()) {
+        return orig;
+    }
+    Class carrierCls = objc_getClass("CTCarrier");
+    if (carrierCls) {
+        CTCarrier *fake = [[carrierCls alloc] init];
+        if (fake) {
+            return @{@"0000000100000001": fake};
+        }
+    }
+    return orig;
+}
+
+static CTCarrier *(*orig_subscriberProvider)(id self, SEL _cmd) = NULL;
+static CTCarrier *hook_subscriberProvider(id self, SEL _cmd) {
+    CTCarrier *orig = orig_subscriberProvider ? orig_subscriberProvider(self, _cmd) : nil;
+    if (orig || g_selfCallDepth > 0 || !IsCarrierSpoofEnabled()) {
+        return orig;
+    }
+    Class carrierCls = objc_getClass("CTCarrier");
+    return carrierCls ? [[carrierCls alloc] init] : nil;
+}
+
 static NSDictionary<NSString *, NSString *> *(*orig_serviceRadioTech)(id self, SEL _cmd) = NULL;
 static NSDictionary<NSString *, NSString *> *hook_serviceRadioTech(id self, SEL _cmd) {
     NSDictionary<NSString *, NSString *> *orig = orig_serviceRadioTech ? orig_serviceRadioTech(self, _cmd) : nil;
-    if (orig.count > 0 || !IsGeoSpoofEnabled()) return orig;
+    if (orig.count > 0 || g_selfCallDepth > 0 || !IsCarrierSpoofEnabled()) return orig;
     return @{
         @"0000000100000001": @"CTRadioAccessTechnologyLTE",
         @"0000000100000002": @"CTRadioAccessTechnologyLTE"
@@ -574,15 +655,15 @@ static NSDictionary<NSString *, NSString *> *hook_serviceRadioTech(id self, SEL 
 static NSString *(*orig_currentRadioTech)(id self, SEL _cmd) = NULL;
 static NSString *hook_currentRadioTech(id self, SEL _cmd) {
     NSString *orig = orig_currentRadioTech ? orig_currentRadioTech(self, _cmd) : nil;
-    if (orig.length > 0 || !IsGeoSpoofEnabled()) return orig;
+    if (orig.length > 0 || g_selfCallDepth > 0 || !IsCarrierSpoofEnabled()) return orig;
     return @"CTRadioAccessTechnologyLTE";
 }
 
 static NSString *(*orig_dataServiceIdentifier)(id self, SEL _cmd) = NULL;
 static NSString *hook_dataServiceIdentifier(id self, SEL _cmd) {
     NSString *orig = orig_dataServiceIdentifier ? orig_dataServiceIdentifier(self, _cmd) : nil;
-    if (orig.length > 0 || !IsGeoSpoofEnabled()) return orig;
-    return @"0000000100000002";
+    if (orig.length > 0 || g_selfCallDepth > 0 || !IsCarrierSpoofEnabled()) return orig;
+    return @"0000000100000001";
 }
 
 static BOOL hook_returnYES(id self, SEL _cmd) {
@@ -590,7 +671,7 @@ static BOOL hook_returnYES(id self, SEL _cmd) {
 }
 
 // ============================================================================
-// 9. 代理与 VPN 网卡隐身（带 PAC 剥离与单节点链表修复）
+// 9. 代理与 VPN 网卡隐身（PAC 剥离 + 正确放行系统框架 + 单节点链表修复）
 // ============================================================================
 
 static BOOL IsSystemNetworkingCaller(void *retAddr) {
@@ -639,7 +720,10 @@ static CFDictionaryRef hook_SCDynamicStoreCopyProxies(void *store) {
 
 static NSDictionary *(*orig_connectionProxyDictionary)(id self, SEL _cmd) = NULL;
 static NSDictionary *hook_connectionProxyDictionary(id self, SEL _cmd) {
-    return @{};
+    if (IsSystemNetworkingCaller(__builtin_return_address(0)) && orig_connectionProxyDictionary) {
+        return orig_connectionProxyDictionary(self, _cmd);
+    }
+    return nil;
 }
 
 static BOOL IsVirtualVPNInterface(const char *ifname) {
@@ -678,7 +762,7 @@ static int hook_getifaddrs(struct ifaddrs **ifap) {
 }
 
 // ============================================================================
-// 10. URL Scheme 探测拦截
+// 10. URL Scheme 探测拦截（涵盖常见越狱与代理客户端）
 // ============================================================================
 
 static BOOL IsBlockedURLScheme(NSString *scheme) {
@@ -687,9 +771,10 @@ static BOOL IsBlockedURLScheme(NSString *scheme) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         blocked = [NSSet setWithArray:@[
-            @"apple-magnifier", @"sileo", @"zbra", @"cydia",
-            @"filza", @"santander", @"trollstore", @"dopamine", @"roothide",
-            @"geranium", @"locsim", @"shadowrocket", @"quantumult", @"surge", @"loon", @"stash"
+            @"apple-magnifier", @"sileo", @"zbra", @"zebra", @"cydia",
+            @"filza", @"santander", @"trollstore", @"dopamine", @"roothide", @"choicy",
+            @"geranium", @"locsim", @"shadowrocket", @"quantumult", @"surge", @"loon",
+            @"stash", @"potatso", @"clash", @"v2box", @"hiddify", @"streisand", @"karing", @"sing-box"
         ]];
     });
     return [blocked containsObject:scheme.lowercaseString];
@@ -810,7 +895,7 @@ static void *hook_locInitWithCoder(void *selfPtr, SEL _cmd, void *coderPtr) {
 #define DEFINE_GEO_CC_HOOK(name) \
 static NSString *(*orig_##name)(id self, SEL _cmd) = NULL; \
 static NSString *hook_##name(id self, SEL _cmd) { \
-    if (IsGeoSpoofEnabled()) return GetTargetCountryCode(); \
+    if (g_selfCallDepth == 0 && IsGeoSpoofEnabled()) return GetTargetCountryCode(); \
     return orig_##name ? orig_##name(self, _cmd) : @"US"; \
 }
 
@@ -821,12 +906,12 @@ DEFINE_GEO_CC_HOOK(geo_sourceCountryCode)
 
 static BOOL (*orig_isChina)(id self, SEL _cmd) = NULL;
 static BOOL hook_isChina(id self, SEL _cmd) {
-    if (IsGeoSpoofEnabled()) return NO;
+    if (g_selfCallDepth == 0 && IsGeoSpoofEnabled()) return NO;
     return orig_isChina ? orig_isChina(self, _cmd) : NO;
 }
 
 // ============================================================================
-// 13. Wi-Fi 伪造（仅返回原生合法三字段，无非法扩展 Key）
+// 13. Wi-Fi 伪造（CaptiveNetwork 原生三字段 + iOS 15+ NEHotspotNetwork）
 // ============================================================================
 
 static NSArray<NSDictionary *> *GetMockWiFiList(void) {
@@ -842,7 +927,7 @@ static NSArray<NSDictionary *> *GetMockWiFiList(void) {
 
 static CFArrayRef (*orig_CNCopySupportedInterfaces)(void) = NULL;
 static CFArrayRef hook_CNCopySupportedInterfaces(void) {
-    if (GetMockWiFiList() != nil) {
+    if (g_selfCallDepth == 0 && GetMockWiFiList() != nil) {
         return (__bridge_retained CFArrayRef)@[@"en0"];
     }
     return orig_CNCopySupportedInterfaces ? orig_CNCopySupportedInterfaces() : (__bridge_retained CFArrayRef)@[@"en0"];
@@ -850,19 +935,43 @@ static CFArrayRef hook_CNCopySupportedInterfaces(void) {
 
 static CFDictionaryRef (*orig_CNCopyCurrentNetworkInfo)(CFStringRef interfaceName) = NULL;
 static CFDictionaryRef hook_CNCopyCurrentNetworkInfo(CFStringRef interfaceName) {
-    NSArray<NSDictionary *> *nets = GetMockWiFiList();
-    if (nets.count > 0) {
-        NSDictionary *topAP = nets[0];
-        NSString *ssid = topAP[@"SSID"] ?: @"NETGEAR-C27B-5G";
-        NSString *bssid = topAP[@"BSSID"] ?: @"20:4E:7F:67:BC:7F";
-        NSDictionary *result = @{
-            (__bridge NSString *)kCNNetworkInfoKeySSID: ssid,
-            (__bridge NSString *)kCNNetworkInfoKeyBSSID: bssid,
-            (__bridge NSString *)kCNNetworkInfoKeySSIDData: [ssid dataUsingEncoding:NSUTF8StringEncoding]
-        };
-        return (__bridge_retained CFDictionaryRef)result;
+    if (g_selfCallDepth == 0) {
+        NSArray<NSDictionary *> *nets = GetMockWiFiList();
+        if (nets.count > 0) {
+            NSDictionary *topAP = nets[0];
+            NSString *ssid = topAP[@"SSID"] ?: @"NETGEAR-C27B-5G";
+            NSString *bssid = topAP[@"BSSID"] ?: @"20:4E:7F:67:BC:7F";
+            NSDictionary *result = @{
+                (__bridge NSString *)kCNNetworkInfoKeySSID: ssid,
+                (__bridge NSString *)kCNNetworkInfoKeyBSSID: bssid,
+                (__bridge NSString *)kCNNetworkInfoKeySSIDData: [ssid dataUsingEncoding:NSUTF8StringEncoding]
+            };
+            return (__bridge_retained CFDictionaryRef)result;
+        }
     }
     return orig_CNCopyCurrentNetworkInfo ? orig_CNCopyCurrentNetworkInfo(interfaceName) : NULL;
+}
+
+static NSString *(*orig_hotspotSSID)(id self, SEL _cmd) = NULL;
+static NSString *hook_hotspotSSID(id self, SEL _cmd) {
+    if (g_selfCallDepth == 0) {
+        NSArray<NSDictionary *> *nets = GetMockWiFiList();
+        if (nets.count > 0 && nets[0][@"SSID"]) {
+            return nets[0][@"SSID"];
+        }
+    }
+    return orig_hotspotSSID ? orig_hotspotSSID(self, _cmd) : nil;
+}
+
+static NSString *(*orig_hotspotBSSID)(id self, SEL _cmd) = NULL;
+static NSString *hook_hotspotBSSID(id self, SEL _cmd) {
+    if (g_selfCallDepth == 0) {
+        NSArray<NSDictionary *> *nets = GetMockWiFiList();
+        if (nets.count > 0 && nets[0][@"BSSID"]) {
+            return nets[0][@"BSSID"];
+        }
+    }
+    return orig_hotspotBSSID ? orig_hotspotBSSID(self, _cmd) : nil;
 }
 
 // ============================================================================
@@ -874,16 +983,14 @@ static void AutoIPLocHookEntry(void) {
     @autoreleasepool {
         const char *prog = getprogname();
         if (!prog) return;
-        if (strcmp(prog, "SpringBoard") == 0 ||
-            strcmp(prog, "backboardd") == 0 ||
-            strcmp(prog, "Preferences") == 0 ||
-            strcmp(prog, "AutoIPLoc") == 0 ||
-            strcmp(prog, "Shadowrocket") == 0 ||
-            strcmp(prog, "Dopamine") == 0 ||
-            strcmp(prog, "Sileo") == 0 ||
-            strcmp(prog, "TrollStore") == 0 ||
-            strcmp(prog, "Filza") == 0) {
-            return;
+        static const char *kSkipProcs[] = {
+            "SpringBoard", "backboardd", "Preferences", "AutoIPLoc",
+            "Shadowrocket", "QuantumultX", "Surge", "Loon", "Stash", "SingBox", "Karing",
+            "Dopamine", "Sileo", "Zebra", "TrollStore", "Filza", "RootHide", "Bootstrap"
+        };
+        size_t skipCount = sizeof(kSkipProcs) / sizeof(kSkipProcs[0]);
+        for (size_t i = 0; i < skipCount; i++) {
+            if (strcmp(prog, kSkipProcs[i]) == 0) return;
         }
 
         char execBuf[1024] = {0};
@@ -914,6 +1021,10 @@ static void AutoIPLocHookEntry(void) {
             HookObjCMethod(localeMeta, @selector(currentLocale), (IMP)hook_currentLocale, (IMP *)&orig_currentLocale);
             HookObjCMethod(localeMeta, @selector(autoupdatingCurrentLocale), (IMP)hook_autoupdatingCurrentLocale, (IMP *)&orig_autoupdatingCurrentLocale);
             HookObjCMethod(localeMeta, @selector(preferredLanguages), (IMP)hook_preferredLanguages, (IMP *)&orig_preferredLanguages);
+        }
+        Class defaultsCls = objc_getClass("NSUserDefaults");
+        if (defaultsCls) {
+            HookObjCMethod(defaultsCls, @selector(objectForKey:), (IMP)hook_defaultsObjectForKey, (IMP *)&orig_defaultsObjectForKey);
         }
 
         Class appCls = objc_getClass("UIApplication");
@@ -947,9 +1058,17 @@ static void AutoIPLocHookEntry(void) {
         }
         Class netInfoCls = objc_getClass("CTTelephonyNetworkInfo");
         if (netInfoCls) {
+            HookObjCMethod(netInfoCls, NSSelectorFromString(@"serviceSubscriberCellularProviders"), (IMP)hook_serviceProviders, (IMP *)&orig_serviceProviders);
+            HookObjCMethod(netInfoCls, NSSelectorFromString(@"subscriberCellularProvider"), (IMP)hook_subscriberProvider, (IMP *)&orig_subscriberProvider);
             HookObjCMethod(netInfoCls, NSSelectorFromString(@"serviceCurrentRadioAccessTechnology"), (IMP)hook_serviceRadioTech, (IMP *)&orig_serviceRadioTech);
             HookObjCMethod(netInfoCls, NSSelectorFromString(@"currentRadioAccessTechnology"), (IMP)hook_currentRadioTech, (IMP *)&orig_currentRadioTech);
             HookObjCMethod(netInfoCls, NSSelectorFromString(@"dataServiceIdentifier"), (IMP)hook_dataServiceIdentifier, (IMP *)&orig_dataServiceIdentifier);
+        }
+
+        Class hotspotCls = objc_getClass("NEHotspotNetwork");
+        if (hotspotCls) {
+            HookObjCMethod(hotspotCls, NSSelectorFromString(@"SSID"), (IMP)hook_hotspotSSID, (IMP *)&orig_hotspotSSID);
+            HookObjCMethod(hotspotCls, NSSelectorFromString(@"BSSID"), (IMP)hook_hotspotBSSID, (IMP *)&orig_hotspotBSSID);
         }
 
         Class srcInfoCls = objc_getClass("CLLocationSourceInformation");
@@ -1013,11 +1132,11 @@ static void AutoIPLocHookEntry(void) {
             g_MSHookFunction((void *)CNCopySupportedInterfaces, (void *)hook_CNCopySupportedInterfaces, (void **)&orig_CNCopySupportedInterfaces);
         }
 
-        // 写入插件激活状态时开启 TLS 自放行，防止被刚挂载的文件 Hook 拦截
+        // 写入插件状态时开启 TLS 自放行，避免被刚挂载的文件 Hook 拦截
         g_selfCallDepth++;
         NSDictionary *status = @{
             @"active": @YES,
-            @"version": @"4.4.0",
+            @"version": @"4.5.0",
             @"lastProc": [NSString stringWithUTF8String:prog],
             @"cHookReady": @(g_MSHookFunction != NULL && g_MSHookMessageEx != NULL),
             @"timestamp": @([[NSDate date] timeIntervalSince1970])
