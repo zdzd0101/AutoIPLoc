@@ -267,3 +267,46 @@ Read-only comparison:
 - `/var/tmp` versus `/rootfs/var/tmp`
 
 This is a path-namespace hypothesis grounded in RootHide's file-mirror list, not yet a diagnosis of the current device.
+
+
+## 2026-11-27 — device confirms rootfs namespace contains live-looking state files
+
+The user has now compared both path namespaces directly.
+
+### Path namespace observations
+
+- `readlink /var/jb` returns `/`.
+- `realpath /var/jb` returns `/`.
+- `ls -ld /var/jb /rootfs` shows `/var/jb -> //` and a separate directory `/rootfs`.
+- The Hook patch registration link resolves textually to `/usr/lib/DynamicPatches/AutoPatches.dylib`; that AutoPatches dylib exists (300,464 bytes, executable) at the queried path.
+- `/var/mobile/Library/Preferences` and `/rootfs/var/mobile/Library/Preferences` are distinct directories with different timestamps and contents.
+- `/var/mobile/Library/Logs` is absent in the shell's current namespace, while `/rootfs/var/mobile/Library/Logs` exists.
+
+Do not treat `/var/jb -> /` as the canonical RootHide jbroot. In this environment, the shell namespace and `/rootfs` tree are visibly distinct. Their relationship must be established from RootHide's path mapping and process context, not inferred from the symlink target alone.
+
+### Config and status files found under rootfs
+
+The user found all three expected files in `/rootfs/var/mobile/Library/Preferences`:
+
+| File | Owner/group | Mode | Size |
+|---|---|---|---:|
+| `com.autoiploc.geo.plist` | mobile/mobile | 0600 | 726 bytes |
+| `com.autoiploc.hookstatus.plist` | mobile/wheel | 0644 | 517 bytes |
+| `com.autoiploc.wifi.plist` | mobile/mobile | 0600 | 2,098 bytes |
+
+This corrects the earlier conclusion that all six files were absent: they were absent from the current shell namespace's two queried directories, but are present in the separate rootfs Preferences directory. File presence and modes do not yet prove which process wrote them or which process can read them.
+
+### CrashReporter path correction
+
+- `/var/mobile/Library/Logs/CrashReporter` is absent in the current shell namespace.
+- `/rootfs/var/mobile/Library/Logs/CrashReporter` exists and contains hundreds of .ips reports, including entries dated 2026-11-27.
+- No crash contents have yet been examined; no component can be blamed until targeted reports are read.
+
+### Next evidence required
+
+1. Read the exact Hook status plist content, to identify `lastProc`, `active`, hook counts, `geoConfigReadable`, and `wifiConfigReadable`.
+2. Read only non-sensitive structural metadata from Geo/Wi-Fi configs; avoid exposing or copying precise user location/network data into PR text.
+3. Search recent .ips filenames/content for AutoIPLocHook, Preferences/Settings, SpringBoard, and affected applications; examine only relevant crash reports.
+4. Establish which path namespace each app/target process resolves, ideally by a read-only path diagnostic from those processes. Do not loosen permissions simply because files are stored in `/rootfs`.
+
+No device files were modified, and no claim is made that Hook loaded or configuration reads succeeded until the status plist values are read.
