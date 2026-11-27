@@ -173,3 +173,71 @@ ls -la /var/mobile/Library/Logs/CrashReporter/Retired 2>&1 | head -30
 ```
 
 Do not run cache deletion, remove packages, toggle global Tweak Injection, or modify any `.jbroot` link while collecting these facts.
+
+
+## Correction — RootHide Patcher conversion evidenced on the user's device (2026-11-27)
+
+The user's latest NewTerm output materially changes the interpretation of the earlier path warning.
+
+### Observed device state
+
+- Installed AutoIPLoc package: `com.local.autoiploc.hook 4.3.5 iphoneos-arm64e`.
+- Installed RootHide Patcher: `com.roothide.patcher 2.1.4-1+debug`.
+- Installed RootHide PatchLoader: `com.roothide.patchloader 0.0.8`.
+- The reported package file listing includes:
+  - `/var/mobile/Library/pkgmirror/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib`
+  - `/var/mobile/Library/pkgmirror/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist`
+- The user also observed:
+  - `/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib`
+  - `/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist`
+  - `AutoIPLocHook.dylib.roothidepatch -> /usr/lib/DynamicPatches/AutoPatches.dylib`
+
+### Interpretation revised from the previous section
+
+The above `pkgmirror` paths and `.roothidepatch` symlink match the documented RootHide Patcher implementation when its AutoPatches conversion path is used:
+
+- RootHide Patcher copies the converted package tree into `var/mobile/Library/pkgmirror` and stores its package metadata under a package-specific `DEBIAN.*` directory.
+- In AutoPatches mode, it creates a `.roothidepatch` symlink beside the Mach-O target pointing to `/usr/lib/DynamicPatches/AutoPatches.dylib`.
+- It converts the package architecture metadata from `iphoneos-arm64` to `iphoneos-arm64e`.
+- RootHide Dynamic Patches documentation states that PatchLoader loads the linked dynamic patch before the target Mach-O executes.
+
+Therefore, the device evidence is consistent with the installed 4.3.5 package having been processed by RootHide Patcher using AutoPatches. The presence of the mirror is not, by itself, evidence of a duplicate active installation or stale garbage. The `.roothidepatch` link is not the AutoIPLoc Hook itself; it is a registration link to the RootHide AutoPatches module.
+
+This corrects the earlier overly broad implication that the traditional rootless DEB layout necessarily means the installed device package was not converted for RootHide. The CI artifact is still a conventional rootless input package; the user's device appears to have a separate Patcher conversion step. Whether that conversion succeeds for every AutoIPLoc Mach-O, script, config path, injection target and iOS 16.2 process remains unproven. RootHide Patcher itself warns that not all packages are supported.
+
+### What remains unverified
+
+- Whether the files under `/var/mobile/Library/pkgmirror` are only preserved source copies, and which exact paths the converted package manager registered as live files.
+- Whether `/var/jb` resolves through the RootHide compatibility layout on this device.
+- Whether the `.roothidepatch` link resolves and PatchLoader actually loads AutoPatches for AutoIPLocHook.
+- Whether AutoPatches modifies this Hook in a way compatible with its own runtime and current iOS 16.2.
+- Whether the Hook's hard-coded `/var/mobile/Library/Preferences` and `/var/tmp` reads/writes resolve to the intended data domains after conversion.
+- Why Geo/Wi-Fi and Hook-status plists were absent at the queried locations.
+
+### Revised safety and install decision
+
+Do not delete either copy, do not remove `.roothidepatch`, and do not manually alter `/var/jb` or any `.jbroot*` link. Do not install raw Build #196 over 4.3.5 yet. If #196 is tested later, the test must explicitly compare (a) the raw artifact, (b) the exact RootHide Patcher conversion mode and output metadata, and (c) installed live/mirror paths, with a verified rollback package. A successful dpkg conversion alone is not runtime acceptance.
+
+### Focused read-only checks still needed
+
+Run these separately in NewTerm and preserve their full unwrapped output:
+
+```sh
+echo "=== RootHide compatibility link ==="
+readlink /var/jb 2>&1
+stat -f '%N type=%HT owner=%Su group=%Sg mode=%Lp' /var/jb 2>&1
+realpath /var/jb 2>&1
+
+echo "=== active/mirror package ownership ==="
+dpkg-query -S /var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib 2>&1
+dpkg-query -S /var/mobile/Library/pkgmirror/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib 2>&1
+ls -l /var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib.roothidepatch 2>&1
+readlink /var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib.roothidepatch 2>&1
+ls -l /usr/lib/DynamicPatches/AutoPatches.dylib 2>&1
+
+echo "=== exact .jbroot target (do not modify) ==="
+readlink /var/containers/Bundle/Application/.jbroot-B65E3B6A7115A07D 2>&1
+stat -f '%N type=%HT owner=%Su group=%Sg mode=%Lp' /var/containers/Bundle/Application/.jbroot-B65E3B6A7115A07D 2>&1
+```
+
+No package remove/reinstall, permission change, global injection toggle, or filesystem cleanup is authorized as part of this diagnostic step.
