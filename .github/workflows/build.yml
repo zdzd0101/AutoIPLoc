@@ -11,6 +11,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Run host-side stability regression tests
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/autoiploc-tests
+
+          clang -std=c11 -Wall -Wextra -Werror -pedantic -pthread \
+            -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -I Tweak Tweak/AutoIPLocIfaddrs.c Tests/AutoIPLocIfaddrsTests.c \
+            -o /tmp/autoiploc-tests/ifaddrs-ownership-tests
+          ASAN_OPTIONS=detect_leaks=1 /tmp/autoiploc-tests/ifaddrs-ownership-tests
+
+          swiftc -warnings-as-errors WiFiConfigValidation.swift Tests/WiFiConfigValidationTests.swift \
+            -o /tmp/autoiploc-tests/wifi-config-tests
+          /tmp/autoiploc-tests/wifi-config-tests
+
       - name: Install dpkg
         run: HOMEBREW_NO_AUTO_UPDATE=1 brew install dpkg
 
@@ -30,13 +45,13 @@ jobs:
           echo "Using iPhoneOS SDK: $SDK_PATH"
           xcrun --sdk iphoneos --show-sdk-version
 
-          "$IOS_SWIFTC" main.swift \
+          "$IOS_SWIFTC" WiFiConfigValidation.swift main.swift \
             -parse-as-library \
             -import-objc-header Bridge.h \
             -sdk "$SDK_PATH" \
             -target arm64-apple-ios15.0 \
             -Xcc -isysroot -Xcc "$SDK_PATH" \
-            -framework SwiftUI -framework UIKit -framework CoreLocation -framework Network -framework AVFoundation \
+            -framework SwiftUI -framework UIKit -framework CoreLocation -framework Network \
             -o Payload/AutoIPLoc.app/AutoIPLoc
 
           cp Info.plist Payload/AutoIPLoc.app/Info.plist
@@ -55,7 +70,16 @@ jobs:
           grep -Fq "inet_pton(AF_INET" main.swift
           grep -Fq "inet_pton(AF_INET6" main.swift
           grep -Fq "isValidGeoProfile(profile)" main.swift
+          grep -Fq "WiFiConfigValidator.validatedNetworks" main.swift
           grep -Fq "activeReports.max(by:" main.swift
+          if grep -Eq 'AVFoundation|AVAudio|AVCapture|AVPlayer' main.swift; then
+            echo "Unused AVFoundation/audio/video dependency detected in main.swift" >&2
+            exit 1
+          fi
+          if /usr/libexec/PlistBuddy -c 'Print :UIBackgroundModes' Info.plist | grep -q 'audio'; then
+            echo "Audio background mode remains without an audio feature" >&2
+            exit 1
+          fi
           echo "Checking Hook source safety invariants..."
           grep -Fq "MethodHasExpectedSignature" Tweak/AutoIPLocHook.m
           grep -Fq "object_setIvarWithStrongDefault" Tweak/AutoIPLocHook.m
@@ -81,6 +105,9 @@ jobs:
           grep -Fq "methodMatchesSignature" main.swift
           grep -Fq "method_copyArgumentType" main.swift
           grep -Fq "hook_freeifaddrs" Tweak/AutoIPLocHook.m
+          grep -Fq "AutoIPLocIfaddrsCloneAndRegister" Tweak/AutoIPLocHook.m
+          grep -Fq "AutoIPLocIfaddrsReleaseRegistered" Tweak/AutoIPLocHook.m
+          grep -Fq "if (!ifap)" Tweak/AutoIPLocHook.m
           grep -Fq "INSTALL_C_FUNCTION_HOOK(freeifaddrs" Tweak/AutoIPLocHook.m
           if grep -Fq "memcpy(head, nextNode" Tweak/AutoIPLocHook.m; then
             echo "Unsafe in-place ifaddrs list mutation detected" >&2
@@ -108,7 +135,8 @@ jobs:
             -install_name /Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib \
             -framework Foundation -framework UIKit -framework CoreLocation -framework CoreTelephony -framework SystemConfiguration -framework CFNetwork \
             -fobjc-arc \
-            Tweak/AutoIPLocHook.m \
+            Tweak/AutoIPLocHook.m Tweak/AutoIPLocIfaddrs.c \
+            -I Tweak \
             -o deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
 
           MAIN_BIN="Payload/AutoIPLoc.app/AutoIPLoc"
@@ -166,7 +194,7 @@ jobs:
           EOF
 
           INSTALLED_SIZE=$(du -sk deb_pkg/var | cut -f1)
-          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 4.3.4\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Fat arm64+arm64e XPC-level CLLocationSourceInformation scrub & RootHide ElleKit stealth hook\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
+          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 4.3.5\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Fat arm64+arm64e XPC-level CLLocationSourceInformation scrub & RootHide ElleKit stealth hook\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
 
           chmod 0755 deb_pkg/DEBIAN
           chmod 0755 deb_pkg/DEBIAN/postinst

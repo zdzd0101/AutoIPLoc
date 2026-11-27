@@ -2,7 +2,6 @@ import SwiftUI
 import UIKit
 import CoreLocation
 import Network
-import AVFoundation
 import Darwin
 import ObjectiveC
 
@@ -414,9 +413,13 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             }
         }
 
-        if let wDict = readSharedPlist(paths: wifiPlistPaths),
-           let nets = wDict["networks"] as? [[String: String]] {
-            wifiList = nets
+        if let wDict = readSharedPlist(paths: wifiPlistPaths) {
+            if let validatedNetworks = WiFiConfigValidator.validatedNetworks(wDict["networks"]) {
+                wifiList = validatedNetworks
+            } else {
+                wifiList = []
+                statusError = statusError ?? "已保存的 Wi-Fi 配置格式无效；未加载不完整的网络条目。"
+            }
         }
     }
 
@@ -740,9 +743,13 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     }
 
     private func saveWiFiPlist(enabled: Bool) {
+        guard let validatedNetworks = WiFiConfigValidator.validatedNetworks(wifiList) else {
+            statusError = "Wi-Fi 配置未保存：SSID 必须为 1–32 个 UTF-8 字节，BSSID 必须为六组十六进制字节。"
+            return
+        }
         let dict: [String: Any] = [
             "enabled": enabled,
-            "networks": wifiList
+            "networks": validatedNetworks
         ]
         writeSharedPlist(dict, paths: wifiPlistPaths)
     }

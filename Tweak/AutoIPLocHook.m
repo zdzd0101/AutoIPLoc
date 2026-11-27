@@ -9,6 +9,7 @@
 #import <objc/message.h>
 #import <mach-o/dyld.h>
 #import <ifaddrs.h>
+#import "AutoIPLocIfaddrs.h"
 #import <dlfcn.h>
 #import <dirent.h>
 #import <sys/stat.h>
@@ -693,24 +694,18 @@ static void (*orig_freeifaddrs)(struct ifaddrs *ifap) = NULL;
 
 #define AUTOIPLOC_IFADDRS_MAX_NODES 4096
 
-typedef struct AutoIPLocIfaddrsAllocation {
-    struct AutoIPLocIfaddrsAllocation *registryNext;
-    struct ifaddrs *originalHead;
-    size_t visibleCount;
-    struct ifaddrs nodes[];
-} AutoIPLocIfaddrsAllocation;
-
-static pthread_mutex_t g_ifaddrsRegistryLock = PTHREAD_MUTEX_INITIALIZER;
-static AutoIPLocIfaddrsAllocation *g_ifaddrsAllocations = NULL;
-
 static int hook_getifaddrs(struct ifaddrs **ifap) {
+    if (!ifap) {
+        errno = EFAULT;
+        return -1;
+    }
     if (!orig_getifaddrs) {
         errno = ENOSYS;
         return -1;
     }
 
     int ret = orig_getifaddrs(ifap);
-    if (ret != 0 || !ifap || !*ifap || !orig_freeifaddrs) return ret;
+    if (ret != 0 || !*ifap || !orig_freeifaddrs) return ret;
 
     size_t totalCount = 0;
     size_t visibleCount = 0;
@@ -719,62 +714,34 @@ static int hook_getifaddrs(struct ifaddrs **ifap) {
         if (!IsVirtualVPNInterface(node->ifa_name)) visibleCount++;
     }
 
-    // Keep the original allocation untouched if filtering is unnecessary or
-    // would otherwise return an empty list with ambiguous caller expectations.
+    // Preserve the original list whenever the existing selection policy does
+    // not produce a non-empty, smaller result.
     if (visibleCount == 0 || visibleCount == totalCount) return ret;
-    if (visibleCount > (SIZE_MAX - sizeof(AutoIPLocIfaddrsAllocation)) / sizeof(struct ifaddrs)) {
-        return ret;
-    }
+    if (visibleCount > SIZE_MAX / sizeof(struct ifaddrs *)) return ret;
 
-    size_t allocationSize = sizeof(AutoIPLocIfaddrsAllocation) + visibleCount * sizeof(struct ifaddrs);
-    AutoIPLocIfaddrsAllocation *allocation = calloc(1, allocationSize);
-    if (!allocation) return ret;
-
-    allocation->originalHead = *ifap;
-    allocation->visibleCount = visibleCount;
+    const struct ifaddrs **selectedNodes = calloc(visibleCount, sizeof(*selectedNodes));
+    if (!selectedNodes) return ret;
 
     size_t index = 0;
     for (struct ifaddrs *node = *ifap; node != NULL; node = node->ifa_next) {
-        if (IsVirtualVPNInterface(node->ifa_name)) continue;
-        allocation->nodes[index] = *node;
-        allocation->nodes[index].ifa_next =
-            (index + 1 < visibleCount) ? &allocation->nodes[index + 1] : NULL;
-        index++;
+        if (!IsVirtualVPNInterface(node->ifa_name)) {
+            selectedNodes[index++] = node;
+        }
     }
 
-    pthread_mutex_lock(&g_ifaddrsRegistryLock);
-    allocation->registryNext = g_ifaddrsAllocations;
-    g_ifaddrsAllocations = allocation;
-    pthread_mutex_unlock(&g_ifaddrsRegistryLock);
+    struct ifaddrs *registeredHead =
+        AutoIPLocIfaddrsCloneAndRegister(*ifap, selectedNodes, visibleCount);
+    free(selectedNodes);
+    if (!registeredHead) return ret;
 
-    *ifap = &allocation->nodes[0];
+    *ifap = registeredHead;
     return ret;
 }
 
 static void hook_freeifaddrs(struct ifaddrs *ifap) {
-    if (!ifap) {
-        if (orig_freeifaddrs) orig_freeifaddrs(NULL);
-        return;
-    }
+    if (!ifap) return;
 
-    AutoIPLocIfaddrsAllocation *matched = NULL;
-    pthread_mutex_lock(&g_ifaddrsRegistryLock);
-    AutoIPLocIfaddrsAllocation **cursor = &g_ifaddrsAllocations;
-    while (*cursor != NULL) {
-        if (&(*cursor)->nodes[0] == ifap) {
-            matched = *cursor;
-            *cursor = matched->registryNext;
-            break;
-        }
-        cursor = &(*cursor)->registryNext;
-    }
-    pthread_mutex_unlock(&g_ifaddrsRegistryLock);
-
-    if (matched != NULL) {
-        if (orig_freeifaddrs && matched->originalHead) {
-            orig_freeifaddrs(matched->originalHead);
-        }
-        free(matched);
+    if (AutoIPLocIfaddrsReleaseRegistered(ifap, orig_freeifaddrs)) {
         return;
     }
 
@@ -894,15 +861,55 @@ static NSString *hook_targetCountryCode(id self, SEL _cmd) {
     return GetTargetCountryCode();
 }
 
-static NSArray<NSDictionary *> *GetMockWiFiList(void) {
-    NSDictionary *wifiCfg = LoadWiFiConfig();
-    if ([wifiCfg[@"enabled"] boolValue]) {
-        NSArray *nets = wifiCfg[@"networks"];
-        if ([nets isKindOfClass:[NSArray class]] && nets.count > 0) {
-            return nets;
+static BOOL IsValidWiFiSSIDValue(NSString *ssid) {
+    if (![ssid isKindOfClass:[NSString class]]) return NO;
+    NSData *data = [ssid dataUsingEncoding:NSUTF8StringEncoding allowLossyConversion:NO];
+    return data.length > 0 && data.length <= 32;
+}
+
+static BOOL IsValidWiFiBSSIDValue(NSString *bssid) {
+    if (![bssid isKindOfClass:[NSString class]]) return NO;
+    NSArray<NSString *> *octets = [bssid componentsSeparatedByString:@":"];
+    if (octets.count != 6) return NO;
+
+    NSCharacterSet *nonHex = [[NSCharacterSet characterSetWithCharactersInString:
+        @"0123456789abcdefABCDEF"] invertedSet];
+    for (NSString *octet in octets) {
+        if (octet.length != 2 ||
+            [octet rangeOfCharacterFromSet:nonHex].location != NSNotFound) {
+            return NO;
         }
     }
-    return nil;
+    return YES;
+}
+
+static NSArray<NSDictionary *> *GetMockWiFiList(void) {
+    NSDictionary *wifiCfg = LoadWiFiConfig();
+    id enabledValue = wifiCfg[@"enabled"];
+    id rawNetworks = wifiCfg[@"networks"];
+    if (![enabledValue isKindOfClass:[NSNumber class]] || ![enabledValue boolValue] ||
+        ![rawNetworks isKindOfClass:[NSArray class]]) {
+        return nil;
+    }
+
+    NSArray *nets = (NSArray *)rawNetworks;
+    if (nets.count == 0 || nets.count > 64) return nil;
+
+    NSMutableArray<NSDictionary *> *validated = [NSMutableArray arrayWithCapacity:nets.count];
+    for (id item in nets) {
+        if (![item isKindOfClass:[NSDictionary class]]) return nil;
+        NSDictionary *entry = (NSDictionary *)item;
+        id ssid = entry[@"SSID"];
+        id bssid = entry[@"BSSID"];
+        if (![ssid isKindOfClass:[NSString class]] ||
+            ![bssid isKindOfClass:[NSString class]] ||
+            !IsValidWiFiSSIDValue((NSString *)ssid) ||
+            !IsValidWiFiBSSIDValue((NSString *)bssid)) {
+            return nil;
+        }
+        [validated addObject:@{@"SSID": ssid, @"BSSID": bssid}];
+    }
+    return [validated copy];
 }
 
 static CFArrayRef (*orig_CNCopySupportedInterfaces)(void) = NULL;
@@ -1076,7 +1083,7 @@ static void AutoIPLocHookEntry(void) {
 
         NSDictionary *status = @{
             @"active": @(g_installedCHookCount > 0 || g_installedObjCHookCount > 0),
-            @"version": @"4.3.4",
+            @"version": @"4.3.5",
             @"lastProc": [NSString stringWithUTF8String:prog],
             @"cHookReady": @(orig_dladdr != NULL && orig_getifaddrs != NULL && orig_freeifaddrs != NULL),
             @"cHookCount": @(g_installedCHookCount),
