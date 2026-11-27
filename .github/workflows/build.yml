@@ -26,7 +26,7 @@ jobs:
             -import-objc-header Bridge.h \
             -sdk "$SDK_PATH" \
             -target arm64-apple-ios15.0 \
-            -framework SwiftUI -framework UIKit -framework CoreLocation -framework Network -framework AVFoundation \
+            -framework SwiftUI -framework UIKit -framework CoreLocation -framework Network \
             -o Payload/AutoIPLoc.app/AutoIPLoc
 
           cp Info.plist Payload/AutoIPLoc.app/Info.plist
@@ -83,7 +83,7 @@ jobs:
           EOF
 
           INSTALLED_SIZE=$(du -sk deb_pkg/var | cut -f1)
-          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 4.3.0\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Fat arm64+arm64e XPC-level CLLocationSourceInformation scrub & RootHide ElleKit stealth hook\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
+          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 4.4.0\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Fat arm64+arm64e stealth hook with ARC-safe XPC scrub, PAC strip, TLS self-bypass, NSLocale & dynamic carrier spoof\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
 
           chmod 0755 deb_pkg/DEBIAN
           chmod 0755 deb_pkg/DEBIAN/postinst
