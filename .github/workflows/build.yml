@@ -43,6 +43,20 @@ jobs:
           plutil -lint Info.plist
           plutil -lint entitlements.plist
           plutil -lint Tweak/AutoIPLocHook.plist
+          echo "Checking Hook source safety invariants..."
+          grep -Fq "MethodHasExpectedSignature" Tweak/AutoIPLocHook.m
+          grep -Fq "object_setIvarWithStrongDefault" Tweak/AutoIPLocHook.m
+          grep -Fq "hook_freeifaddrs" Tweak/AutoIPLocHook.m
+          grep -Fq "INSTALL_C_FUNCTION_HOOK(freeifaddrs" Tweak/AutoIPLocHook.m
+          if grep -Fq "memcpy(head, nextNode" Tweak/AutoIPLocHook.m; then
+            echo "Unsafe in-place ifaddrs list mutation detected" >&2
+            exit 1
+          fi
+          if grep -Eq '\(IMP \*\)&orig_|\(void \*\*\)&orig_' Tweak/AutoIPLocHook.m; then
+            echo "Aliased typed function-pointer storage passed to hook API" >&2
+            exit 1
+          fi
+
           /usr/libexec/PlistBuddy -c "Delete :NSAppTransportSecurity" Payload/AutoIPLoc.app/Info.plist 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity dict" Payload/AutoIPLoc.app/Info.plist
           /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSAllowsArbitraryLoads bool true" Payload/AutoIPLoc.app/Info.plist
@@ -98,17 +112,31 @@ jobs:
 
           cat << 'EOF' > deb_pkg/DEBIAN/postinst
           #!/bin/sh
-          for JB in /var/containers/Bundle/Application/.jbroot-*; do
+          set -eu
+          umask 022
+
+          ROOT_FILE="/var/tmp/com.autoiploc.jbroot.txt"
+          ROOT_TMP="${ROOT_FILE}.$$"
+          ROOT_DIR="/var/containers/Bundle/Application"
+
+          : > "$ROOT_TMP"
+          for JB in "$ROOT_DIR"/.jbroot-*; do
             if [ -d "$JB" ]; then
-              printf "%s\n" "$JB" > /var/tmp/com.autoiploc.jbroot.txt
-              chmod 666 /var/tmp/com.autoiploc.jbroot.txt
+              printf "%s\n" "$JB" >> "$ROOT_TMP"
             fi
           done
+
+          if [ -s "$ROOT_TMP" ]; then
+            chmod 0644 "$ROOT_TMP"
+            mv -f "$ROOT_TMP" "$ROOT_FILE"
+          else
+            rm -f "$ROOT_TMP" "$ROOT_FILE"
+          fi
           exit 0
           EOF
 
           INSTALLED_SIZE=$(du -sk deb_pkg/var | cut -f1)
-          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 4.3.0\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Fat arm64+arm64e XPC-level CLLocationSourceInformation scrub & RootHide ElleKit stealth hook\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
+          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 4.3.1\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Fat arm64+arm64e XPC-level CLLocationSourceInformation scrub & RootHide ElleKit stealth hook\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
 
           chmod 0755 deb_pkg/DEBIAN
           chmod 0755 deb_pkg/DEBIAN/postinst

@@ -176,14 +176,36 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     private func findInstalledHookDylib() -> String? {
         let fm = FileManager.default
         let baseDir = "/var/containers/Bundle/Application"
+        var roots: [String] = []
+
+        if let savedRootList = try? String(
+            contentsOfFile: "/var/tmp/com.autoiploc.jbroot.txt",
+            encoding: .utf8
+        ) {
+            roots.append(contentsOf: savedRootList.components(separatedBy: .newlines))
+        }
+
         if let items = try? fm.contentsOfDirectory(atPath: baseDir) {
-            for item in items where item.hasPrefix(".jbroot-") {
-                let candidate = "\(baseDir)/\(item)/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib"
-                if fm.fileExists(atPath: candidate) {
-                    return candidate
-                }
+            roots.append(contentsOf: items
+                .filter { $0.hasPrefix(".jbroot-") }
+                .sorted()
+                .map { "\(baseDir)/\($0)" })
+        }
+
+        var visitedRoots = Set<String>()
+        for rawRoot in roots {
+            let root = rawRoot.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard root.hasPrefix("\(baseDir)/.jbroot-"),
+                  visitedRoots.insert(root).inserted else {
+                continue
+            }
+
+            let candidate = "\(root)/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib"
+            if fm.fileExists(atPath: candidate) {
+                return candidate
             }
         }
+
         let fallback = "/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib"
         return fm.fileExists(atPath: fallback) ? fallback : nil
     }

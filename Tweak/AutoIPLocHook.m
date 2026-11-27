@@ -58,7 +58,8 @@ static BOOL TryLoadElleKitFromRoot(const char *jbRoot) {
     };
     for (int i = 0; i < 4; i++) {
         char fullPath[768] = {0};
-        snprintf(fullPath, sizeof(fullPath), "%s%s", jbRoot, relPaths[i]);
+        int pathLength = snprintf(fullPath, sizeof(fullPath), "%s%s", jbRoot, relPaths[i]);
+        if (pathLength <= 0 || (size_t)pathLength >= sizeof(fullPath)) continue;
         BeginInternalIO();
         void *h = dlopen(fullPath, RTLD_NOW | RTLD_GLOBAL);
         EndInternalIO();
@@ -88,8 +89,12 @@ static void ResolveElleKitRuntime(void *selfSymbolAddr) {
         EndInternalIO();
     }
     if (savedRoot.length > 0) {
-        NSString *trimmed = [savedRoot stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if (TryLoadElleKitFromRoot(trimmed.UTF8String)) return;
+        NSCharacterSet *separators = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+        for (NSString *rawRoot in [savedRoot componentsSeparatedByCharactersInSet:separators]) {
+            NSString *trimmed = [rawRoot stringByTrimmingCharactersInSet:separators];
+            if (![trimmed hasPrefix:@"/var/containers/Bundle/Application/.jbroot-"]) continue;
+            if (TryLoadElleKitFromRoot(trimmed.UTF8String)) return;
+        }
     }
 
     Dl_info selfInfo;
@@ -691,7 +696,12 @@ static BOOL hook_returnNO(id self, SEL _cmd) {
     return NO;
 }
 
-static id (*orig_initWithSimState)(id self, SEL _cmd, BOOL isSimulated, BOOL isAccessory) = NULL;
+typedef id AutoIPLocInitWithSimStateIMP(id, SEL, BOOL, BOOL) __attribute__((ns_returns_retained));
+typedef id AutoIPLocInitWithCoderIMP(id, SEL, NSCoder *) __attribute__((ns_returns_retained));
+typedef id AutoIPLocCopyWithZoneIMP(id, SEL, NSZone *) __attribute__((ns_returns_retained));
+
+static AutoIPLocInitWithSimStateIMP *orig_initWithSimState = NULL;
+static id hook_initWithSimState(id self, SEL _cmd, BOOL isSimulated, BOOL isAccessory) __attribute__((ns_returns_retained));
 static id hook_initWithSimState(id self, SEL _cmd, BOOL isSimulated, BOOL isAccessory) {
     if (!orig_initWithSimState) return nil;
     return orig_initWithSimState(self, _cmd, NO, NO);
@@ -709,7 +719,8 @@ static id CreateCleanLocationSourceInfo(void) {
     return [obj init];
 }
 
-static id (*orig_srcInfoInitWithCoder)(id self, SEL _cmd, NSCoder *coder) = NULL;
+static AutoIPLocInitWithCoderIMP *orig_srcInfoInitWithCoder = NULL;
+static id hook_srcInfoInitWithCoder(id self, SEL _cmd, NSCoder *coder) __attribute__((ns_returns_retained));
 static id hook_srcInfoInitWithCoder(id self, SEL _cmd, NSCoder *coder) {
     if (!orig_srcInfoInitWithCoder) return nil;
     id decoded = orig_srcInfoInitWithCoder(self, _cmd, coder);
@@ -725,14 +736,16 @@ static id hook_sourceInformation(id self, SEL _cmd) {
     return orig_sourceInformation ? orig_sourceInformation(self, _cmd) : nil;
 }
 
-static id (*orig_srcInfoCopyWithZone)(id self, SEL _cmd, NSZone *zone) = NULL;
+static AutoIPLocCopyWithZoneIMP *orig_srcInfoCopyWithZone = NULL;
+static id hook_srcInfoCopyWithZone(id self, SEL _cmd, NSZone *zone) __attribute__((ns_returns_retained));
 static id hook_srcInfoCopyWithZone(id self, SEL _cmd, NSZone *zone) {
     id clean = CreateCleanLocationSourceInfo();
     if (clean) return clean;
     return orig_srcInfoCopyWithZone ? orig_srcInfoCopyWithZone(self, _cmd, zone) : self;
 }
 
-static id (*orig_locInitWithCoder)(id self, SEL _cmd, NSCoder *coder) = NULL;
+static AutoIPLocInitWithCoderIMP *orig_locInitWithCoder = NULL;
+static id hook_locInitWithCoder(id self, SEL _cmd, NSCoder *coder) __attribute__((ns_returns_retained));
 static id hook_locInitWithCoder(id self, SEL _cmd, NSCoder *coder) {
     if (!orig_locInitWithCoder) return nil;
     id decoded = orig_locInitWithCoder(self, _cmd, coder);
@@ -932,7 +945,7 @@ static void AutoIPLocHookEntry(void) {
 
         NSDictionary *status = @{
             @"active": @(g_installedCHookCount > 0 || g_installedObjCHookCount > 0),
-            @"version": @"4.3.0",
+            @"version": @"4.3.1",
             @"lastProc": [NSString stringWithUTF8String:prog],
             @"cHookReady": @(orig_dladdr != NULL && orig_getifaddrs != NULL && orig_freeifaddrs != NULL),
             @"cHookCount": @(g_installedCHookCount),
