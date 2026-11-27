@@ -15,6 +15,13 @@ struct IPGeoDisplayInfo: Equatable {
     let postalCode: String?
     let provider: String
 
+    var qualityScore: Int {
+        (timeZoneIdentifier == nil ? 0 : 4) +
+        (city == nil ? 0 : 2) +
+        (region == nil ? 0 : 1) +
+        ((countryName ?? countryCode) == nil ? 0 : 1)
+    }
+
     var areaDescription: String {
         [city, region, countryName ?? countryCode]
             .compactMap { value -> String? in

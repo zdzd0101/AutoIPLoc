@@ -493,6 +493,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
 
         var settled = false
         var completedCount = 0
+        var bestInfo: IPGeoDisplayInfo? = nil
         var lastFailure = "未收到有效响应"
         let expectedCount = requests.count
 
@@ -518,23 +519,10 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
                 }
 
                 if let info = parsedInfo {
-                    settled = true
-                    self.activeIPDisplaySession = nil
-                    self.ipDisplayStateLock.unlock()
-                    session.invalidateAndCancel()
-
-                    DispatchQueue.main.async {
-                        self.ipDisplayStateLock.lock()
-                        let stillCurrent = self.activeIPDisplayRequestID == requestID
-                        self.ipDisplayStateLock.unlock()
-                        guard stillCurrent else { return }
-                        self.applyIPGeoDisplay(info)
+                    if bestInfo == nil || info.qualityScore > bestInfo!.qualityScore {
+                        bestInfo = info
                     }
-                    return
-                }
-
-                completedCount += 1
-                if let http {
+                } else if let http {
                     lastFailure = "HTTP \(http.statusCode)（\(request.url?.host ?? "unknown")）"
                 } else if let error {
                     lastFailure = "\((error as NSError).localizedDescription)（\(request.url?.host ?? "unknown")）"
@@ -542,20 +530,27 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
                     lastFailure = "响应字段不包含可验证的 IP 和有效坐标（\(request.url?.host ?? "unknown")）"
                 }
 
-                let allFailed = completedCount >= expectedCount
-                if allFailed {
+                completedCount += 1
+                let allCompleted = completedCount >= expectedCount
+                let chosenInfo = allCompleted ? bestInfo : nil
+                if allCompleted {
                     settled = true
                     self.activeIPDisplaySession = nil
                 }
                 self.ipDisplayStateLock.unlock()
 
-                if allFailed {
-                    session.finishTasksAndInvalidate()
-                    DispatchQueue.main.async {
-                        self.ipDisplayStateLock.lock()
-                        let stillCurrent = self.activeIPDisplayRequestID == requestID
-                        self.ipDisplayStateLock.unlock()
-                        guard stillCurrent else { return }
+                guard allCompleted else { return }
+                session.finishTasksAndInvalidate()
+
+                DispatchQueue.main.async {
+                    self.ipDisplayStateLock.lock()
+                    let stillCurrent = self.activeIPDisplayRequestID == requestID
+                    self.ipDisplayStateLock.unlock()
+                    guard stillCurrent else { return }
+
+                    if let chosenInfo {
+                        self.applyIPGeoDisplay(chosenInfo)
+                    } else {
                         self.finishIPGeoRefresh(
                             error: "未取得有效的 IP 地理坐标：\(lastFailure)"
                         )
