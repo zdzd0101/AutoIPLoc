@@ -8,7 +8,7 @@
 #include <string.h>
 
 #define THREAD_COUNT 8
-#define ITERATIONS_PER_THREAD 50
+#define ITERATIONS_PER_THREAD 1000
 
 static atomic_int g_original_free_calls = 0;
 

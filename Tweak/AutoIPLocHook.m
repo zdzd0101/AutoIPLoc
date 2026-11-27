@@ -1081,13 +1081,17 @@ static void AutoIPLocHookEntry(void) {
             INSTALL_C_FUNCTION_HOOK(CNCopySupportedInterfaces, hook_CNCopySupportedInterfaces, orig_CNCopySupportedInterfaces);
         }
 
+        NSDictionary *geoConfigSnapshot = LoadGeoConfig();
+        NSDictionary *wifiConfigSnapshot = LoadWiFiConfig();
         NSDictionary *status = @{
             @"active": @(g_installedCHookCount > 0 || g_installedObjCHookCount > 0),
-            @"version": @"4.3.5",
+            @"version": @"4.3.6",
             @"lastProc": [NSString stringWithUTF8String:prog],
             @"cHookReady": @(orig_dladdr != NULL && orig_getifaddrs != NULL && orig_freeifaddrs != NULL),
             @"cHookCount": @(g_installedCHookCount),
             @"objcHookCount": @(g_installedObjCHookCount),
+            @"geoConfigReadable": @(geoConfigSnapshot != nil),
+            @"wifiConfigReadable": @(wifiConfigSnapshot != nil),
             @"timestamp": @([[NSDate date] timeIntervalSince1970])
         };
         BeginInternalIO();

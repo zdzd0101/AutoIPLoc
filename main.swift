@@ -30,7 +30,10 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     @Published var streetAddress = "等待获取 IP 附近的地理编码结果..."
     @Published var zipCode = "--"
     @Published var hookStatusText = "正在检测插件状态..."
+    @Published var hookInstallStatusText = "尚未检查 Hook 安装路径"
+    @Published var hookConfigStatusText = "尚无 Hook 进程配置读取报告"
     @Published var hookIsActive = false
+    @Published var maintenanceStatusText = ""
     @Published var autoSyncOnNetworkChange = true
     @Published var lockSessionGeo = true
     @Published var wifiList: [[String: String]] = []
@@ -287,45 +290,41 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         return true
     }
 
-    private func findInstalledHookDylib() -> String? {
+    private func findInstalledHookDylibs() -> [String] {
         let fm = FileManager.default
         let baseDir = "/var/containers/Bundle/Application"
-        var roots: [String] = []
+        let legacyPath = "/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib"
 
-        if let savedRootList = try? String(
+        let savedRootList = try? String(
             contentsOfFile: "/var/tmp/com.autoiploc.jbroot.txt",
             encoding: .utf8
-        ) {
-            roots.append(contentsOf: savedRootList.components(separatedBy: .newlines))
+        )
+        let discoveredRoots = (try? fm.contentsOfDirectory(atPath: baseDir)) ?? []
+        let possiblePaths = HookInstallResolver.candidatePaths(
+            savedRootList: savedRootList,
+            discoveredRootNames: discoveredRoots,
+            baseDirectory: baseDir,
+            hookRelativePath: "Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib",
+            legacyPath: legacyPath,
+            legacyPathExists: fm.fileExists(atPath: legacyPath)
+        )
+        return possiblePaths.filter { fm.fileExists(atPath: $0) }.sorted()
+    }
+
+    private func updateHookInstallDiagnostic(_ candidates: [String]) {
+        switch candidates.count {
+        case 0:
+            hookInstallStatusText = "未找到 Hook 文件；请核对当前 RootHide 根目录和 DEB 安装状态"
+        case 1:
+            hookInstallStatusText = "找到 1 个候选文件：\(candidates[0])；文件存在不代表已加载"
+        default:
+            hookInstallStatusText = "发现 \(candidates.count) 个 Hook 文件副本，RootHide 根目录存在歧义；没有擅自选择第一个：\(candidates.joined(separator: "；"))"
         }
-
-        if let items = try? fm.contentsOfDirectory(atPath: baseDir) {
-            roots.append(contentsOf: items
-                .filter { $0.hasPrefix(".jbroot-") }
-                .sorted()
-                .map { "\(baseDir)/\($0)" })
-        }
-
-        var visitedRoots = Set<String>()
-        for rawRoot in roots {
-            let root = rawRoot.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard root.hasPrefix("\(baseDir)/.jbroot-"),
-                  visitedRoots.insert(root).inserted else {
-                continue
-            }
-
-            let candidate = "\(root)/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib"
-            if fm.fileExists(atPath: candidate) {
-                return candidate
-            }
-        }
-
-        let fallback = "/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib"
-        return fm.fileExists(atPath: fallback) ? fallback : nil
     }
 
     func refreshHookStatus() {
         let now = Date().timeIntervalSince1970
+        updateHookInstallDiagnostic(findInstalledHookDylibs())
         let reports = hookStatusPaths.compactMap { readSharedPlist(paths: [$0]) }
         let activeReports = reports.filter { ($0["active"] as? Bool) == true }
 
@@ -337,6 +336,12 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             let hookOk = (dict["cHookReady"] as? Bool) ?? false
             let cCount = dict["cHookCount"] as? Int ?? 0
             let objcCount = dict["objcHookCount"] as? Int ?? 0
+            if let geoReadable = dict["geoConfigReadable"] as? Bool,
+               let wifiReadable = dict["wifiConfigReadable"] as? Bool {
+                hookConfigStatusText = "\(proc)：Geo 配置\(geoReadable ? "可读取" : "未读取/不存在")；Wi-Fi 配置\(wifiReadable ? "可读取" : "未读取/不存在")。这是该进程自己的读取报告。"
+            } else {
+                hookConfigStatusText = "\(proc)：旧版 Hook 未提供 Geo/Wi-Fi 跨进程读取状态。"
+            }
             let ts = (dict["timestamp"] as? Double) ?? 0
             let ageSec = Int(max(0, now - ts))
 
@@ -353,13 +358,9 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             }
         }
 
-        if findInstalledHookDylib() != nil {
-            hookIsActive = false
-            hookStatusText = "已找到 Hook 动态库文件；未验证目标进程加载或实际执行"
-        } else {
-            hookIsActive = false
-            hookStatusText = "未找到 AutoIPLocHook.dylib（请检查 RootHide 安装路径）"
-        }
+        hookConfigStatusText = "没有最近的 Hook 进程报告，无法确认该进程是否读取到 Geo/Wi-Fi 配置。"
+        hookIsActive = false
+        hookStatusText = "没有可用的 Hook 加载报告；请先确认当前 RootHide 进程注入状态"
     }
 
     private func networkPathSignature(_ path: NWPath) -> String {
@@ -954,8 +955,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         let fm = FileManager.default
         let paths = [
             "/var/mobile/Library/Caches/com.apple.Maps",
-            "/var/mobile/Library/Caches/GeoServices",
-            "/var/mobile/Library/Preferences/com.apple.GEO.plist"
+            "/var/mobile/Library/Caches/GeoServices"
         ]
         var failures: [String] = []
         for path in paths where fm.fileExists(atPath: path) {
@@ -966,7 +966,11 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             }
         }
         if !failures.isEmpty {
-            statusError = "部分 Apple Maps 缓存未能清理：\(failures.joined(separator: "；"))"
+            maintenanceStatusText = ""
+            statusError = "部分 Apple Maps / GeoServices 缓存目录未能清理：\(failures.joined(separator: "；"))"
+        } else {
+            statusError = nil
+            maintenanceStatusText = "已处理 Maps / GeoServices 缓存目录；没有删除 com.apple.GEO.plist，也没有强制终止 geod。若服务仍保留内存状态，需要在正常重启后再验证。"
         }
     }
 
@@ -1049,7 +1053,13 @@ struct ContentView: View {
                                 Text(engine.hookStatusText)
                                     .font(.caption)
                                     .foregroundColor(.secondary)
-                                Text("单个进程的报告不代表所有目标进程都已加载。")
+                                Text(engine.hookInstallStatusText)
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                                Text(engine.hookConfigStatusText)
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                                Text("单个进程的报告不代表所有目标进程都已加载；安装文件存在也不等于运行成功。")
                                     .font(.caption2)
                                     .foregroundColor(.secondary)
                             }
@@ -1151,13 +1161,19 @@ struct ContentView: View {
                     .disabled(engine.isSyncing)
 
                     Button(action: { engine.resetAppleMapsCache() }) {
-                        Text("清理 Apple Maps / GeoServices 本地缓存")
+                        Text("清理 Apple Maps / GeoServices 缓存目录")
                             .font(.subheadline.bold())
                             .foregroundColor(.blue)
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 12)
                             .background(Color.blue.opacity(0.12))
                             .cornerRadius(12)
+                    }
+                    if !engine.maintenanceStatusText.isEmpty {
+                        Text(engine.maintenanceStatusText)
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                     }
 
                     VStack(alignment: .leading, spacing: 8) {

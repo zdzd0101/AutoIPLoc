@@ -30,6 +30,10 @@ jobs:
             -o /tmp/autoiploc-tests/ip-geodata-tests
           /tmp/autoiploc-tests/ip-geodata-tests
 
+          swiftc -warnings-as-errors HookInstallResolver.swift Tests/HookInstallResolverTests.swift \
+            -o /tmp/autoiploc-tests/hook-path-tests
+          /tmp/autoiploc-tests/hook-path-tests
+
       - name: Install dpkg
         run: HOMEBREW_NO_AUTO_UPDATE=1 brew install dpkg
 
@@ -49,7 +53,7 @@ jobs:
           echo "Using iPhoneOS SDK: $SDK_PATH"
           xcrun --sdk iphoneos --show-sdk-version
 
-          "$IOS_SWIFTC" WiFiConfigValidation.swift IPGeoDisplayInfo.swift main.swift \
+          "$IOS_SWIFTC" WiFiConfigValidation.swift IPGeoDisplayInfo.swift HookInstallResolver.swift main.swift \
             -parse-as-library \
             -import-objc-header Bridge.h \
             -sdk "$SDK_PATH" \
@@ -75,6 +79,14 @@ jobs:
           grep -Fq "inet_pton(AF_INET6" main.swift
           grep -Fq "isValidGeoProfile(profile)" main.swift
           grep -Fq "WiFiConfigValidator.validatedNetworks" main.swift
+          grep -Fq "HookInstallResolver.candidatePaths" main.swift
+          grep -Fq "geoConfigReadable" Tweak/AutoIPLocHook.m
+          grep -Fq "wifiConfigReadable" Tweak/AutoIPLocHook.m
+          if grep -Fq '<string>com.apple.Preferences</string>' Tweak/AutoIPLocHook.plist; then
+            echo "AutoIPLoc Hook must not target the Preferences bundle" >&2
+            exit 1
+          fi
+          grep -Fq 'strcmp(prog, "Preferences") == 0' Tweak/AutoIPLocHook.m
           grep -Fq "activeReports.max(by:" main.swift
           if grep -Eq 'AVFoundation|AVAudio|AVCapture|AVPlayer' main.swift; then
             echo "Unused AVFoundation/audio/video dependency detected in main.swift" >&2
@@ -197,11 +209,30 @@ jobs:
           exit 0
           EOF
 
+          cat << 'EOF' > deb_pkg/DEBIAN/postrm
+          #!/bin/sh
+          set -eu
+
+          case "${1:-}" in
+            remove|purge)
+              # Remove package-owned diagnostics only. Preserve user Geo/Wi-Fi
+              # configuration so reinstall/rollback does not destroy user data.
+              rm -f /var/tmp/com.autoiploc.jbroot.txt
+              rm -f /var/tmp/com.autoiploc.hookstatus.plist
+              rm -f /var/mobile/Library/Preferences/com.autoiploc.hookstatus.plist
+              ;;
+          esac
+
+          exit 0
+          EOF
+          sh -n deb_pkg/DEBIAN/postrm
+
           INSTALLED_SIZE=$(du -sk deb_pkg/var | cut -f1)
-          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 4.3.5\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Fat arm64+arm64e XPC-level CLLocationSourceInformation scrub & RootHide ElleKit stealth hook\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
+          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 4.3.6\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Fat arm64+arm64e XPC-level CLLocationSourceInformation scrub & RootHide ElleKit stealth hook\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
 
           chmod 0755 deb_pkg/DEBIAN
           chmod 0755 deb_pkg/DEBIAN/postinst
+          chmod 0755 deb_pkg/DEBIAN/postrm
           chmod 0644 deb_pkg/DEBIAN/control
           chmod 0755 deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
           chmod 0644 deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
