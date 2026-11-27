@@ -9,7 +9,9 @@
 #import <objc/message.h>
 #import <mach-o/dyld.h>
 #import <os/lock.h>
+#import <net/if.h>
 #import <ifaddrs.h>
+#import <notify.h>
 #import <dlfcn.h>
 #import <dirent.h>
 #import <sys/stat.h>
@@ -22,12 +24,18 @@
 #include <ptrauth.h>
 #endif
 
+#define HOOK_VER_MAJOR 5
+#define HOOK_VER_MINOR 0
+#define HOOK_VER_PATCH 0
+#define HOOK_VER_STR   @"5.0.0"
+
 typedef void (*MSHookFunction_t)(void *symbol, void *replace, void **result);
 typedef void (*MSHookMessageEx_t)(Class _class, SEL message, IMP hook, IMP *old);
 
 static MSHookFunction_t g_MSHookFunction = NULL;
 static MSHookMessageEx_t g_MSHookMessageEx = NULL;
 static int (*orig_dladdr)(const void *addr, Dl_info *info) = NULL;
+static char g_selfDirPath[768] = {0};
 
 // ============================================================================
 // 1. PAC 指针剥离 & 线程局部重入守卫 (TLS)
@@ -54,8 +62,23 @@ static _Thread_local int g_localeHookDepth = 0;
 static _Thread_local int g_defaultsHookDepth = 0;
 
 // ============================================================================
-// 2. ElleKit / Substrate 动态解析
+// 2. 自身目录解析 & ElleKit / Substrate 动态解析
 // ============================================================================
+
+static void CaptureSelfDirectory(void *selfSymbolAddr) {
+    Dl_info selfInfo;
+    void *cleanAddr = StripFunctionPointerPAC(selfSymbolAddr);
+    if (dladdr(cleanAddr, &selfInfo) != 0 && selfInfo.dli_fname != NULL) {
+        const char *lastSlash = strrchr(selfInfo.dli_fname, '/');
+        if (lastSlash != NULL) {
+            size_t len = (size_t)(lastSlash - selfInfo.dli_fname);
+            if (len > 0 && len < sizeof(g_selfDirPath) - 1) {
+                memcpy(g_selfDirPath, selfInfo.dli_fname, len);
+                g_selfDirPath[len] = '\0';
+            }
+        }
+    }
+}
 
 static BOOL TryLoadElleKitFromRoot(const char *jbRoot) {
     if (!jbRoot || jbRoot[0] == '\0') return NO;
@@ -89,29 +112,28 @@ static void ResolveElleKitRuntime(void *selfSymbolAddr) {
         return;
     }
 
+    // 优先通过自身路径反推 jbroot（不依赖可能受沙盒限制的 /var/tmp）
+    if (g_selfDirPath[0] != '\0') {
+        const char *libMarker = strstr(g_selfDirPath, "/Library/");
+        if (libMarker != NULL) {
+            size_t rootLen = (size_t)(libMarker - g_selfDirPath);
+            if (rootLen > 0 && rootLen < 512) {
+                char jbRoot[512] = {0};
+                memcpy(jbRoot, g_selfDirPath, rootLen);
+                if (TryLoadElleKitFromRoot(jbRoot)) {
+                    g_selfCallDepth--;
+                    return;
+                }
+            }
+        }
+    }
+
     NSString *savedRoot = [NSString stringWithContentsOfFile:@"/var/tmp/com.autoiploc.jbroot.txt" encoding:NSUTF8StringEncoding error:nil];
     if (savedRoot.length > 0) {
         NSString *trimmed = [savedRoot stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         if (TryLoadElleKitFromRoot(trimmed.UTF8String)) {
             g_selfCallDepth--;
             return;
-        }
-    }
-
-    Dl_info selfInfo;
-    void *cleanSelfAddr = StripFunctionPointerPAC(selfSymbolAddr);
-    if (dladdr(cleanSelfAddr, &selfInfo) != 0 && selfInfo.dli_fname != NULL) {
-        const char *libMarker = strstr(selfInfo.dli_fname, "/Library/");
-        if (libMarker != NULL) {
-            size_t rootLen = (size_t)(libMarker - selfInfo.dli_fname);
-            if (rootLen > 0 && rootLen < 512) {
-                char jbRoot[512] = {0};
-                memcpy(jbRoot, selfInfo.dli_fname, rootLen);
-                if (TryLoadElleKitFromRoot(jbRoot)) {
-                    g_selfCallDepth--;
-                    return;
-                }
-            }
         }
     }
 
@@ -149,7 +171,7 @@ static void HookObjCMethod(Class cls, SEL sel, IMP newImp, IMP *oldImp) {
 }
 
 // ============================================================================
-// 3. 带内存缓存与 TLS 放行的配置读取（3秒 TTL，锁外磁盘 I/O）
+// 3. 多通道沙盒可读配置读取（优先读取插件同目录 <jbroot> + 3秒 TTL 内存缓存）
 // ============================================================================
 
 static os_unfair_lock g_cfgLock = OS_UNFAIR_LOCK_INIT;
@@ -158,6 +180,18 @@ static CFAbsoluteTime g_lastGeoLoad = 0;
 static NSDictionary *g_cachedWiFi = nil;
 static CFAbsoluteTime g_lastWiFiLoad = 0;
 static const CFAbsoluteTime kConfigCacheTTL = 3.0;
+
+static NSDictionary *LoadPlistMultiPath(const char *selfFileName, NSString *tmpPath, NSString *prefPath) {
+    NSDictionary *d = nil;
+    if (g_selfDirPath[0] != '\0') {
+        char selfCfgPath[1024] = {0};
+        snprintf(selfCfgPath, sizeof(selfCfgPath), "%s/%s", g_selfDirPath, selfFileName);
+        d = [NSDictionary dictionaryWithContentsOfFile:[NSString stringWithUTF8String:selfCfgPath]];
+    }
+    if (!d) d = [NSDictionary dictionaryWithContentsOfFile:tmpPath];
+    if (!d) d = [NSDictionary dictionaryWithContentsOfFile:prefPath];
+    return d;
+}
 
 static NSDictionary *LoadGeoConfig(void) {
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
@@ -170,8 +204,11 @@ static NSDictionary *LoadGeoConfig(void) {
     os_unfair_lock_unlock(&g_cfgLock);
 
     g_selfCallDepth++;
-    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@"/var/tmp/com.autoiploc.geo.plist"];
-    if (!d) d = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/com.autoiploc.geo.plist"];
+    NSDictionary *d = LoadPlistMultiPath(
+        "AutoIPLoc.geo.plist",
+        @"/var/tmp/com.autoiploc.geo.plist",
+        @"/var/mobile/Library/Preferences/com.autoiploc.geo.plist"
+    );
     g_selfCallDepth--;
 
     os_unfair_lock_lock(&g_cfgLock);
@@ -192,8 +229,11 @@ static NSDictionary *LoadWiFiConfig(void) {
     os_unfair_lock_unlock(&g_cfgLock);
 
     g_selfCallDepth++;
-    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@"/var/tmp/com.autoiploc.wifi.plist"];
-    if (!d) d = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/com.autoiploc.wifi.plist"];
+    NSDictionary *d = LoadPlistMultiPath(
+        "AutoIPLoc.wifi.plist",
+        @"/var/tmp/com.autoiploc.wifi.plist",
+        @"/var/mobile/Library/Preferences/com.autoiploc.wifi.plist"
+    );
     g_selfCallDepth--;
 
     os_unfair_lock_lock(&g_cfgLock);
@@ -219,6 +259,13 @@ static BOOL IsCarrierSpoofEnabled(void) {
     NSDictionary *cfg = LoadGeoConfig();
     if (!cfg || ![cfg[@"enabled"] boolValue]) return NO;
     id flag = cfg[@"spoofCarrier"];
+    return (flag == nil) ? YES : [flag boolValue];
+}
+
+static BOOL IsProxyStealthEnabled(void) {
+    NSDictionary *cfg = LoadGeoConfig();
+    if (!cfg) return YES;
+    id flag = cfg[@"spoofProxy"];
     return (flag == nil) ? YES : [flag boolValue];
 }
 
@@ -358,7 +405,8 @@ static BOOL IsJailbreakPath(const char *path) {
             strstr(path, "/etc/apt") != NULL ||
             strstr(path, "/bin/bash") != NULL ||
             strstr(path, "/bin/sh") != NULL ||
-            strstr(path, "autoiploc") != NULL);
+            strstr(path, "autoiploc") != NULL ||
+            strstr(path, "AutoIPLoc") != NULL);
 }
 
 static int (*orig_access)(const char *path, int mode) = NULL;
@@ -420,6 +468,40 @@ static BOOL hook_fileExistsIsDir(id self, SEL _cmd, NSString *path, BOOL *isDir)
         return NO;
     }
     return orig_fileExistsIsDir ? orig_fileExistsIsDir(self, _cmd, path, isDir) : NO;
+}
+
+static BOOL (*orig_isReadableFile)(id self, SEL _cmd, NSString *path) = NULL;
+static BOOL hook_isReadableFile(id self, SEL _cmd, NSString *path) {
+    if (g_selfCallDepth == 0 && IsJailbreakPath(path.UTF8String)) {
+        return NO;
+    }
+    return orig_isReadableFile ? orig_isReadableFile(self, _cmd, path) : NO;
+}
+
+static NSArray<NSString *> *(*orig_contentsOfDir)(id self, SEL _cmd, NSString *path, NSError **error) = NULL;
+static NSArray<NSString *> *hook_contentsOfDir(id self, SEL _cmd, NSString *path, NSError **error) {
+    if (g_selfCallDepth == 0 && IsJailbreakPath(path.UTF8String)) {
+        if (error) {
+            *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileReadNoSuchFileError userInfo:nil];
+        }
+        return nil;
+    }
+    NSArray<NSString *> *items = orig_contentsOfDir ? orig_contentsOfDir(self, _cmd, path, error) : nil;
+    if (g_selfCallDepth == 0 && items.count > 0 && path.length > 0) {
+        const char *p = path.UTF8String;
+        if (p && (strcmp(p, "/") == 0 || strcmp(p, "/var") == 0 || strcmp(p, "/private/var") == 0 ||
+                  strcmp(p, "/var/tmp") == 0 || strcmp(p, "/private/var/tmp") == 0 ||
+                  strcmp(p, "/Applications") == 0 || strstr(p, "Bundle/Application") != NULL)) {
+            NSMutableArray<NSString *> *filtered = [NSMutableArray arrayWithCapacity:items.count];
+            for (NSString *name in items) {
+                if (!IsJailbreakPath(name.UTF8String)) {
+                    [filtered addObject:name];
+                }
+            }
+            return filtered;
+        }
+    }
+    return items;
 }
 
 static pid_t (*orig_fork)(void) = NULL;
@@ -671,7 +753,7 @@ static BOOL hook_returnYES(id self, SEL _cmd) {
 }
 
 // ============================================================================
-// 9. 代理与 VPN 网卡隐身（PAC 剥离 + 放行系统/地图网络框架 + 单节点修复）
+// 9. 代理与 VPN 网卡隐身（PAC 剥离 + 全网卡 API 覆盖 + 代理隐身可配置）
 // ============================================================================
 
 static BOOL IsSystemNetworkingCaller(void *retAddr) {
@@ -687,7 +769,8 @@ static BOOL IsSystemNetworkingCaller(void *retAddr) {
             strstr(info.dli_fname, "GeoServices") != NULL ||
             strstr(info.dli_fname, "MapKit") != NULL ||
             strstr(info.dli_fname, "VectorKit") != NULL ||
-            strstr(info.dli_fname, "Foundation") != NULL) {
+            strstr(info.dli_fname, "Foundation") != NULL ||
+            strstr(info.dli_fname, "CoreFoundation") != NULL) {
             return YES;
         }
     }
@@ -708,7 +791,8 @@ static CFDictionaryRef CreateCleanProxyDict(void) {
 
 static CFDictionaryRef (*orig_CFNetworkCopySystemProxySettings)(void) = NULL;
 static CFDictionaryRef hook_CFNetworkCopySystemProxySettings(void) {
-    if (IsSystemNetworkingCaller(__builtin_return_address(0)) && orig_CFNetworkCopySystemProxySettings) {
+    if ((IsSystemNetworkingCaller(__builtin_return_address(0)) || !IsProxyStealthEnabled()) &&
+        orig_CFNetworkCopySystemProxySettings) {
         return orig_CFNetworkCopySystemProxySettings();
     }
     return CreateCleanProxyDict();
@@ -716,7 +800,8 @@ static CFDictionaryRef hook_CFNetworkCopySystemProxySettings(void) {
 
 static CFDictionaryRef (*orig_SCDynamicStoreCopyProxies)(void *store) = NULL;
 static CFDictionaryRef hook_SCDynamicStoreCopyProxies(void *store) {
-    if (IsSystemNetworkingCaller(__builtin_return_address(0)) && orig_SCDynamicStoreCopyProxies) {
+    if ((IsSystemNetworkingCaller(__builtin_return_address(0)) || !IsProxyStealthEnabled()) &&
+        orig_SCDynamicStoreCopyProxies) {
         return orig_SCDynamicStoreCopyProxies(store);
     }
     return CreateCleanProxyDict();
@@ -724,7 +809,8 @@ static CFDictionaryRef hook_SCDynamicStoreCopyProxies(void *store) {
 
 static NSDictionary *(*orig_connectionProxyDictionary)(id self, SEL _cmd) = NULL;
 static NSDictionary *hook_connectionProxyDictionary(id self, SEL _cmd) {
-    if (IsSystemNetworkingCaller(__builtin_return_address(0)) && orig_connectionProxyDictionary) {
+    if ((IsSystemNetworkingCaller(__builtin_return_address(0)) || !IsProxyStealthEnabled()) &&
+        orig_connectionProxyDictionary) {
         return orig_connectionProxyDictionary(self, _cmd);
     }
     return nil;
@@ -765,8 +851,32 @@ static int hook_getifaddrs(struct ifaddrs **ifap) {
     return ret;
 }
 
+static unsigned int (*orig_if_nametoindex)(const char *ifname) = NULL;
+static unsigned int hook_if_nametoindex(const char *ifname) {
+    if (g_selfCallDepth == 0 && IsVirtualVPNInterface(ifname)) {
+        return 0;
+    }
+    return orig_if_nametoindex ? orig_if_nametoindex(ifname) : if_nametoindex(ifname);
+}
+
+static struct if_nameindex *(*orig_if_nameindex)(void) = NULL;
+static struct if_nameindex *hook_if_nameindex(void) {
+    struct if_nameindex *list = orig_if_nameindex ? orig_if_nameindex() : if_nameindex();
+    if (list && g_selfCallDepth == 0) {
+        size_t w = 0;
+        for (size_t i = 0; list[i].if_index != 0 || list[i].if_name != NULL; i++) {
+            if (!IsVirtualVPNInterface(list[i].if_name)) {
+                list[w++] = list[i];
+            }
+        }
+        list[w].if_index = 0;
+        list[w].if_name = NULL;
+    }
+    return list;
+}
+
 // ============================================================================
-// 10. URL Scheme 探测拦截（涵盖常见越狱与代理客户端）
+// 10. URL Scheme 与已安装越狱/代理应用探测拦截
 // ============================================================================
 
 static BOOL IsBlockedURLScheme(NSString *scheme) {
@@ -782,6 +892,24 @@ static BOOL IsBlockedURLScheme(NSString *scheme) {
         ]];
     });
     return [blocked containsObject:scheme.lowercaseString];
+}
+
+static BOOL IsBlockedBundleIdentifier(NSString *bundleId) {
+    if (bundleId.length == 0) return NO;
+    NSString *lower = bundleId.lowercaseString;
+    static NSArray<NSString *> *keywords = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        keywords = @[
+            @"sileo", @"zebra", @"cydia", @"filza", @"trollstore", @"dopamine",
+            @"roothide", @"choicy", @"geranium", @"autoiploc", @"shadowrocket",
+            @"quantumult", @"surge", @"loon", @"stash", @"v2box", @"karing"
+        ];
+    });
+    for (NSString *kw in keywords) {
+        if ([lower containsString:kw]) return YES;
+    }
+    return NO;
 }
 
 static BOOL (*orig_canOpenURL)(id self, SEL _cmd, NSURL *url) = NULL;
@@ -806,6 +934,12 @@ static NSURL *(*orig_urlOverride)(id self, SEL _cmd, NSURL *url) = NULL;
 static NSURL *hook_urlOverride(id self, SEL _cmd, NSURL *url) {
     if (IsBlockedURLScheme(url.scheme)) return nil;
     return orig_urlOverride ? orig_urlOverride(self, _cmd, url) : nil;
+}
+
+static BOOL (*orig_appIsInstalled)(id self, SEL _cmd, NSString *bundleId) = NULL;
+static BOOL hook_appIsInstalled(id self, SEL _cmd, NSString *bundleId) {
+    if (IsBlockedBundleIdentifier(bundleId)) return NO;
+    return orig_appIsInstalled ? orig_appIsInstalled(self, _cmd, bundleId) : NO;
 }
 
 // ============================================================================
@@ -893,7 +1027,7 @@ static void *hook_locInitWithCoder(void *selfPtr, SEL _cmd, void *coderPtr) {
 }
 
 // ============================================================================
-// 12. GeoServices 国家与地区码伪造
+// 12. GeoServices 国家与地区码伪造（同步覆盖前台 App 与后台 geod）
 // ============================================================================
 
 #define DEFINE_GEO_CC_HOOK(name) \
@@ -912,6 +1046,21 @@ static BOOL (*orig_isChina)(id self, SEL _cmd) = NULL;
 static BOOL hook_isChina(id self, SEL _cmd) {
     if (g_selfCallDepth == 0 && IsGeoSpoofEnabled()) return NO;
     return orig_isChina ? orig_isChina(self, _cmd) : NO;
+}
+
+static void InstallGeoServicesHooks(void) {
+    dlopen("/System/Library/PrivateFrameworks/GeoServices.framework/GeoServices", RTLD_NOW);
+    Class geoCls = objc_getClass("GEOCountryConfiguration");
+    if (geoCls) {
+        HookObjCMethod(geoCls, NSSelectorFromString(@"countryCode"), (IMP)hook_geo_countryCode, (IMP *)&orig_geo_countryCode);
+        HookObjCMethod(geoCls, NSSelectorFromString(@"_countryCode"), (IMP)hook_geo__countryCode, (IMP *)&orig_geo__countryCode);
+        HookObjCMethod(geoCls, NSSelectorFromString(@"currentCountryCode"), (IMP)hook_geo_currentCountryCode, (IMP *)&orig_geo_currentCountryCode);
+        HookObjCMethod(geoCls, NSSelectorFromString(@"sourceCountryCode"), (IMP)hook_geo_sourceCountryCode, (IMP *)&orig_geo_sourceCountryCode);
+    }
+    Class platformCls = objc_getClass("GEOPlatform");
+    if (platformCls) {
+        HookObjCMethod(platformCls, NSSelectorFromString(@"isChina"), (IMP)hook_isChina, (IMP *)&orig_isChina);
+    }
 }
 
 // ============================================================================
@@ -979,7 +1128,49 @@ static NSString *hook_hotspotBSSID(id self, SEL _cmd) {
 }
 
 // ============================================================================
-// 14. 入口构造器
+// 14. 跨沙盒实时心跳上报（Darwin notify_set_state + 多路径 plist）
+// ============================================================================
+
+static void PublishHookHeartbeat(const char *prog, BOOL cHookReady) {
+    g_selfCallDepth++;
+
+    // 通道 1：Darwin notify_set_state（无需文件写权限，所有沙盒 App 100% 可上报）
+    uint64_t ts = (uint64_t)[[NSDate date] timeIntervalSince1970];
+    uint64_t state = ((uint64_t)(HOOK_VER_MAJOR & 0xFF) << 56) |
+                     ((uint64_t)(HOOK_VER_MINOR & 0xFF) << 48) |
+                     ((uint64_t)(HOOK_VER_PATCH & 0x7F) << 41) |
+                     ((uint64_t)(cHookReady ? 1 : 0) << 40) |
+                     (ts & 0xFFFFFFFFFFULL);
+    int token = 0;
+    if (notify_register_check("com.autoiploc.hook.heartbeat", &token) == NOTIFY_STATUS_OK) {
+        notify_set_state(token, state);
+        notify_cancel(token);
+    }
+
+    // 通道 2：多路径 plist 记录进程名与详情
+    NSDictionary *status = @{
+        @"active": @YES,
+        @"version": HOOK_VER_STR,
+        @"lastProc": [NSString stringWithUTF8String:prog ?: "App"],
+        @"cHookReady": @(cHookReady),
+        @"timestamp": @((double)ts)
+    };
+    if (g_selfDirPath[0] != '\0') {
+        char selfStatusPath[1024] = {0};
+        snprintf(selfStatusPath, sizeof(selfStatusPath), "%s/AutoIPLoc.hookstatus.plist", g_selfDirPath);
+        [status writeToFile:[NSString stringWithUTF8String:selfStatusPath] atomically:NO];
+        chmod(selfStatusPath, 0666);
+    }
+    [status writeToFile:@"/var/tmp/com.autoiploc.hookstatus.plist" atomically:NO];
+    chmod("/var/tmp/com.autoiploc.hookstatus.plist", 0666);
+    [status writeToFile:@"/var/mobile/Library/Preferences/com.autoiploc.hookstatus.plist" atomically:NO];
+    chmod("/var/mobile/Library/Preferences/com.autoiploc.hookstatus.plist", 0666);
+
+    g_selfCallDepth--;
+}
+
+// ============================================================================
+// 15. 入口构造器
 // ============================================================================
 
 __attribute__((constructor))
@@ -987,6 +1178,16 @@ static void AutoIPLocHookEntry(void) {
     @autoreleasepool {
         const char *prog = getprogname();
         if (!prog) return;
+
+        CaptureSelfDirectory((void *)&AutoIPLocHookEntry);
+
+        // 后台地图服务 geod 专用极简分支：仅接管 GeoServices 地区判定，确保与前台 Maps.app 一致并加载国际瓦片
+        if (strcmp(prog, "geod") == 0) {
+            ResolveElleKitRuntime((void *)&AutoIPLocHookEntry);
+            InstallGeoServicesHooks();
+            return;
+        }
+
         static const char *kSkipProcs[] = {
             "SpringBoard", "backboardd", "Preferences", "AutoIPLoc",
             "Shadowrocket", "QuantumultX", "Surge", "Loon", "Stash", "SingBox", "Karing",
@@ -1004,7 +1205,6 @@ static void AutoIPLocHookEntry(void) {
 
         dlopen("/System/Library/Frameworks/CoreLocation.framework/CoreLocation", RTLD_NOW);
         dlopen("/System/Library/Frameworks/CoreTelephony.framework/CoreTelephony", RTLD_NOW);
-        dlopen("/System/Library/PrivateFrameworks/GeoServices.framework/GeoServices", RTLD_NOW);
         ResolveElleKitRuntime((void *)&AutoIPLocHookEntry);
 
         NSString *initTZ = GetTargetTimeZoneName();
@@ -1040,11 +1240,14 @@ static void AutoIPLocHookEntry(void) {
         if (wsCls) {
             HookObjCMethod(wsCls, NSSelectorFromString(@"applicationsAvailableForHandlingURLScheme:"), (IMP)hook_appsForScheme, (IMP *)&orig_appsForScheme);
             HookObjCMethod(wsCls, NSSelectorFromString(@"URLOverrideForURL:"), (IMP)hook_urlOverride, (IMP *)&orig_urlOverride);
+            HookObjCMethod(wsCls, NSSelectorFromString(@"applicationIsInstalled:"), (IMP)hook_appIsInstalled, (IMP *)&orig_appIsInstalled);
         }
         Class fmCls = objc_getClass("NSFileManager");
         if (fmCls) {
             HookObjCMethod(fmCls, @selector(fileExistsAtPath:), (IMP)hook_fileExists, (IMP *)&orig_fileExists);
             HookObjCMethod(fmCls, @selector(fileExistsAtPath:isDirectory:), (IMP)hook_fileExistsIsDir, (IMP *)&orig_fileExistsIsDir);
+            HookObjCMethod(fmCls, @selector(isReadableFileAtPath:), (IMP)hook_isReadableFile, (IMP *)&orig_isReadableFile);
+            HookObjCMethod(fmCls, @selector(contentsOfDirectoryAtPath:error:), (IMP)hook_contentsOfDir, (IMP *)&orig_contentsOfDir);
         }
 
         Class sessionCfgCls = objc_getClass("NSURLSessionConfiguration");
@@ -1091,17 +1294,7 @@ static void AutoIPLocHookEntry(void) {
             HookObjCMethod(locCls, @selector(initWithCoder:), (IMP)hook_locInitWithCoder, (IMP *)&orig_locInitWithCoder);
         }
 
-        Class geoCls = objc_getClass("GEOCountryConfiguration");
-        if (geoCls) {
-            HookObjCMethod(geoCls, NSSelectorFromString(@"countryCode"), (IMP)hook_geo_countryCode, (IMP *)&orig_geo_countryCode);
-            HookObjCMethod(geoCls, NSSelectorFromString(@"_countryCode"), (IMP)hook_geo__countryCode, (IMP *)&orig_geo__countryCode);
-            HookObjCMethod(geoCls, NSSelectorFromString(@"currentCountryCode"), (IMP)hook_geo_currentCountryCode, (IMP *)&orig_geo_currentCountryCode);
-            HookObjCMethod(geoCls, NSSelectorFromString(@"sourceCountryCode"), (IMP)hook_geo_sourceCountryCode, (IMP *)&orig_geo_sourceCountryCode);
-        }
-        Class platformCls = objc_getClass("GEOPlatform");
-        if (platformCls) {
-            HookObjCMethod(platformCls, NSSelectorFromString(@"isChina"), (IMP)hook_isChina, (IMP *)&orig_isChina);
-        }
+        InstallGeoServicesHooks();
 
         if (g_MSHookFunction) {
             g_MSHookFunction((void *)_dyld_get_image_name, (void *)hook_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
@@ -1132,23 +1325,13 @@ static void AutoIPLocHookEntry(void) {
             if (symSCDyn) g_MSHookFunction(symSCDyn, (void *)hook_SCDynamicStoreCopyProxies, (void **)&orig_SCDynamicStoreCopyProxies);
 
             g_MSHookFunction((void *)getifaddrs, (void *)hook_getifaddrs, (void **)&orig_getifaddrs);
+            g_MSHookFunction((void *)if_nametoindex, (void *)hook_if_nametoindex, (void **)&orig_if_nametoindex);
+            g_MSHookFunction((void *)if_nameindex, (void *)hook_if_nameindex, (void **)&orig_if_nameindex);
+
             g_MSHookFunction((void *)CNCopyCurrentNetworkInfo, (void *)hook_CNCopyCurrentNetworkInfo, (void **)&orig_CNCopyCurrentNetworkInfo);
             g_MSHookFunction((void *)CNCopySupportedInterfaces, (void *)hook_CNCopySupportedInterfaces, (void **)&orig_CNCopySupportedInterfaces);
         }
 
-        // 采用非原子直接覆写 + 0666 权限，提升沙盒进程写入成功率并避免旧文件覆盖新状态
-        g_selfCallDepth++;
-        NSDictionary *status = @{
-            @"active": @YES,
-            @"version": @"4.5.1",
-            @"lastProc": [NSString stringWithUTF8String:prog],
-            @"cHookReady": @(g_MSHookFunction != NULL && g_MSHookMessageEx != NULL),
-            @"timestamp": @([[NSDate date] timeIntervalSince1970])
-        };
-        [status writeToFile:@"/var/tmp/com.autoiploc.hookstatus.plist" atomically:NO];
-        chmod("/var/tmp/com.autoiploc.hookstatus.plist", 0666);
-        [status writeToFile:@"/var/mobile/Library/Preferences/com.autoiploc.hookstatus.plist" atomically:NO];
-        chmod("/var/mobile/Library/Preferences/com.autoiploc.hookstatus.plist", 0666);
-        g_selfCallDepth--;
+        PublishHookHeartbeat(prog, (g_MSHookFunction != NULL && g_MSHookMessageEx != NULL));
     }
 }
