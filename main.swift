@@ -310,12 +310,13 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
 
         var successCount = 0
         for path in targetPaths {
+            let resolvedURL = URL(fileURLWithPath: path).resolvingSymlinksInPath()
             do {
-                try xmlData.write(to: URL(fileURLWithPath: path), options: [])
-                Darwin.chmod(path, 0o666)
+                try xmlData.write(to: resolvedURL, options: [])
+                Darwin.chmod(resolvedURL.path, 0o666)
                 successCount += 1
             } catch {
-                // 可能由 root 拥有且权限为 644
+                // 跳过无权写入的兜底路径
             }
         }
 
