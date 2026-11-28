@@ -25,9 +25,9 @@
 #endif
 
 #define HOOK_VER_MAJOR 5
-#define HOOK_VER_MINOR 0
+#define HOOK_VER_MINOR 1
 #define HOOK_VER_PATCH 0
-#define HOOK_VER_STR   @"5.0.0"
+#define HOOK_VER_STR   @"5.1.0"
 
 typedef void (*MSHookFunction_t)(void *symbol, void *replace, void **result);
 typedef void (*MSHookMessageEx_t)(Class _class, SEL message, IMP hook, IMP *old);
@@ -112,9 +112,9 @@ static void ResolveElleKitRuntime(void *selfSymbolAddr) {
         return;
     }
 
-    // 优先通过自身路径反推 jbroot（不依赖可能受沙盒限制的 /var/tmp）
     if (g_selfDirPath[0] != '\0') {
-        const char *libMarker = strstr(g_selfDirPath, "/Library/");
+        const char *libMarker = strstr(g_selfDirPath, "/usr/lib/");
+        if (!libMarker) libMarker = strstr(g_selfDirPath, "/Library/");
         if (libMarker != NULL) {
             size_t rootLen = (size_t)(libMarker - g_selfDirPath);
             if (rootLen > 0 && rootLen < 512) {
@@ -171,7 +171,7 @@ static void HookObjCMethod(Class cls, SEL sel, IMP newImp, IMP *oldImp) {
 }
 
 // ============================================================================
-// 3. 多通道沙盒可读配置读取（优先读取插件同目录 <jbroot> + 3秒 TTL 内存缓存）
+// 3. 多通道沙盒可读配置读取（优先读取插件同目录 + 3秒 TTL 内存缓存）
 // ============================================================================
 
 static os_unfair_lock g_cfgLock = OS_UNFAIR_LOCK_INIT;
@@ -575,7 +575,7 @@ static CFTimeZoneRef hook_CFTimeZoneCopyDefault(void) {
 }
 
 // ============================================================================
-// 7. 语言与区域伪造（NSLocale + CFLocale + NSUserDefaults 闭环，带防递归）
+// 7. 语言与区域伪造（NSLocale + CFLocale + NSUserDefaults 闭环）
 // ============================================================================
 
 static NSLocale *(*orig_currentLocale)(id self, SEL _cmd) = NULL;
@@ -1027,7 +1027,7 @@ static void *hook_locInitWithCoder(void *selfPtr, SEL _cmd, void *coderPtr) {
 }
 
 // ============================================================================
-// 12. GeoServices 国家与地区码伪造（同步覆盖前台 App 与后台 geod）
+// 12. GeoServices 国家与地区码伪造
 // ============================================================================
 
 #define DEFINE_GEO_CC_HOOK(name) \
@@ -1134,7 +1134,6 @@ static NSString *hook_hotspotBSSID(id self, SEL _cmd) {
 static void PublishHookHeartbeat(const char *prog, BOOL cHookReady) {
     g_selfCallDepth++;
 
-    // 通道 1：Darwin notify_set_state（无需文件写权限，所有沙盒 App 100% 可上报）
     uint64_t ts = (uint64_t)[[NSDate date] timeIntervalSince1970];
     uint64_t state = ((uint64_t)(HOOK_VER_MAJOR & 0xFF) << 56) |
                      ((uint64_t)(HOOK_VER_MINOR & 0xFF) << 48) |
@@ -1147,7 +1146,6 @@ static void PublishHookHeartbeat(const char *prog, BOOL cHookReady) {
         notify_cancel(token);
     }
 
-    // 通道 2：多路径 plist 记录进程名与详情
     NSDictionary *status = @{
         @"active": @YES,
         @"version": HOOK_VER_STR,
@@ -1181,17 +1179,11 @@ static void AutoIPLocHookEntry(void) {
 
         CaptureSelfDirectory((void *)&AutoIPLocHookEntry);
 
-        // 后台地图服务 geod 专用极简分支：仅接管 GeoServices 地区判定，确保与前台 Maps.app 一致并加载国际瓦片
-        if (strcmp(prog, "geod") == 0) {
-            ResolveElleKitRuntime((void *)&AutoIPLocHookEntry);
-            InstallGeoServicesHooks();
-            return;
-        }
-
         static const char *kSkipProcs[] = {
             "SpringBoard", "backboardd", "Preferences", "AutoIPLoc",
             "Shadowrocket", "QuantumultX", "Surge", "Loon", "Stash", "SingBox", "Karing",
-            "Dopamine", "Sileo", "Zebra", "TrollStore", "Filza", "RootHide", "Bootstrap"
+            "Dopamine", "Sileo", "Zebra", "TrollStore", "Filza", "RootHide", "Bootstrap",
+            "NewTerm", "Terminal", "amg"
         };
         size_t skipCount = sizeof(kSkipProcs) / sizeof(kSkipProcs[0]);
         for (size_t i = 0; i < skipCount; i++) {
