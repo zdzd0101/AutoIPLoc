@@ -36,9 +36,16 @@ struct AuditItem: Identifiable {
     let isWarning: Bool
 }
 
+struct InstalledAppInfo: Identifiable, Hashable {
+    var id: String { bundleId }
+    let name: String
+    let bundleId: String
+    let isSystem: Bool
+}
+
 final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegate {
     static let shared = LocationEngine()
-    static let expectedHookVersion = "5.0.0"
+    static let expectedHookVersion = "5.1.0"
 
     @Published var isSimulating = false
     @Published var isSyncing = false
@@ -46,6 +53,8 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     @Published var statusError: String? = nil
     @Published var versionMismatchWarning: String? = nil
     @Published var mapResetMessage: String? = nil
+    @Published var whitelistFeedback: String? = nil
+    @Published var whitelistHasError = false
     @Published var exitIP = "未获取 [--]"
     @Published var ispText = "--"
     @Published var timezoneName = "- (待同步)"
@@ -75,6 +84,8 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     }
     @Published var wifiList: [[String: String]] = []
     @Published var auditItems: [AuditItem] = []
+    @Published var installedApps: [InstalledAppInfo] = []
+    @Published var enabledBundleIDs: Set<String> = ["com.apple.Maps"]
 
     private let locationManager = CLLocationManager()
     private lazy var simManager = CLSimulationManager()
@@ -91,6 +102,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         locationManager.requestAlwaysAuthorization()
         ensureWritableHookStatusFiles()
         loadSavedState()
+        loadInstalledAppsAndWhitelist()
         refreshHookStatus()
         startNetworkMonitor()
     }
@@ -100,14 +112,50 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         let baseDir = "/var/containers/Bundle/Application"
         if let items = try? fm.contentsOfDirectory(atPath: baseDir) {
             for item in items where item.hasPrefix(".jbroot-") {
-                let dir = "\(baseDir)/\(item)/Library/MobileSubstrate/DynamicLibraries"
-                if fm.fileExists(atPath: dir) {
-                    return dir
+                let tweakInject = "\(baseDir)/\(item)/usr/lib/TweakInject"
+                if fm.fileExists(atPath: tweakInject) {
+                    return tweakInject
+                }
+                let dynLibs = "\(baseDir)/\(item)/Library/MobileSubstrate/DynamicLibraries"
+                if fm.fileExists(atPath: dynLibs) {
+                    return dynLibs
                 }
             }
         }
         let fallbackDir = "/var/jb/Library/MobileSubstrate/DynamicLibraries"
         return fm.fileExists(atPath: fallbackDir) ? fallbackDir : nil
+    }
+
+    private func findHookFilterPlistPaths() -> [String] {
+        let fm = FileManager.default
+        var rawPaths: [String] = []
+        let baseDir = "/var/containers/Bundle/Application"
+        if let items = try? fm.contentsOfDirectory(atPath: baseDir) {
+            for item in items where item.hasPrefix(".jbroot-") {
+                let p1 = "\(baseDir)/\(item)/usr/lib/TweakInject/AutoIPLocHook.plist"
+                let p2 = "\(baseDir)/\(item)/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist"
+                if fm.fileExists(atPath: "\(baseDir)/\(item)/usr/lib/TweakInject") {
+                    rawPaths.append(p1)
+                }
+                if fm.fileExists(atPath: "\(baseDir)/\(item)/Library/MobileSubstrate/DynamicLibraries") {
+                    rawPaths.append(p2)
+                }
+            }
+        }
+        let fallback = "/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist"
+        if fm.fileExists(atPath: "/var/jb/Library/MobileSubstrate/DynamicLibraries") {
+            rawPaths.append(fallback)
+        }
+        var seen = Set<String>()
+        var unique: [String] = []
+        for p in rawPaths {
+            let resolved = URL(fileURLWithPath: p).resolvingSymlinksInPath().path
+            if !seen.contains(resolved) {
+                seen.insert(resolved)
+                unique.append(p)
+            }
+        }
+        return unique
     }
 
     private var geoPlistPaths: [String] {
@@ -142,6 +190,145 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         }
         return paths
     }
+
+    // MARK: - 可视化 App 定向白名单管理
+
+    func loadInstalledAppsAndWhitelist() {
+        var loadedSet = Set<String>()
+        for path in findHookFilterPlistPaths() {
+            if let dict = NSDictionary(contentsOfFile: path) as? [String: Any],
+               let filter = dict["Filter"] as? [String: Any],
+               let bundles = filter["Bundles"] as? [String] {
+                for b in bundles where b != "com.apple.UIKit" {
+                    loadedSet.insert(b)
+                }
+                break
+            }
+        }
+        if loadedSet.isEmpty {
+            loadedSet.insert("com.apple.Maps")
+        }
+        self.enabledBundleIDs = loadedSet
+
+        let systemPresets: [InstalledAppInfo] = [
+            InstalledAppInfo(name: "苹果地图 (Apple Maps)", bundleId: "com.apple.Maps", isSystem: true),
+            InstalledAppInfo(name: "Safari 浏览器", bundleId: "com.apple.mobilesafari", isSystem: true),
+            InstalledAppInfo(name: "App Store", bundleId: "com.apple.AppStore", isSystem: true),
+            InstalledAppInfo(name: "天气 (Weather)", bundleId: "com.apple.weather", isSystem: true)
+        ]
+
+        let blockedKeywords = [
+            "autoiploc", "shadowrocket", "quantumult", "surge", "loon", "stash",
+            "dopamine", "sileo", "zebra", "cydia", "filza", "trollstore",
+            "roothide", "choicy", "newterm", "terminal", "amg456", "karing", "v2box"
+        ]
+
+        var appsByID: [String: InstalledAppInfo] = [:]
+        for sys in systemPresets {
+            appsByID[sys.bundleId] = sys
+        }
+
+        let fm = FileManager.default
+        let appContainerDir = "/var/containers/Bundle/Application"
+        if let uuids = try? fm.contentsOfDirectory(atPath: appContainerDir) {
+            for uuid in uuids where !uuid.hasPrefix(".") {
+                let uuidPath = "\(appContainerDir)/\(uuid)"
+                guard let subItems = try? fm.contentsOfDirectory(atPath: uuidPath) else { continue }
+                for item in subItems where item.hasSuffix(".app") {
+                    let infoPath = "\(uuidPath)/\(item)/Info.plist"
+                    guard let info = NSDictionary(contentsOfFile: infoPath) as? [String: Any],
+                          let bid = info["CFBundleIdentifier"] as? String, !bid.isEmpty else { continue }
+                    let lower = bid.lowercased()
+                    if blockedKeywords.contains(where: { lower.contains($0) }) { continue }
+
+                    let displayName = (info["CFBundleDisplayName"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let bundleName = (info["CFBundleName"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let finalName = (displayName?.isEmpty == false ? displayName! : (bundleName?.isEmpty == false ? bundleName! : bid))
+                    appsByID[bid] = InstalledAppInfo(name: finalName, bundleId: bid, isSystem: false)
+                }
+            }
+        }
+
+        // 把已开启但未扫描到的自定义 Bundle ID 也补进列表
+        for bid in loadedSet where appsByID[bid] == nil {
+            appsByID[bid] = InstalledAppInfo(name: "自定义应用", bundleId: bid, isSystem: false)
+        }
+
+        self.installedApps = appsByID.values.sorted { lhs, rhs in
+            let lOn = loadedSet.contains(lhs.bundleId)
+            let rOn = loadedSet.contains(rhs.bundleId)
+            if lOn != rOn { return lOn }
+            if lhs.isSystem != rhs.isSystem { return lhs.isSystem }
+            return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+        }
+    }
+
+    func setBundleEnabled(_ bundleId: String, enabled: Bool) {
+        let trimmed = bundleId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != "com.apple.UIKit" else { return }
+        if enabled {
+            enabledBundleIDs.insert(trimmed)
+        } else {
+            enabledBundleIDs.remove(trimmed)
+        }
+        saveHookFilterPlist()
+    }
+
+    func addCustomBundleID(_ bundleId: String) {
+        let trimmed = bundleId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.contains("."), trimmed != "com.apple.UIKit" else {
+            whitelistHasError = true
+            whitelistFeedback = "请输入正确的 Bundle ID（如 com.example.app）"
+            return
+        }
+        enabledBundleIDs.insert(trimmed)
+        if !installedApps.contains(where: { $0.bundleId == trimmed }) {
+            installedApps.insert(InstalledAppInfo(name: "自定义应用", bundleId: trimmed, isSystem: false), at: 0)
+        }
+        saveHookFilterPlist()
+    }
+
+    func saveHookFilterPlist() {
+        let sortedBundles = Array(enabledBundleIDs).sorted()
+        let plistDict: [String: Any] = [
+            "Filter": [
+                "Bundles": sortedBundles
+            ]
+        ]
+        guard let xmlData = try? PropertyListSerialization.data(fromPropertyList: plistDict, format: .xml, options: 0) else {
+            whitelistHasError = true
+            whitelistFeedback = "生成过滤配置失败"
+            return
+        }
+
+        let targetPaths = findHookFilterPlistPaths()
+        if targetPaths.isEmpty {
+            whitelistHasError = true
+            whitelistFeedback = "未找到 AutoIPLocHook.plist，请先通过 RootHide Patcher 安装 v5.1.0 插件。"
+            return
+        }
+
+        var successCount = 0
+        for path in targetPaths {
+            do {
+                try xmlData.write(to: URL(fileURLWithPath: path), options: [])
+                Darwin.chmod(path, 0o666)
+                successCount += 1
+            } catch {
+                // 可能由 root 拥有且权限为 644
+            }
+        }
+
+        if successCount > 0 {
+            whitelistHasError = false
+            whitelistFeedback = "已保存（共 \(sortedBundles.count) 个目标 App）。划掉目标 App 重开即可生效，无需重启手机。"
+        } else {
+            whitelistHasError = true
+            whitelistFeedback = "没有写入权限！请在终端运行一次：sudo chmod 666 /usr/lib/TweakInject/AutoIPLocHook.plist 后再切开关。"
+        }
+    }
+
+    // MARK: - 共享配置与状态监控
 
     private func ensureWritableHookStatusFiles() {
         let fm = FileManager.default
@@ -243,18 +430,16 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     func refreshHookStatus() {
         let now = Date().timeIntervalSince1970
         var bestVer: String? = nil
-        var bestProc: String = "沙盒应用"
+        var bestProc: String = "目标应用"
         var bestHookOk = false
         var bestTS: Double = -1
 
-        // 1. 优先读取跨沙盒 Darwin IPC 心跳
         if let hb = readDarwinHeartbeat() {
             bestVer = hb.version
             bestHookOk = hb.cHookReady
             bestTS = hb.timestamp
         }
 
-        // 2. 合并多路径 plist（获取具体进程名或更新的时间戳）
         for path in hookStatusPaths {
             if let dict = NSDictionary(contentsOfFile: path) as? [String: Any],
                let active = dict["active"] as? Bool, active {
@@ -279,7 +464,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             let ageText = formatAgeText(ageSec)
 
             if ver != Self.expectedHookVersion {
-                self.versionMismatchWarning = "检测到手机正在运行旧版插件 v\(ver)（当前应为 v\(Self.expectedHookVersion)）。请用 RootHide Patcher 转换新版 AutoIPLocHook.deb 覆盖安装，并在 Dopamine 执行 Userspace Reboot！"
+                self.versionMismatchWarning = "检测到手机正在运行旧版插件 v\(ver)（当前应为 v\(Self.expectedHookVersion)）。请用 RootHide Patcher 转换新版 AutoIPLocHook.deb 覆盖安装并重启用户空间。"
             } else {
                 self.versionMismatchWarning = nil
             }
@@ -294,7 +479,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
                 return
             } else {
                 self.hookIsActive = false
-                self.hookStatusText = "上次注入已超过 24 小时（请重开目标 App 刷新状态）"
+                self.hookStatusText = "上次注入已超过 24 小时（请打开白名单内任意 App 刷新）"
                 return
             }
         }
@@ -304,7 +489,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             if let handle = dlopen(dylibPath, RTLD_NOW) {
                 dlclose(handle)
                 self.hookIsActive = false
-                self.hookStatusText = "插件文件已就绪（请开启 Dopamine 插件注入并重开目标 App）"
+                self.hookStatusText = "插件已就绪（请打开白名单内任意 App 触发激活）"
             } else {
                 let errStr = dlerror().map { String(cString: $0) } ?? "未知加载错误"
                 self.hookIsActive = false
@@ -364,7 +549,6 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
                 self.streetAddress = street
                 self.zipCode = zip
                 self.updateMappedProfileSummary(for: cc)
-                // 同步一次到 jbroot 插件目录，确保沙盒 App 立即能读到
                 self.writeGeoPlist(profile)
                 if self.naturalGpsJitter {
                     self.startGpsDriftTimer()
@@ -781,7 +965,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             results.append(AuditItem(
                 title: "定位 / 时区 / 运营商 / 语言联动",
                 detail: consistencyOk
-                    ? "\(self.lockedProfile!.countryCode) · \(self.timezoneName) · \(self.mappedProfileText)"
+                    ? "\(self.lockedProfile!.countryCode) · \(self.timezoneName) · \(self.mappedProfileText)（白名单已选 \(self.enabledBundleIDs.count) 个 App）"
                     : "尚未开启模拟，目标 App 将读取本机真实参数",
                 passed: consistencyOk,
                 isWarning: !consistencyOk
@@ -810,13 +994,12 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
                 } catch {}
             }
         }
-        // 同步抹除 cfprefsd 内存中的国内高德配置键
         let targetCC = (lockedProfile?.countryCode ?? "US") as CFString
         CFPreferencesSetValue("CountryProviders" as CFString, nil, "com.apple.GEO" as CFString, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
         CFPreferencesSetValue("GEOCountryConfigurationCountryCode" as CFString, targetCC, "com.apple.GEO" as CFString, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
         CFPreferencesSynchronize("com.apple.GEO" as CFString, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
 
-        mapResetMessage = "已彻底清理 \(cleared) 处地图/geod缓存并重置 cfprefsd 地区键为 \(targetCC)。请确认 Shadowrocket 中苹果 IPv6 规则已设为 REJECT，并在 Dopamine 执行 Userspace Reboot 后重开地图。"
+        mapResetMessage = "已清理 \(cleared) 处地图缓存并重置地区键为 \(targetCC)。若地图仍显示网格，请把代理中苹果 IPv6 规则改为 REJECT 后重开地图。"
     }
 
     func stopSimulation() {
@@ -846,6 +1029,105 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         ]
         writeSharedPlist(geoDict, paths: geoPlistPaths)
         saveWiFiPlist(enabled: false)
+    }
+}
+
+struct WhitelistManagerView: View {
+    @ObservedObject var engine: LocationEngine
+    @State private var searchText = ""
+    @State private var customBundleInput = ""
+
+    private var filteredApps: [InstalledAppInfo] {
+        let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if q.isEmpty { return engine.installedApps }
+        return engine.installedApps.filter {
+            $0.name.lowercased().contains(q) || $0.bundleId.lowercased().contains(q)
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("仅对下方打开开关的 App 注入 AutoIPLocHook（隐藏小火箭代理/VPN网卡/模拟定位标记，伪造时区与运营商）。工具软件已自动排除防闪退。")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Text("提示：Amazon 等极高风控原生 App 请保持关闭，改去 RootHide 黑名单 + 路由器代理。")
+                    .font(.caption2.bold())
+                    .foregroundColor(.orange)
+
+                if let fb = engine.whitelistFeedback {
+                    Text(fb)
+                        .font(.caption.bold())
+                        .foregroundColor(.white)
+                        .padding(8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(engine.whitelistHasError ? Color.red : Color.green)
+                        .cornerRadius(8)
+                }
+
+                TextField("搜索 App 名称或 Bundle ID...", text: $searchText)
+                    .textFieldStyle(RoundedBorderTextFieldStyle())
+                    .autocapitalization(.none)
+                    .disableAutocorrection(true)
+
+                HStack(spacing: 8) {
+                    TextField("手动添加 Bundle ID（可选）", text: $customBundleInput)
+                        .textFieldStyle(RoundedBorderTextFieldStyle())
+                        .autocapitalization(.none)
+                        .disableAutocorrection(true)
+                        .font(.caption)
+                    Button("添加") {
+                        engine.addCustomBundleID(customBundleInput)
+                        customBundleInput = ""
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .font(.caption)
+                }
+            }
+            .padding()
+            .background(Color(.secondarySystemBackground))
+
+            List {
+                ForEach(filteredApps) { app in
+                    Toggle(isOn: Binding(
+                        get: { engine.enabledBundleIDs.contains(app.bundleId) },
+                        set: { engine.setBundleEnabled(app.bundleId, enabled: $0) }
+                    )) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(spacing: 6) {
+                                Text(app.name)
+                                    .font(.subheadline.weight(.medium))
+                                if app.isSystem {
+                                    Text("系统")
+                                        .font(.caption2)
+                                        .padding(.horizontal, 5)
+                                        .padding(.vertical, 1)
+                                        .background(Color.blue.opacity(0.15))
+                                        .foregroundColor(.blue)
+                                        .cornerRadius(4)
+                                }
+                            }
+                            Text(app.bundleId)
+                                .font(.caption2.monospaced())
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+            }
+            .listStyle(PlainListStyle())
+        }
+        .navigationTitle("定向伪装 App 管理")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .navigationBarTrailing) {
+                Button("重扫") {
+                    engine.loadInstalledAppsAndWhitelist()
+                }
+            }
+        }
+        .onAppear {
+            engine.loadInstalledAppsAndWhitelist()
+        }
     }
 }
 
@@ -936,6 +1218,32 @@ struct ContentView: View {
                     .background(Color(.secondarySystemBackground))
                     .cornerRadius(14)
 
+                    // 可视化定向白名单入口
+                    NavigationLink(destination: WhitelistManagerView(engine: engine)) {
+                        HStack {
+                            Image(systemName: "checklist")
+                                .font(.title3)
+                                .foregroundColor(.white)
+                                .frame(width: 34, height: 34)
+                                .background(Color.indigo)
+                                .cornerRadius(8)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("定向伪装 App 白名单管理")
+                                    .font(.subheadline.bold())
+                                    .foregroundColor(.primary)
+                                Text("已勾选 \(engine.enabledBundleIDs.count) 个目标 App · 点此勾选隐身与代理隐藏对象")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .foregroundColor(.secondary)
+                        }
+                        .padding()
+                        .background(Color(.secondarySystemBackground))
+                        .cornerRadius(14)
+                    }
+
                     // 主同步按钮
                     Button(action: { engine.syncEnvironment(forceReanchor: true) }) {
                         HStack(spacing: 8) {
@@ -1008,7 +1316,7 @@ struct ContentView: View {
                             .font(.subheadline)
                         Toggle("伪造运营商与 SIM 卡信息 (CTCarrier)", isOn: $engine.spoofCarrier)
                             .font(.subheadline)
-                        Toggle("隐藏系统代理特征 (Proxy Stealth)", isOn: $engine.spoofProxy)
+                        Toggle("隐藏系统代理与 VPN 网卡特征", isOn: $engine.spoofProxy)
                             .font(.subheadline)
                         Toggle("GPS 自然精度与微幅漂移保活（45秒刷新）", isOn: $engine.naturalGpsJitter)
                             .font(.subheadline)
@@ -1038,10 +1346,10 @@ struct ContentView: View {
                     .background(Color(.secondarySystemBackground))
                     .cornerRadius(14)
 
-                    // 彻底重置地图与 geod 缓存
+                    // 彻底重置地图与缓存
                     VStack(alignment: .leading, spacing: 6) {
                         Button(action: { engine.resetAppleMapsCache() }) {
-                            Text("彻底重置苹果国际地图（清除高德与 geod 缓存）")
+                            Text("彻底重置苹果国际地图（清除高德与地理缓存）")
                                 .font(.subheadline.bold())
                                 .foregroundColor(.blue)
                                 .frame(maxWidth: .infinity)
@@ -1069,6 +1377,7 @@ struct ContentView: View {
             .navigationTitle("IP 自动定位与全局时区助手")
             .onAppear {
                 engine.refreshHookStatus()
+                engine.loadInstalledAppsAndWhitelist()
             }
         }
         .navigationViewStyle(StackNavigationViewStyle())
