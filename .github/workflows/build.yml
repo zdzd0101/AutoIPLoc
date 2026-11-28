@@ -74,15 +74,52 @@ jobs:
 
           cat << 'EOF' > deb_pkg/DEBIAN/postinst
           #!/bin/sh
+          PERSIST_PLIST="/var/mobile/Library/Preferences/com.autoiploc.filter.plist"
+
+          if [ ! -s "$PERSIST_PLIST" ]; then
+            cat << 'PLISTEOF' > "$PERSIST_PLIST"
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>Filter</key>
+              <dict>
+                  <key>Bundles</key>
+                  <array>
+                      <string>com.apple.Maps</string>
+                  </array>
+              </dict>
+          </dict>
+          </plist>
+          PLISTEOF
+          fi
+
+          chown mobile:staff "$PERSIST_PLIST" 2>/dev/null || true
+          chmod 666 "$PERSIST_PLIST" 2>/dev/null || true
+
           for JB in /var/containers/Bundle/Application/.jbroot-*; do
             if [ -d "$JB" ]; then
               printf "%s\n" "$JB" > /var/tmp/com.autoiploc.jbroot.txt
               chmod 666 /var/tmp/com.autoiploc.jbroot.txt
-              chmod 666 "$JB/usr/lib/TweakInject/AutoIPLocHook.plist" 2>/dev/null || true
-              chmod 666 "$JB/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist" 2>/dev/null || true
+
+              if [ -d "$JB/usr/lib/TweakInject" ]; then
+                rm -f "$JB/usr/lib/TweakInject/AutoIPLocHook.plist" 2>/dev/null || true
+                ln -sf "$PERSIST_PLIST" "$JB/usr/lib/TweakInject/AutoIPLocHook.plist" 2>/dev/null || true
+              fi
+              if [ -d "$JB/Library/MobileSubstrate/DynamicLibraries" ] && [ ! -L "$JB/Library/MobileSubstrate/DynamicLibraries" ]; then
+                rm -f "$JB/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist" 2>/dev/null || true
+                ln -sf "$PERSIST_PLIST" "$JB/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist" 2>/dev/null || true
+              fi
+
               rm -f "$JB/usr/lib/TweakInject/"*hookstatus* "$JB/Library/MobileSubstrate/DynamicLibraries/"*hookstatus* 2>/dev/null || true
             fi
           done
+
+          if [ -d "/usr/lib/TweakInject" ]; then
+            rm -f "/usr/lib/TweakInject/AutoIPLocHook.plist" 2>/dev/null || true
+            ln -sf "$PERSIST_PLIST" "/usr/lib/TweakInject/AutoIPLocHook.plist" 2>/dev/null || true
+          fi
+
           rm -f /var/tmp/*hookstatus* /var/mobile/Library/Preferences/*hookstatus* /rootfs/var/tmp/*hookstatus* /rootfs/var/mobile/Library/Preferences/*hookstatus* 2>/dev/null || true
           touch /var/tmp/com.autoiploc.hookstatus.plist /var/mobile/Library/Preferences/com.autoiploc.hookstatus.plist 2>/dev/null || true
           chmod 666 /var/tmp/com.autoiploc.hookstatus.plist /var/mobile/Library/Preferences/com.autoiploc.hookstatus.plist 2>/dev/null || true
@@ -90,7 +127,7 @@ jobs:
           EOF
 
           INSTALLED_SIZE=$(du -sk deb_pkg/var | cut -f1)
-          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 5.1.0\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Fat arm64+arm64e stealth hook v5.1.0 with visual per-App whitelist manager, auto-cleanup postinst, Darwin IPC heartbeat & full proxy/VPN/loc stealth\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
+          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 5.2.0\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Fat arm64+arm64e RootHide-safe stealth hook v5.2.0 (fixed stat/jbroot recursion, strict TLS reentrancy guards & persistent whitelist symlink)\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
 
           chmod 0755 deb_pkg/DEBIAN
           chmod 0755 deb_pkg/DEBIAN/postinst
