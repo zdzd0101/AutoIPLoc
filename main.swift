@@ -45,7 +45,7 @@ struct InstalledAppInfo: Identifiable, Hashable {
 
 final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegate {
     static let shared = LocationEngine()
-    static let expectedHookVersion = "5.1.0"
+    static let expectedHookVersion = "5.2.0"
 
     @Published var isSimulating = false
     @Published var isSyncing = false
@@ -304,7 +304,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         let targetPaths = findHookFilterPlistPaths()
         if targetPaths.isEmpty {
             whitelistHasError = true
-            whitelistFeedback = "未找到 AutoIPLocHook.plist，请先通过 RootHide Patcher 安装 v5.1.0 插件。"
+            whitelistFeedback = "未找到 AutoIPLocHook.plist，请先通过 RootHide Patcher 安装 v5.2.0 插件。"
             return
         }
 
