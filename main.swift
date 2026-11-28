@@ -45,7 +45,7 @@ struct InstalledAppInfo: Identifiable, Hashable {
 
 final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegate {
     static let shared = LocationEngine()
-    static let expectedHookVersion = "5.2.0"
+    static let expectedHookVersion = "5.2.1"
 
     @Published var isSimulating = false
     @Published var isSyncing = false
@@ -160,22 +160,22 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
 
     private var geoPlistPaths: [String] {
         var paths = [
-            "/var/tmp/com.autoiploc.geo.plist",
-            "/var/mobile/Library/Preferences/com.autoiploc.geo.plist"
+            "/var/mobile/Library/Preferences/com.autoiploc.geo.plist",
+            "/var/tmp/com.autoiploc.geo.plist"
         ]
         if let dir = findTweakDirectory() {
-            paths.insert("\(dir)/AutoIPLoc.geo.plist", at: 0)
+            paths.append("\(dir)/AutoIPLoc.geo.plist")
         }
         return paths
     }
 
     private var wifiPlistPaths: [String] {
         var paths = [
-            "/var/tmp/com.autoiploc.wifi.plist",
-            "/var/mobile/Library/Preferences/com.autoiploc.wifi.plist"
+            "/var/mobile/Library/Preferences/com.autoiploc.wifi.plist",
+            "/var/tmp/com.autoiploc.wifi.plist"
         ]
         if let dir = findTweakDirectory() {
-            paths.insert("\(dir)/AutoIPLoc.wifi.plist", at: 0)
+            paths.append("\(dir)/AutoIPLoc.wifi.plist")
         }
         return paths
     }
@@ -249,7 +249,6 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             }
         }
 
-        // 把已开启但未扫描到的自定义 Bundle ID 也补进列表
         for bid in loadedSet where appsByID[bid] == nil {
             appsByID[bid] = InstalledAppInfo(name: "自定义应用", bundleId: bid, isSystem: false)
         }
@@ -304,7 +303,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         let targetPaths = findHookFilterPlistPaths()
         if targetPaths.isEmpty {
             whitelistHasError = true
-            whitelistFeedback = "未找到 AutoIPLocHook.plist，请先通过 RootHide Patcher 安装 v5.2.0 插件。"
+            whitelistFeedback = "未找到 AutoIPLocHook.plist，请先通过 RootHide Patcher 安装 v5.2.1 插件。"
             return
         }
 
@@ -352,10 +351,21 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     }
 
     private func writeSharedPlist(_ dict: [String: Any], paths: [String]) {
-        let nsDict = dict as NSDictionary
+        guard let xmlData = try? PropertyListSerialization.data(fromPropertyList: dict, format: .xml, options: 0) else {
+            return
+        }
+        var seen = Set<String>()
         for path in paths {
-            nsDict.write(toFile: path, atomically: true)
-            Darwin.chmod(path, 0o666)
+            let resolvedURL = URL(fileURLWithPath: path).resolvingSymlinksInPath()
+            let resolvedPath = resolvedURL.path
+            if seen.contains(resolvedPath) { continue }
+            seen.insert(resolvedPath)
+            do {
+                try xmlData.write(to: resolvedURL, options: [])
+                Darwin.chmod(resolvedPath, 0o666)
+            } catch {
+                // 跳过无权写入的兜底路径
+            }
         }
     }
 
@@ -428,6 +438,25 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         }
     }
 
+    private func collectAllHookStatusPaths() -> [String] {
+        var paths = hookStatusPaths
+        paths.append("/var/mobile/Library/Caches/com.autoiploc.hookstatus.plist")
+        let dataDir = "/var/mobile/Containers/Data/Application"
+        if let uuids = try? FileManager.default.contentsOfDirectory(atPath: dataDir) {
+            for uuid in uuids where !uuid.hasPrefix(".") {
+                let cPath = "\(dataDir)/\(uuid)/Library/Caches/com.autoiploc.hookstatus.plist"
+                if Darwin.access(cPath, R_OK) == 0 {
+                    paths.append(cPath)
+                }
+                let tPath = "\(dataDir)/\(uuid)/tmp/com.autoiploc.hookstatus.plist"
+                if Darwin.access(tPath, R_OK) == 0 {
+                    paths.append(tPath)
+                }
+            }
+        }
+        return paths
+    }
+
     func refreshHookStatus() {
         let now = Date().timeIntervalSince1970
         var bestVer: String? = nil
@@ -441,7 +470,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             bestTS = hb.timestamp
         }
 
-        for path in hookStatusPaths {
+        for path in collectAllHookStatusPaths() {
             if let dict = NSDictionary(contentsOfFile: path) as? [String: Any],
                let active = dict["active"] as? Bool, active {
                 let ts = (dict["timestamp"] as? Double) ?? 0
@@ -1134,6 +1163,7 @@ struct WhitelistManagerView: View {
 
 struct ContentView: View {
     @ObservedObject private var engine = LocationEngine.shared
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         NavigationView {
@@ -1379,6 +1409,11 @@ struct ContentView: View {
             .onAppear {
                 engine.refreshHookStatus()
                 engine.loadInstalledAppsAndWhitelist()
+            }
+            .onChange(of: scenePhase) { phase in
+                if phase == .active {
+                    engine.refreshHookStatus()
+                }
             }
         }
         .navigationViewStyle(StackNavigationViewStyle())
