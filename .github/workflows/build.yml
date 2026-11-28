@@ -63,15 +63,9 @@ jobs:
           <dict>
               <key>Filter</key>
               <dict>
-                  <key>Mode</key>
-                  <string>Any</string>
                   <key>Bundles</key>
                   <array>
-                      <string>com.apple.UIKit</string>
-                  </array>
-                  <key>Executables</key>
-                  <array>
-                      <string>geod</string>
+                      <string>com.apple.Maps</string>
                   </array>
               </dict>
           </dict>
@@ -84,19 +78,25 @@ jobs:
             if [ -d "$JB" ]; then
               printf "%s\n" "$JB" > /var/tmp/com.autoiploc.jbroot.txt
               chmod 666 /var/tmp/com.autoiploc.jbroot.txt
+              chmod 666 "$JB/usr/lib/TweakInject/AutoIPLocHook.plist" 2>/dev/null || true
+              chmod 666 "$JB/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist" 2>/dev/null || true
+              rm -f "$JB/usr/lib/TweakInject/"*hookstatus* "$JB/Library/MobileSubstrate/DynamicLibraries/"*hookstatus* 2>/dev/null || true
             fi
           done
+          rm -f /var/tmp/*hookstatus* /var/mobile/Library/Preferences/*hookstatus* /rootfs/var/tmp/*hookstatus* /rootfs/var/mobile/Library/Preferences/*hookstatus* 2>/dev/null || true
+          touch /var/tmp/com.autoiploc.hookstatus.plist /var/mobile/Library/Preferences/com.autoiploc.hookstatus.plist 2>/dev/null || true
+          chmod 666 /var/tmp/com.autoiploc.hookstatus.plist /var/mobile/Library/Preferences/com.autoiploc.hookstatus.plist 2>/dev/null || true
           exit 0
           EOF
 
           INSTALLED_SIZE=$(du -sk deb_pkg/var | cut -f1)
-          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 5.0.0\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Fat arm64+arm64e stealth hook v5.0.0 with geod Maps fix, jbroot sandbox config, Darwin IPC heartbeat, full VPN/Proxy/JB stealth & NSLocale spoof\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
+          printf "Package: com.local.autoiploc.hook\nName: AutoIPLocHook\nVersion: 5.1.0\nArchitecture: iphoneos-arm64\nDepends: firmware (>= 15.0)\nInstalled-Size: %s\nDescription: Fat arm64+arm64e stealth hook v5.1.0 with visual per-App whitelist manager, auto-cleanup postinst, Darwin IPC heartbeat & full proxy/VPN/loc stealth\nMaintainer: AutoIPLoc\nAuthor: AutoIPLoc\nSection: Tweaks\n" "$INSTALLED_SIZE" > deb_pkg/DEBIAN/control
 
           chmod 0755 deb_pkg/DEBIAN
           chmod 0755 deb_pkg/DEBIAN/postinst
           chmod 0644 deb_pkg/DEBIAN/control
           chmod 0755 deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.dylib
-          chmod 0644 deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
+          chmod 0666 deb_pkg/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoIPLocHook.plist
 
           dpkg-deb -Zgzip -b deb_pkg AutoIPLocHook.deb
           ls -lh AutoIPLoc.tipa AutoIPLocHook.deb
