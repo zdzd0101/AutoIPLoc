@@ -13,7 +13,6 @@
 #import <ifaddrs.h>
 #import <notify.h>
 #import <dlfcn.h>
-#import <dirent.h>
 #import <sys/stat.h>
 #import <unistd.h>
 #import <errno.h>
@@ -25,16 +24,15 @@
 #endif
 
 #define HOOK_VER_MAJOR 5
-#define HOOK_VER_MINOR 1
+#define HOOK_VER_MINOR 2
 #define HOOK_VER_PATCH 0
-#define HOOK_VER_STR   @"5.1.0"
+#define HOOK_VER_STR   @"5.2.0"
 
 typedef void (*MSHookFunction_t)(void *symbol, void *replace, void **result);
 typedef void (*MSHookMessageEx_t)(Class _class, SEL message, IMP hook, IMP *old);
 
 static MSHookFunction_t g_MSHookFunction = NULL;
 static MSHookMessageEx_t g_MSHookMessageEx = NULL;
-static int (*orig_dladdr)(const void *addr, Dl_info *info) = NULL;
 static char g_selfDirPath[768] = {0};
 
 // ============================================================================
@@ -58,8 +56,12 @@ static inline void *StripFunctionPointerPAC(void *addr) {
 }
 
 static _Thread_local int g_selfCallDepth = 0;
+static _Thread_local int g_tzHookDepth = 0;
 static _Thread_local int g_localeHookDepth = 0;
 static _Thread_local int g_defaultsHookDepth = 0;
+static _Thread_local int g_proxyHookDepth = 0;
+static _Thread_local int g_ifHookDepth = 0;
+static _Thread_local int g_wifiHookDepth = 0;
 
 // ============================================================================
 // 2. 自身目录解析 & ElleKit / Substrate 动态解析
@@ -332,45 +334,21 @@ static const CountryProfilePreset *GetCountryPresetForTarget(void) {
 }
 
 // ============================================================================
-// 5. 反越狱与路径隐身（统一使用 TLS g_selfCallDepth 放行）
+// 5. 反越狱与路径隐身（RootHide 安全版：移除 stat/lstat/access/fopen/opendir/fork/dladdr/dyld）
 // ============================================================================
-
-static BOOL IsSensitiveDylibPath(const char *path) {
-    if (!path) return NO;
-    if (strncmp(path, "/System/", 8) == 0) return NO;
-    if (strncmp(path, "/usr/lib/", 9) == 0) return NO;
-    if (strncmp(path, "/Developer/", 11) == 0) return NO;
-    if (strstr(path, ".app/") != NULL) return NO;
-    return YES;
-}
-
-static const char *(*orig_dyld_get_image_name)(uint32_t image_index) = NULL;
-static const char *hook_dyld_get_image_name(uint32_t image_index) {
-    const char *name = orig_dyld_get_image_name ? orig_dyld_get_image_name(image_index) : _dyld_get_image_name(image_index);
-    if (g_selfCallDepth == 0 && IsSensitiveDylibPath(name)) {
-        return "/usr/lib/libobjc.A.dylib";
-    }
-    return name;
-}
-
-static int hook_dladdr(const void *addr, Dl_info *info) {
-    int ret = orig_dladdr ? orig_dladdr(addr, info) : dladdr(addr, info);
-    if (g_selfCallDepth == 0 && ret != 0 && info && info->dli_fname && IsSensitiveDylibPath(info->dli_fname)) {
-        info->dli_fname = "/usr/lib/libobjc.A.dylib";
-    }
-    return ret;
-}
 
 static char *(*orig_getenv)(const char *name) = NULL;
 static char *hook_getenv(const char *name) {
-    if (g_selfCallDepth == 0 && name &&
-        (strcmp(name, "DYLD_INSERT_LIBRARIES") == 0 ||
-         strcmp(name, "_MSSafeMode") == 0 ||
-         strcmp(name, "SUBSTRATE_SAFE_MODE") == 0 ||
-         strcmp(name, "JBROOT") == 0)) {
-        return NULL;
+    if (g_selfCallDepth == 0 && name != NULL) {
+        g_selfCallDepth++;
+        BOOL blocked = (strcmp(name, "DYLD_INSERT_LIBRARIES") == 0 ||
+                        strcmp(name, "_MSSafeMode") == 0 ||
+                        strcmp(name, "SUBSTRATE_SAFE_MODE") == 0 ||
+                        strcmp(name, "JBROOT") == 0);
+        g_selfCallDepth--;
+        if (blocked) return NULL;
     }
-    return orig_getenv ? orig_getenv(name) : getenv(name);
+    return orig_getenv ? orig_getenv(name) : NULL;
 }
 
 static BOOL IsJailbreakPath(const char *path) {
@@ -407,51 +385,6 @@ static BOOL IsJailbreakPath(const char *path) {
             strstr(path, "/bin/sh") != NULL ||
             strstr(path, "autoiploc") != NULL ||
             strstr(path, "AutoIPLoc") != NULL);
-}
-
-static int (*orig_access)(const char *path, int mode) = NULL;
-static int hook_access(const char *path, int mode) {
-    if (g_selfCallDepth == 0 && IsJailbreakPath(path)) {
-        errno = ENOENT;
-        return -1;
-    }
-    return orig_access ? orig_access(path, mode) : access(path, mode);
-}
-
-static int (*orig_stat)(const char *path, struct stat *buf) = NULL;
-static int hook_stat(const char *path, struct stat *buf) {
-    if (g_selfCallDepth == 0 && IsJailbreakPath(path)) {
-        errno = ENOENT;
-        return -1;
-    }
-    return orig_stat ? orig_stat(path, buf) : stat(path, buf);
-}
-
-static int (*orig_lstat)(const char *path, struct stat *buf) = NULL;
-static int hook_lstat(const char *path, struct stat *buf) {
-    if (g_selfCallDepth == 0 && IsJailbreakPath(path)) {
-        errno = ENOENT;
-        return -1;
-    }
-    return orig_lstat ? orig_lstat(path, buf) : lstat(path, buf);
-}
-
-static FILE *(*orig_fopen)(const char *filename, const char *mode) = NULL;
-static FILE *hook_fopen(const char *filename, const char *mode) {
-    if (g_selfCallDepth == 0 && IsJailbreakPath(filename)) {
-        errno = ENOENT;
-        return NULL;
-    }
-    return orig_fopen ? orig_fopen(filename, mode) : fopen(filename, mode);
-}
-
-static DIR *(*orig_opendir)(const char *filename) = NULL;
-static DIR *hook_opendir(const char *filename) {
-    if (g_selfCallDepth == 0 && IsJailbreakPath(filename)) {
-        errno = ENOENT;
-        return NULL;
-    }
-    return orig_opendir ? orig_opendir(filename) : opendir(filename);
 }
 
 static BOOL (*orig_fileExists)(id self, SEL _cmd, NSString *path) = NULL;
@@ -504,86 +437,101 @@ static NSArray<NSString *> *hook_contentsOfDir(id self, SEL _cmd, NSString *path
     return items;
 }
 
-static pid_t (*orig_fork)(void) = NULL;
-static pid_t hook_fork(void) {
-    errno = EPERM;
-    return -1;
-}
-
 // ============================================================================
-// 6. 全局时区伪造（带 g_selfCallDepth 防递归守卫）
+// 6. 全局时区伪造（带 TLS 严格防重入守卫）
 // ============================================================================
 
 static NSTimeZone *(*orig_systemTimeZone)(id self, SEL _cmd) = NULL;
 static NSTimeZone *hook_systemTimeZone(id self, SEL _cmd) {
-    if (g_selfCallDepth == 0) {
+    if (g_selfCallDepth == 0 && g_tzHookDepth == 0) {
+        g_tzHookDepth++;
+        g_selfCallDepth++;
         NSString *tzName = GetTargetTimeZoneName();
-        if (tzName) {
-            NSTimeZone *tz = [NSTimeZone timeZoneWithName:tzName];
-            if (tz) return tz;
-        }
+        NSTimeZone *tz = tzName ? [NSTimeZone timeZoneWithName:tzName] : nil;
+        g_selfCallDepth--;
+        g_tzHookDepth--;
+        if (tz) return tz;
     }
     return orig_systemTimeZone ? orig_systemTimeZone(self, _cmd) : [NSTimeZone timeZoneWithName:@"America/New_York"];
 }
 
 static NSTimeZone *(*orig_defaultTimeZone)(id self, SEL _cmd) = NULL;
 static NSTimeZone *hook_defaultTimeZone(id self, SEL _cmd) {
-    if (g_selfCallDepth == 0) {
+    if (g_selfCallDepth == 0 && g_tzHookDepth == 0) {
+        g_tzHookDepth++;
+        g_selfCallDepth++;
         NSString *tzName = GetTargetTimeZoneName();
-        if (tzName) {
-            NSTimeZone *tz = [NSTimeZone timeZoneWithName:tzName];
-            if (tz) return tz;
-        }
+        NSTimeZone *tz = tzName ? [NSTimeZone timeZoneWithName:tzName] : nil;
+        g_selfCallDepth--;
+        g_tzHookDepth--;
+        if (tz) return tz;
     }
     return orig_defaultTimeZone ? orig_defaultTimeZone(self, _cmd) : [NSTimeZone timeZoneWithName:@"America/New_York"];
 }
 
 static NSTimeZone *(*orig_localTimeZone)(id self, SEL _cmd) = NULL;
 static NSTimeZone *hook_localTimeZone(id self, SEL _cmd) {
-    if (g_selfCallDepth == 0) {
+    if (g_selfCallDepth == 0 && g_tzHookDepth == 0) {
+        g_tzHookDepth++;
+        g_selfCallDepth++;
         NSString *tzName = GetTargetTimeZoneName();
-        if (tzName) {
-            NSTimeZone *tz = [NSTimeZone timeZoneWithName:tzName];
-            if (tz) return tz;
-        }
+        NSTimeZone *tz = tzName ? [NSTimeZone timeZoneWithName:tzName] : nil;
+        g_selfCallDepth--;
+        g_tzHookDepth--;
+        if (tz) return tz;
     }
     return orig_localTimeZone ? orig_localTimeZone(self, _cmd) : [NSTimeZone timeZoneWithName:@"America/New_York"];
 }
 
 static CFTimeZoneRef (*orig_CFTimeZoneCopySystem)(void) = NULL;
 static CFTimeZoneRef hook_CFTimeZoneCopySystem(void) {
-    if (g_selfCallDepth == 0) {
+    if (g_selfCallDepth == 0 && g_tzHookDepth == 0) {
+        g_tzHookDepth++;
+        g_selfCallDepth++;
         NSString *tzName = GetTargetTimeZoneName();
+        CFTimeZoneRef tz = NULL;
         if (tzName) {
-            CFTimeZoneRef tz = CFTimeZoneCreateWithName(kCFAllocatorDefault, (__bridge CFStringRef)tzName, true);
-            if (tz) return tz;
+            tz = CFTimeZoneCreateWithName(kCFAllocatorDefault, (__bridge CFStringRef)tzName, true);
         }
+        g_selfCallDepth--;
+        g_tzHookDepth--;
+        if (tz) return tz;
     }
-    return orig_CFTimeZoneCopySystem ? orig_CFTimeZoneCopySystem() : CFTimeZoneCopySystem();
+    return orig_CFTimeZoneCopySystem ? orig_CFTimeZoneCopySystem() : NULL;
 }
 
 static CFTimeZoneRef (*orig_CFTimeZoneCopyDefault)(void) = NULL;
 static CFTimeZoneRef hook_CFTimeZoneCopyDefault(void) {
-    if (g_selfCallDepth == 0) {
+    if (g_selfCallDepth == 0 && g_tzHookDepth == 0) {
+        g_tzHookDepth++;
+        g_selfCallDepth++;
         NSString *tzName = GetTargetTimeZoneName();
+        CFTimeZoneRef tz = NULL;
         if (tzName) {
-            CFTimeZoneRef tz = CFTimeZoneCreateWithName(kCFAllocatorDefault, (__bridge CFStringRef)tzName, true);
-            if (tz) return tz;
+            tz = CFTimeZoneCreateWithName(kCFAllocatorDefault, (__bridge CFStringRef)tzName, true);
         }
+        g_selfCallDepth--;
+        g_tzHookDepth--;
+        if (tz) return tz;
     }
-    return orig_CFTimeZoneCopyDefault ? orig_CFTimeZoneCopyDefault() : CFTimeZoneCopyDefault();
+    return orig_CFTimeZoneCopyDefault ? orig_CFTimeZoneCopyDefault() : NULL;
 }
 
 // ============================================================================
-// 7. 语言与区域伪造（NSLocale + CFLocale + NSUserDefaults 闭环）
+// 7. 语言与区域伪造（NSLocale + CFLocale + NSUserDefaults 闭环，严格重入保护）
 // ============================================================================
 
 static NSLocale *(*orig_currentLocale)(id self, SEL _cmd) = NULL;
 static NSLocale *hook_currentLocale(id self, SEL _cmd) {
-    if (g_selfCallDepth == 0 && g_localeHookDepth == 0 && IsLocaleSpoofEnabled()) {
-        const CountryProfilePreset *p = GetCountryPresetForTarget();
+    if (g_selfCallDepth == 0 && g_localeHookDepth == 0) {
         g_localeHookDepth++;
-        NSLocale *loc = [NSLocale localeWithLocaleIdentifier:[NSString stringWithUTF8String:p->localeId]];
+        g_selfCallDepth++;
+        NSLocale *loc = nil;
+        if (IsLocaleSpoofEnabled()) {
+            const CountryProfilePreset *p = GetCountryPresetForTarget();
+            loc = [NSLocale localeWithLocaleIdentifier:[NSString stringWithUTF8String:p->localeId]];
+        }
+        g_selfCallDepth--;
         g_localeHookDepth--;
         if (loc) return loc;
     }
@@ -592,10 +540,15 @@ static NSLocale *hook_currentLocale(id self, SEL _cmd) {
 
 static NSLocale *(*orig_autoupdatingCurrentLocale)(id self, SEL _cmd) = NULL;
 static NSLocale *hook_autoupdatingCurrentLocale(id self, SEL _cmd) {
-    if (g_selfCallDepth == 0 && g_localeHookDepth == 0 && IsLocaleSpoofEnabled()) {
-        const CountryProfilePreset *p = GetCountryPresetForTarget();
+    if (g_selfCallDepth == 0 && g_localeHookDepth == 0) {
         g_localeHookDepth++;
-        NSLocale *loc = [NSLocale localeWithLocaleIdentifier:[NSString stringWithUTF8String:p->localeId]];
+        g_selfCallDepth++;
+        NSLocale *loc = nil;
+        if (IsLocaleSpoofEnabled()) {
+            const CountryProfilePreset *p = GetCountryPresetForTarget();
+            loc = [NSLocale localeWithLocaleIdentifier:[NSString stringWithUTF8String:p->localeId]];
+        }
+        g_selfCallDepth--;
         g_localeHookDepth--;
         if (loc) return loc;
     }
@@ -604,37 +557,59 @@ static NSLocale *hook_autoupdatingCurrentLocale(id self, SEL _cmd) {
 
 static NSArray<NSString *> *(*orig_preferredLanguages)(id self, SEL _cmd) = NULL;
 static NSArray<NSString *> *hook_preferredLanguages(id self, SEL _cmd) {
-    if (g_selfCallDepth == 0 && g_localeHookDepth == 0 && IsLocaleSpoofEnabled()) {
-        const CountryProfilePreset *p = GetCountryPresetForTarget();
-        NSString *primary = [NSString stringWithUTF8String:p->langCode];
-        return [primary isEqualToString:@"en-US"] ? @[primary] : @[primary, @"en-US"];
+    if (g_selfCallDepth == 0 && g_localeHookDepth == 0) {
+        g_localeHookDepth++;
+        g_selfCallDepth++;
+        NSArray<NSString *> *langs = nil;
+        if (IsLocaleSpoofEnabled()) {
+            const CountryProfilePreset *p = GetCountryPresetForTarget();
+            NSString *primary = [NSString stringWithUTF8String:p->langCode];
+            langs = [primary isEqualToString:@"en-US"] ? @[primary] : @[primary, @"en-US"];
+        }
+        g_selfCallDepth--;
+        g_localeHookDepth--;
+        if (langs) return langs;
     }
     return orig_preferredLanguages ? orig_preferredLanguages(self, _cmd) : @[@"en-US"];
 }
 
 static CFLocaleRef (*orig_CFLocaleCopyCurrent)(void) = NULL;
 static CFLocaleRef hook_CFLocaleCopyCurrent(void) {
-    if (g_selfCallDepth == 0 && g_localeHookDepth == 0 && IsLocaleSpoofEnabled()) {
-        const CountryProfilePreset *p = GetCountryPresetForTarget();
+    if (g_selfCallDepth == 0 && g_localeHookDepth == 0) {
         g_localeHookDepth++;
-        CFStringRef locStr = CFStringCreateWithCString(kCFAllocatorDefault, p->localeId, kCFStringEncodingUTF8);
-        CFLocaleRef loc = locStr ? CFLocaleCreate(kCFAllocatorDefault, locStr) : NULL;
-        if (locStr) CFRelease(locStr);
+        g_selfCallDepth++;
+        CFLocaleRef loc = NULL;
+        if (IsLocaleSpoofEnabled()) {
+            const CountryProfilePreset *p = GetCountryPresetForTarget();
+            CFStringRef locStr = CFStringCreateWithCString(kCFAllocatorDefault, p->localeId, kCFStringEncodingUTF8);
+            if (locStr) {
+                loc = CFLocaleCreate(kCFAllocatorDefault, locStr);
+                CFRelease(locStr);
+            }
+        }
+        g_selfCallDepth--;
         g_localeHookDepth--;
         if (loc) return loc;
     }
-    return orig_CFLocaleCopyCurrent ? orig_CFLocaleCopyCurrent() : CFLocaleCopyCurrent();
+    return orig_CFLocaleCopyCurrent ? orig_CFLocaleCopyCurrent() : NULL;
 }
 
 static CFArrayRef (*orig_CFLocaleCopyPreferredLanguages)(void) = NULL;
 static CFArrayRef hook_CFLocaleCopyPreferredLanguages(void) {
-    if (g_selfCallDepth == 0 && g_localeHookDepth == 0 && IsLocaleSpoofEnabled()) {
-        const CountryProfilePreset *p = GetCountryPresetForTarget();
-        NSString *primary = [NSString stringWithUTF8String:p->langCode];
-        NSArray<NSString *> *langs = [primary isEqualToString:@"en-US"] ? @[primary] : @[primary, @"en-US"];
-        return (__bridge_retained CFArrayRef)langs;
+    if (g_selfCallDepth == 0 && g_localeHookDepth == 0) {
+        g_localeHookDepth++;
+        g_selfCallDepth++;
+        NSArray<NSString *> *langs = nil;
+        if (IsLocaleSpoofEnabled()) {
+            const CountryProfilePreset *p = GetCountryPresetForTarget();
+            NSString *primary = [NSString stringWithUTF8String:p->langCode];
+            langs = [primary isEqualToString:@"en-US"] ? @[primary] : @[primary, @"en-US"];
+        }
+        g_selfCallDepth--;
+        g_localeHookDepth--;
+        if (langs) return (__bridge_retained CFArrayRef)langs;
     }
-    return orig_CFLocaleCopyPreferredLanguages ? orig_CFLocaleCopyPreferredLanguages() : CFLocaleCopyPreferredLanguages();
+    return orig_CFLocaleCopyPreferredLanguages ? orig_CFLocaleCopyPreferredLanguages() : NULL;
 }
 
 static id (*orig_defaultsObjectForKey)(id self, SEL _cmd, NSString *defaultName) = NULL;
@@ -644,8 +619,10 @@ static id hook_defaultsObjectForKey(id self, SEL _cmd, NSString *defaultName) {
         BOOL isLoc = !isLang && [defaultName isEqualToString:@"AppleLocale"];
         if (isLang || isLoc) {
             g_defaultsHookDepth++;
+            g_selfCallDepth++;
             BOOL enabled = IsLocaleSpoofEnabled();
             const CountryProfilePreset *p = enabled ? GetCountryPresetForTarget() : NULL;
+            g_selfCallDepth--;
             g_defaultsHookDepth--;
             if (enabled && p) {
                 if (isLang) {
@@ -753,15 +730,14 @@ static BOOL hook_returnYES(id self, SEL _cmd) {
 }
 
 // ============================================================================
-// 9. 代理与 VPN 网卡隐身（PAC 剥离 + 全网卡 API 覆盖 + 代理隐身可配置）
+// 9. 代理与 VPN 网卡隐身（PAC 剥离 + TLS 重入保护 + 开关可控）
 // ============================================================================
 
 static BOOL IsSystemNetworkingCaller(void *retAddr) {
     void *cleanAddr = StripReturnAddressPAC(retAddr);
     if (!cleanAddr) return NO;
     Dl_info info;
-    int ok = orig_dladdr ? orig_dladdr(cleanAddr, &info) : dladdr(cleanAddr, &info);
-    if (ok != 0 && info.dli_fname != NULL) {
+    if (dladdr(cleanAddr, &info) != 0 && info.dli_fname != NULL) {
         if (strstr(info.dli_fname, "CFNetwork") != NULL ||
             strstr(info.dli_fname, "WebKit") != NULL ||
             strstr(info.dli_fname, "libnetwork") != NULL ||
@@ -791,26 +767,48 @@ static CFDictionaryRef CreateCleanProxyDict(void) {
 
 static CFDictionaryRef (*orig_CFNetworkCopySystemProxySettings)(void) = NULL;
 static CFDictionaryRef hook_CFNetworkCopySystemProxySettings(void) {
-    if ((IsSystemNetworkingCaller(__builtin_return_address(0)) || !IsProxyStealthEnabled()) &&
-        orig_CFNetworkCopySystemProxySettings) {
-        return orig_CFNetworkCopySystemProxySettings();
+    if (g_selfCallDepth > 0 || g_proxyHookDepth > 0) {
+        return orig_CFNetworkCopySystemProxySettings ? orig_CFNetworkCopySystemProxySettings() : NULL;
     }
-    return CreateCleanProxyDict();
+    void *retAddr = __builtin_return_address(0);
+    g_proxyHookDepth++;
+    g_selfCallDepth++;
+    BOOL bypass = IsSystemNetworkingCaller(retAddr) || !IsProxyStealthEnabled();
+    CFDictionaryRef clean = bypass ? NULL : CreateCleanProxyDict();
+    g_selfCallDepth--;
+    g_proxyHookDepth--;
+    if (!bypass && clean) return clean;
+    return orig_CFNetworkCopySystemProxySettings ? orig_CFNetworkCopySystemProxySettings() : CreateCleanProxyDict();
 }
 
 static CFDictionaryRef (*orig_SCDynamicStoreCopyProxies)(void *store) = NULL;
 static CFDictionaryRef hook_SCDynamicStoreCopyProxies(void *store) {
-    if ((IsSystemNetworkingCaller(__builtin_return_address(0)) || !IsProxyStealthEnabled()) &&
-        orig_SCDynamicStoreCopyProxies) {
-        return orig_SCDynamicStoreCopyProxies(store);
+    if (g_selfCallDepth > 0 || g_proxyHookDepth > 0) {
+        return orig_SCDynamicStoreCopyProxies ? orig_SCDynamicStoreCopyProxies(store) : NULL;
     }
-    return CreateCleanProxyDict();
+    void *retAddr = __builtin_return_address(0);
+    g_proxyHookDepth++;
+    g_selfCallDepth++;
+    BOOL bypass = IsSystemNetworkingCaller(retAddr) || !IsProxyStealthEnabled();
+    CFDictionaryRef clean = bypass ? NULL : CreateCleanProxyDict();
+    g_selfCallDepth--;
+    g_proxyHookDepth--;
+    if (!bypass && clean) return clean;
+    return orig_SCDynamicStoreCopyProxies ? orig_SCDynamicStoreCopyProxies(store) : CreateCleanProxyDict();
 }
 
 static NSDictionary *(*orig_connectionProxyDictionary)(id self, SEL _cmd) = NULL;
 static NSDictionary *hook_connectionProxyDictionary(id self, SEL _cmd) {
-    if ((IsSystemNetworkingCaller(__builtin_return_address(0)) || !IsProxyStealthEnabled()) &&
-        orig_connectionProxyDictionary) {
+    if (g_selfCallDepth > 0 || g_proxyHookDepth > 0) {
+        return orig_connectionProxyDictionary ? orig_connectionProxyDictionary(self, _cmd) : nil;
+    }
+    void *retAddr = __builtin_return_address(0);
+    g_proxyHookDepth++;
+    g_selfCallDepth++;
+    BOOL bypass = IsSystemNetworkingCaller(retAddr) || !IsProxyStealthEnabled();
+    g_selfCallDepth--;
+    g_proxyHookDepth--;
+    if (bypass && orig_connectionProxyDictionary) {
         return orig_connectionProxyDictionary(self, _cmd);
     }
     return nil;
@@ -827,8 +825,15 @@ static BOOL IsVirtualVPNInterface(const char *ifname) {
 
 static int (*orig_getifaddrs)(struct ifaddrs **ifap) = NULL;
 static int hook_getifaddrs(struct ifaddrs **ifap) {
-    int ret = orig_getifaddrs ? orig_getifaddrs(ifap) : getifaddrs(ifap);
-    if (ret == 0 && ifap && *ifap) {
+    if (!orig_getifaddrs) return -1;
+    int ret = orig_getifaddrs(ifap);
+    if (g_selfCallDepth > 0 || g_ifHookDepth > 0 || ret != 0 || !ifap || !*ifap) {
+        return ret;
+    }
+    g_ifHookDepth++;
+    g_selfCallDepth++;
+    BOOL stealth = IsProxyStealthEnabled();
+    if (stealth) {
         struct ifaddrs *head = *ifap;
         while (head && IsVirtualVPNInterface(head->ifa_name) && head->ifa_next != NULL) {
             struct ifaddrs *nextNode = head->ifa_next;
@@ -837,32 +842,43 @@ static int hook_getifaddrs(struct ifaddrs **ifap) {
         if (head && IsVirtualVPNInterface(head->ifa_name) && head->ifa_next == NULL) {
             freeifaddrs(*ifap);
             *ifap = NULL;
-            return ret;
-        }
-        struct ifaddrs *curr = head;
-        while (curr && curr->ifa_next != NULL) {
-            if (IsVirtualVPNInterface(curr->ifa_next->ifa_name)) {
-                curr->ifa_next = curr->ifa_next->ifa_next;
-            } else {
-                curr = curr->ifa_next;
+        } else {
+            struct ifaddrs *curr = head;
+            while (curr && curr->ifa_next != NULL) {
+                if (IsVirtualVPNInterface(curr->ifa_next->ifa_name)) {
+                    curr->ifa_next = curr->ifa_next->ifa_next;
+                } else {
+                    curr = curr->ifa_next;
+                }
             }
         }
     }
+    g_selfCallDepth--;
+    g_ifHookDepth--;
     return ret;
 }
 
 static unsigned int (*orig_if_nametoindex)(const char *ifname) = NULL;
 static unsigned int hook_if_nametoindex(const char *ifname) {
-    if (g_selfCallDepth == 0 && IsVirtualVPNInterface(ifname)) {
-        return 0;
+    if (g_selfCallDepth == 0 && g_ifHookDepth == 0 && ifname != NULL) {
+        g_ifHookDepth++;
+        g_selfCallDepth++;
+        BOOL hide = IsProxyStealthEnabled() && IsVirtualVPNInterface(ifname);
+        g_selfCallDepth--;
+        g_ifHookDepth--;
+        if (hide) return 0;
     }
-    return orig_if_nametoindex ? orig_if_nametoindex(ifname) : if_nametoindex(ifname);
+    return orig_if_nametoindex ? orig_if_nametoindex(ifname) : 0;
 }
 
 static struct if_nameindex *(*orig_if_nameindex)(void) = NULL;
 static struct if_nameindex *hook_if_nameindex(void) {
-    struct if_nameindex *list = orig_if_nameindex ? orig_if_nameindex() : if_nameindex();
-    if (list && g_selfCallDepth == 0) {
+    if (!orig_if_nameindex) return NULL;
+    struct if_nameindex *list = orig_if_nameindex();
+    if (!list || g_selfCallDepth > 0 || g_ifHookDepth > 0) return list;
+    g_ifHookDepth++;
+    g_selfCallDepth++;
+    if (IsProxyStealthEnabled()) {
         size_t w = 0;
         for (size_t i = 0; list[i].if_index != 0 || list[i].if_name != NULL; i++) {
             if (!IsVirtualVPNInterface(list[i].if_name)) {
@@ -872,6 +888,8 @@ static struct if_nameindex *hook_if_nameindex(void) {
         list[w].if_index = 0;
         list[w].if_name = NULL;
     }
+    g_selfCallDepth--;
+    g_ifHookDepth--;
     return list;
 }
 
@@ -1080,25 +1098,39 @@ static NSArray<NSDictionary *> *GetMockWiFiList(void) {
 
 static CFArrayRef (*orig_CNCopySupportedInterfaces)(void) = NULL;
 static CFArrayRef hook_CNCopySupportedInterfaces(void) {
-    if (g_selfCallDepth == 0 && GetMockWiFiList() != nil) {
-        return (__bridge_retained CFArrayRef)@[@"en0"];
+    if (g_selfCallDepth == 0 && g_wifiHookDepth == 0) {
+        g_wifiHookDepth++;
+        g_selfCallDepth++;
+        BOOL hasMock = (GetMockWiFiList() != nil);
+        g_selfCallDepth--;
+        g_wifiHookDepth--;
+        if (hasMock) {
+            return (__bridge_retained CFArrayRef)@[@"en0"];
+        }
     }
     return orig_CNCopySupportedInterfaces ? orig_CNCopySupportedInterfaces() : (__bridge_retained CFArrayRef)@[@"en0"];
 }
 
 static CFDictionaryRef (*orig_CNCopyCurrentNetworkInfo)(CFStringRef interfaceName) = NULL;
 static CFDictionaryRef hook_CNCopyCurrentNetworkInfo(CFStringRef interfaceName) {
-    if (g_selfCallDepth == 0) {
+    if (g_selfCallDepth == 0 && g_wifiHookDepth == 0) {
+        g_wifiHookDepth++;
+        g_selfCallDepth++;
         NSArray<NSDictionary *> *nets = GetMockWiFiList();
+        NSDictionary *result = nil;
         if (nets.count > 0) {
             NSDictionary *topAP = nets[0];
             NSString *ssid = topAP[@"SSID"] ?: @"NETGEAR-C27B-5G";
             NSString *bssid = topAP[@"BSSID"] ?: @"20:4E:7F:67:BC:7F";
-            NSDictionary *result = @{
+            result = @{
                 (__bridge NSString *)kCNNetworkInfoKeySSID: ssid,
                 (__bridge NSString *)kCNNetworkInfoKeyBSSID: bssid,
                 (__bridge NSString *)kCNNetworkInfoKeySSIDData: [ssid dataUsingEncoding:NSUTF8StringEncoding]
             };
+        }
+        g_selfCallDepth--;
+        g_wifiHookDepth--;
+        if (result) {
             return (__bridge_retained CFDictionaryRef)result;
         }
     }
@@ -1107,22 +1139,28 @@ static CFDictionaryRef hook_CNCopyCurrentNetworkInfo(CFStringRef interfaceName) 
 
 static NSString *(*orig_hotspotSSID)(id self, SEL _cmd) = NULL;
 static NSString *hook_hotspotSSID(id self, SEL _cmd) {
-    if (g_selfCallDepth == 0) {
+    if (g_selfCallDepth == 0 && g_wifiHookDepth == 0) {
+        g_wifiHookDepth++;
+        g_selfCallDepth++;
         NSArray<NSDictionary *> *nets = GetMockWiFiList();
-        if (nets.count > 0 && nets[0][@"SSID"]) {
-            return nets[0][@"SSID"];
-        }
+        NSString *ssid = (nets.count > 0) ? nets[0][@"SSID"] : nil;
+        g_selfCallDepth--;
+        g_wifiHookDepth--;
+        if (ssid) return ssid;
     }
     return orig_hotspotSSID ? orig_hotspotSSID(self, _cmd) : nil;
 }
 
 static NSString *(*orig_hotspotBSSID)(id self, SEL _cmd) = NULL;
 static NSString *hook_hotspotBSSID(id self, SEL _cmd) {
-    if (g_selfCallDepth == 0) {
+    if (g_selfCallDepth == 0 && g_wifiHookDepth == 0) {
+        g_wifiHookDepth++;
+        g_selfCallDepth++;
         NSArray<NSDictionary *> *nets = GetMockWiFiList();
-        if (nets.count > 0 && nets[0][@"BSSID"]) {
-            return nets[0][@"BSSID"];
-        }
+        NSString *bssid = (nets.count > 0) ? nets[0][@"BSSID"] : nil;
+        g_selfCallDepth--;
+        g_wifiHookDepth--;
+        if (bssid) return bssid;
     }
     return orig_hotspotBSSID ? orig_hotspotBSSID(self, _cmd) : nil;
 }
@@ -1289,15 +1327,7 @@ static void AutoIPLocHookEntry(void) {
         InstallGeoServicesHooks();
 
         if (g_MSHookFunction) {
-            g_MSHookFunction((void *)_dyld_get_image_name, (void *)hook_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
-            g_MSHookFunction((void *)dladdr, (void *)hook_dladdr, (void **)&orig_dladdr);
             g_MSHookFunction((void *)getenv, (void *)hook_getenv, (void **)&orig_getenv);
-            g_MSHookFunction((void *)access, (void *)hook_access, (void **)&orig_access);
-            g_MSHookFunction((void *)stat, (void *)hook_stat, (void **)&orig_stat);
-            g_MSHookFunction((void *)lstat, (void *)hook_lstat, (void **)&orig_lstat);
-            g_MSHookFunction((void *)fopen, (void *)hook_fopen, (void **)&orig_fopen);
-            g_MSHookFunction((void *)opendir, (void *)hook_opendir, (void **)&orig_opendir);
-            g_MSHookFunction((void *)fork, (void *)hook_fork, (void **)&orig_fork);
 
             void *symCFTimeZoneSys = dlsym(RTLD_DEFAULT, "CFTimeZoneCopySystem");
             if (symCFTimeZoneSys) g_MSHookFunction(symCFTimeZoneSys, (void *)hook_CFTimeZoneCopySystem, (void **)&orig_CFTimeZoneCopySystem);
