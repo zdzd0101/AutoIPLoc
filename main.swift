@@ -13,7 +13,7 @@ private func c_notify_get_state(_ token: Int32, _ state64: UnsafeMutablePointer<
 @_silgen_name("notify_cancel")
 private func c_notify_cancel(_ token: Int32) -> UInt32
 
-struct GeoProfile: Codable {
+struct GeoProfile: Codable, Equatable {
     var ip: String
     var countryCode: String
     var region: String
@@ -21,11 +21,27 @@ struct GeoProfile: Codable {
     var timezone: String
     var latitude: Double
     var longitude: Double
+    var altitude: Double?
     var street: String
     var zip: String
     var isp: String
     var isProxy: Bool?
     var isHosting: Bool?
+}
+
+struct EnvProfile: Codable, Identifiable, Equatable {
+    var id: String
+    var name: String
+    var createdAt: Double
+    var geo: GeoProfile
+    var wifiList: [[String: String]]
+    var deviceName: String
+    var idfv: String
+}
+
+struct ProfileVaultStore: Codable {
+    var activeProfileId: String?
+    var profiles: [EnvProfile]
 }
 
 struct AuditItem: Identifiable {
@@ -45,7 +61,8 @@ struct InstalledAppInfo: Identifiable, Hashable {
 
 final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegate {
     static let shared = LocationEngine()
-    static let expectedHookVersion = "5.2.1"
+    static let expectedHookVersion = "5.3.0"
+    static let schemaVersion = 530
 
     @Published var isSimulating = false
     @Published var isSyncing = false
@@ -55,15 +72,25 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     @Published var mapResetMessage: String? = nil
     @Published var whitelistFeedback: String? = nil
     @Published var whitelistHasError = false
+    @Published var profileFeedback: String? = nil
+
     @Published var exitIP = "未获取 [--]"
     @Published var ispText = "--"
     @Published var timezoneName = "- (待同步)"
     @Published var coordText = "- (0.0000, 0.0000)"
+    @Published var altitudeText = "--"
     @Published var mappedProfileText = "待同步"
     @Published var streetAddress = "等待同步解析附近精确街道地址..."
     @Published var zipCode = "--"
+    @Published var currentDeviceName = "Alex's iPhone"
+    @Published var currentIDFV = UUID().uuidString
+    @Published var activeProfileName = "临时会话（未建档）"
+    @Published var activeProfileId: String? = nil
+    @Published var savedProfiles: [EnvProfile] = []
+
     @Published var hookStatusText = "正在检测插件状态..."
     @Published var hookIsActive = false
+
     @Published var autoSyncOnNetworkChange = true
     @Published var lockSessionGeo = true
     @Published var spoofLocale = true {
@@ -75,6 +102,15 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     @Published var spoofProxy = true {
         didSet { persistCurrentGeoIfActive() }
     }
+    @Published var spoofWebView = true {
+        didSet { persistCurrentGeoIfActive() }
+    }
+    @Published var spoofDevice = true {
+        didSet { persistCurrentGeoIfActive() }
+    }
+    @Published var delegateIdfvToCrane = true {
+        didSet { persistCurrentGeoIfActive() }
+    }
     @Published var naturalGpsJitter = true {
         didSet {
             if isSimulating {
@@ -82,6 +118,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             }
         }
     }
+
     @Published var wifiList: [[String: String]] = []
     @Published var auditItems: [AuditItem] = []
     @Published var installedApps: [InstalledAppInfo] = []
@@ -94,18 +131,24 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     private var lastPathStatus: NWPath.Status?
     private var lockedProfile: GeoProfile?
     private var lastWiFiCountry: String = "US"
+    private var baseAltitude: Double = 36.4
     private var gpsDriftTimer: Timer?
+
+    private let profilesVaultPath = "/var/mobile/Library/Preferences/com.autoiploc.profiles.json"
 
     override init() {
         super.init()
         locationManager.delegate = self
         locationManager.requestAlwaysAuthorization()
         ensureWritableHookStatusFiles()
+        loadProfileVault()
         loadSavedState()
         loadInstalledAppsAndWhitelist()
         refreshHookStatus()
         startNetworkMonitor()
     }
+
+    // MARK: - 路径发现
 
     private func findTweakDirectory() -> String? {
         let fm = FileManager.default
@@ -189,6 +232,171 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             paths.insert("\(dir)/AutoIPLoc.hookstatus.plist", at: 0)
         }
         return paths
+    }
+
+    // MARK: - 多账号独立环境档案库 (Profile Vault)
+
+    private func generateLocalizedDeviceName(for cc: String) -> String {
+        let namePools: [String: [String]] = [
+            "US": ["Alex", "Michael", "Ashley", "Hannah", "Daniel", "Emily", "Ryan", "Madison", "Jason", "Lauren", "Kevin", "Sarah"],
+            "GB": ["Oliver", "Charlotte", "Harry", "Amelia", "George", "Sophie", "Jack", "Grace"],
+            "CA": ["Liam", "Emma", "Noah", "Olivia", "Lucas", "Chloe", "Ethan", "Maya"],
+            "AU": ["Jack", "Charlotte", "William", "Isla", "Lachlan", "Mia", "Cooper", "Ruby"],
+            "JP": ["Kenji", "Yuki", "Haruto", "Sakura", "Ren", "Hina", "Sota", "Aoi"],
+            "DE": ["Lukas", "Hannah", "Leon", "Mia", "Finn", "Emma", "Jonas", "Lea"],
+            "FR": ["Lucas", "Chloe", "Hugo", "Emma", "Louis", "Jade", "Gabriel", "Louise"],
+            "SG": ["Ethan", "Chloe", "Ryan", "Rachel", "Marcus", "Clarissa"],
+            "KR": ["Minjun", "Seoyeon", "Jihoon", "Jiwon", "Hyunwoo", "Yujin"],
+            "TW": ["Kevin", "Tina", "Jason", "Vivian", "Eric", "Chloe"]
+        ]
+        let pool = namePools[cc.uppercased()] ?? namePools["US"]!
+        let owner = pool.randomElement() ?? "Alex"
+        return Bool.random() ? "\(owner)'s iPhone" : "iPhone"
+    }
+
+    private func generateRealisticBaseAltitude() -> Double {
+        return Double(Int.random(in: 140...680)) / 10.0
+    }
+
+    private func loadProfileVault() {
+        let url = URL(fileURLWithPath: profilesVaultPath)
+        guard let data = try? Data(contentsOf: url),
+              let store = try? JSONDecoder().decode(ProfileVaultStore.self, from: data) else {
+            return
+        }
+        self.savedProfiles = store.profiles
+        self.activeProfileId = store.activeProfileId
+        if let aid = store.activeProfileId, let matched = store.profiles.first(where: { $0.id == aid }) {
+            self.activeProfileName = matched.name
+        }
+    }
+
+    private func saveProfileVault() {
+        let store = ProfileVaultStore(activeProfileId: activeProfileId, profiles: savedProfiles)
+        guard let data = try? JSONEncoder().encode(store) else { return }
+        let url = URL(fileURLWithPath: profilesVaultPath)
+        do {
+            try data.write(to: url, options: [])
+            Darwin.chmod(profilesVaultPath, 0o666)
+        } catch {}
+    }
+
+    func createProfileFromCurrent(customName: String? = nil) {
+        guard var geo = lockedProfile else {
+            profileFeedback = "请先在主页同步一次海外 IP 后再建档。"
+            return
+        }
+        let cc = geo.countryCode
+        let cityLabel = geo.city.isEmpty ? cc : geo.city
+        let trimmed = customName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let defaultName = "\(cc)·\(cityLabel) #\(savedProfiles.count + 1)"
+        let finalName = trimmed.isEmpty ? defaultName : trimmed
+
+        let freshAlt = generateRealisticBaseAltitude()
+        geo.altitude = freshAlt
+        let freshWiFi = buildWiFiList(for: cc)
+        let freshDeviceName = generateLocalizedDeviceName(for: cc)
+        let freshIDFV = UUID().uuidString
+
+        let newProfile = EnvProfile(
+            id: UUID().uuidString,
+            name: finalName,
+            createdAt: Date().timeIntervalSince1970,
+            geo: geo,
+            wifiList: freshWiFi,
+            deviceName: freshDeviceName,
+            idfv: freshIDFV
+        )
+        savedProfiles.insert(newProfile, at: 0)
+        activateProfile(newProfile)
+        profileFeedback = "已创建并锁定全新档案「\(finalName)」（全新设备名、IDFV、14个Wi-Fi 与固定海拔）。"
+    }
+
+    func activateProfile(_ profile: EnvProfile) {
+        self.activeProfileId = profile.id
+        self.activeProfileName = profile.name
+        self.currentDeviceName = profile.deviceName
+        self.currentIDFV = profile.idfv
+        self.wifiList = profile.wifiList
+        self.lastWiFiCountry = profile.geo.countryCode
+        self.baseAltitude = profile.geo.altitude ?? generateRealisticBaseAltitude()
+
+        var geo = profile.geo
+        geo.altitude = self.baseAltitude
+        self.commitSimulation(geo, keepExistingWiFi: true)
+        saveProfileVault()
+        profileFeedback = "已切换至档案「\(profile.name)」，划掉白名单 App 重开生效。"
+    }
+
+    func regenerateFingerprintForActiveProfile() {
+        guard var geo = lockedProfile else {
+            profileFeedback = "当前未同步环境，请先同步 IP。"
+            return
+        }
+        let cc = geo.countryCode
+        let freshAlt = generateRealisticBaseAltitude()
+        let freshLat = geo.latitude + Double.random(in: -0.004...0.004)
+        let freshLon = geo.longitude + Double.random(in: -0.004...0.004)
+        geo.latitude = freshLat
+        geo.longitude = freshLon
+        geo.altitude = freshAlt
+
+        self.baseAltitude = freshAlt
+        self.currentDeviceName = generateLocalizedDeviceName(for: cc)
+        self.currentIDFV = UUID().uuidString
+        self.wifiList = buildWiFiList(for: cc)
+        self.lastWiFiCountry = cc
+
+        let fallbackCity = geo.city.isEmpty ? (cc == "US" ? "Austin" : cc) : geo.city
+        let fallbackRegion = geo.region.isEmpty ? cc : geo.region
+        geo.street = "\(Int.random(in: 112...4890)) Oakridge Ave, \(fallbackCity), \(fallbackRegion)"
+
+        self.commitSimulation(geo, keepExistingWiFi: true)
+
+        if let aid = activeProfileId, let idx = savedProfiles.firstIndex(where: { $0.id == aid }) {
+            savedProfiles[idx].geo = geo
+            savedProfiles[idx].wifiList = self.wifiList
+            savedProfiles[idx].deviceName = self.currentDeviceName
+            savedProfiles[idx].idfv = self.currentIDFV
+            saveProfileVault()
+        }
+
+        let loc = CLLocation(latitude: freshLat, longitude: freshLon)
+        CLGeocoder().reverseGeocodeLocation(loc) { [weak self] placemarks, _ in
+            guard let self = self, let pm = placemarks?.first else { return }
+            let num = pm.subThoroughfare ?? "\(Int.random(in: 105...3980))"
+            let road = pm.thoroughfare ?? "Maple Creek Dr"
+            let c = pm.locality ?? fallbackCity
+            let st = pm.administrativeArea ?? fallbackRegion
+            let resolvedStreet = "\(num) \(road), \(c), \(st)"
+            let resolvedZip = (pm.postalCode?.isEmpty == false) ? pm.postalCode! : geo.zip
+
+            DispatchQueue.main.async {
+                self.streetAddress = resolvedStreet
+                self.zipCode = resolvedZip
+                if var current = self.lockedProfile {
+                    current.street = resolvedStreet
+                    current.zip = resolvedZip
+                    self.lockedProfile = current
+                    self.writeGeoPlist(current)
+                    if let aid = self.activeProfileId, let idx = self.savedProfiles.firstIndex(where: { $0.id == aid }) {
+                        self.savedProfiles[idx].geo = current
+                        self.saveProfileVault()
+                    }
+                }
+            }
+        }
+        profileFeedback = "已全面换新周边坐标、海拔、14个Wi-Fi、设备名（\(currentDeviceName)）与 IDFV。"
+    }
+
+    func deleteProfiles(at offsets: IndexSet) {
+        let removedIds = offsets.map { savedProfiles[$0].id }
+        savedProfiles.remove(atOffsets: offsets)
+        if let aid = activeProfileId, removedIds.contains(aid) {
+            activeProfileId = nil
+            activeProfileName = "临时会话（未建档）"
+        }
+        saveProfileVault()
     }
 
     // MARK: - 可视化 App 定向白名单管理
@@ -303,7 +511,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         let targetPaths = findHookFilterPlistPaths()
         if targetPaths.isEmpty {
             whitelistHasError = true
-            whitelistFeedback = "未找到 AutoIPLocHook.plist，请先通过 RootHide Patcher 安装 v5.2.1 插件。"
+            whitelistFeedback = "未找到 AutoIPLocHook.plist，请先通过 RootHide Patcher 安装 v5.3.0 插件。"
             return
         }
 
@@ -314,9 +522,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
                 try xmlData.write(to: resolvedURL, options: [])
                 Darwin.chmod(resolvedURL.path, 0o666)
                 successCount += 1
-            } catch {
-                // 跳过无权写入的兜底路径
-            }
+            } catch {}
         }
 
         if successCount > 0 {
@@ -328,7 +534,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         }
     }
 
-    // MARK: - 共享配置与状态监控
+    // MARK: - 共享配置与心跳状态监控
 
     private func ensureWritableHookStatusFiles() {
         let fm = FileManager.default
@@ -363,9 +569,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             do {
                 try xmlData.write(to: resolvedURL, options: [])
                 Darwin.chmod(resolvedPath, 0o666)
-            } catch {
-                // 跳过无权写入的兜底路径
-            }
+            } catch {}
         }
     }
 
@@ -550,6 +754,12 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             if let sl = dict["spoofLocale"] as? Bool { self.spoofLocale = sl }
             if let sc = dict["spoofCarrier"] as? Bool { self.spoofCarrier = sc }
             if let sp = dict["spoofProxy"] as? Bool { self.spoofProxy = sp }
+            if let sw = dict["spoofWebView"] as? Bool { self.spoofWebView = sw }
+            if let sd = dict["spoofDevice"] as? Bool { self.spoofDevice = sd }
+            if let dc = dict["delegateIdfvToCrane"] as? Bool { self.delegateIdfvToCrane = dc }
+            if let dn = dict["deviceName"] as? String, !dn.isEmpty { self.currentDeviceName = dn }
+            if let idfv = dict["idfv"] as? String, !idfv.isEmpty { self.currentIDFV = idfv }
+            if let alt = dict["altitude"] as? Double, alt > 0 { self.baseAltitude = alt }
 
             if let enabled = dict["enabled"] as? Bool, enabled,
                let ip = dict["ip"] as? String,
@@ -565,6 +775,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
                 let profile = GeoProfile(
                     ip: ip, countryCode: cc, region: region, city: city,
                     timezone: tz, latitude: lat, longitude: lon,
+                    altitude: self.baseAltitude,
                     street: street, zip: zip, isp: isp,
                     isProxy: dict["isProxy"] as? Bool,
                     isHosting: dict["isHosting"] as? Bool
@@ -576,6 +787,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
                 self.ispText = isp
                 self.timezoneName = tz
                 self.coordText = String(format: "%.5f, %.5f", lat, lon)
+                self.altitudeText = String(format: "%.1fm (平滑锁定)", self.baseAltitude)
                 self.streetAddress = street
                 self.zipCode = zip
                 self.updateMappedProfileSummary(for: cc)
@@ -591,6 +803,8 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             self.saveWiFiPlist(enabled: isSimulating)
         }
     }
+
+    // MARK: - IP 探测与环境联动
 
     func syncEnvironment(forceReanchor: Bool = true) {
         refreshHookStatus()
@@ -734,16 +948,23 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         return GeoProfile(
             ip: ip, countryCode: cc, region: region, city: city,
             timezone: tz, latitude: lat, longitude: lon,
+            altitude: nil,
             street: "", zip: zip, isp: isp,
             isProxy: isProxy, isHosting: isHosting
         )
     }
 
     private func applyDetectedProfile(_ raw: GeoProfile, forceReanchor: Bool) {
-        if lockSessionGeo, isSimulating, let locked = lockedProfile,
+        if lockSessionGeo, isSimulating, var locked = lockedProfile,
            locked.countryCode == raw.countryCode, locked.timezone == raw.timezone, !forceReanchor {
+            locked.ip = raw.ip
+            locked.isp = raw.isp
+            locked.isProxy = raw.isProxy
+            locked.isHosting = raw.isHosting
+            self.lockedProfile = locked
             self.exitIP = "\(raw.ip) [\(raw.countryCode)]"
             self.ispText = raw.isp
+            self.writeGeoPlist(locked)
             self.isSyncing = false
             return
         }
@@ -751,6 +972,12 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         let jitterLat = raw.latitude + Double.random(in: -0.0065...0.0065)
         let jitterLon = raw.longitude + Double.random(in: -0.0065...0.0065)
         let loc = CLLocation(latitude: jitterLat, longitude: jitterLon)
+        let lockedAlt = generateRealisticBaseAltitude()
+        self.baseAltitude = lockedAlt
+
+        if self.activeProfileId == nil || self.lastWiFiCountry != raw.countryCode {
+            self.currentDeviceName = generateLocalizedDeviceName(for: raw.countryCode)
+        }
 
         let fallbackCity = raw.city.isEmpty ? (raw.countryCode == "US" ? "Austin" : raw.countryCode) : raw.city
         let fallbackRegion = raw.region.isEmpty ? raw.countryCode : raw.region
@@ -761,10 +988,11 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             ip: raw.ip, countryCode: raw.countryCode, region: raw.region,
             city: raw.city, timezone: raw.timezone,
             latitude: jitterLat, longitude: jitterLon,
+            altitude: lockedAlt,
             street: fallbackStreet, zip: fallbackZip, isp: raw.isp,
             isProxy: raw.isProxy, isHosting: raw.isHosting
         )
-        self.commitSimulation(finalized)
+        self.commitSimulation(finalized, keepExistingWiFi: false)
 
         CLGeocoder().reverseGeocodeLocation(loc) { [weak self] placemarks, _ in
             guard let self = self, let pm = placemarks?.first else { return }
@@ -791,9 +1019,17 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     private func writeGeoPlist(_ profile: GeoProfile) {
         var geoDict: [String: Any] = [
             "enabled": true,
+            "schemaVersion": Self.schemaVersion,
             "spoofLocale": spoofLocale,
             "spoofCarrier": spoofCarrier,
             "spoofProxy": spoofProxy,
+            "spoofWebView": spoofWebView,
+            "spoofDevice": spoofDevice,
+            "delegateIdfvToCrane": delegateIdfvToCrane,
+            "deviceName": currentDeviceName,
+            "idfv": currentIDFV,
+            "profileId": activeProfileId ?? "",
+            "profileName": activeProfileName,
             "ip": profile.ip,
             "countryCode": profile.countryCode,
             "region": profile.region,
@@ -801,6 +1037,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             "timezone": profile.timezone,
             "lat": profile.latitude,
             "lon": profile.longitude,
+            "altitude": profile.altitude ?? baseAltitude,
             "street": profile.street,
             "zip": profile.zip,
             "isp": profile.isp
@@ -811,11 +1048,12 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
     }
 
     private func pushSimulatedCoordinate(lat: Double, lon: Double) {
-        let hAcc = naturalGpsJitter ? Double.random(in: 5.5...14.5) : 5.0
-        let vAcc = naturalGpsJitter ? Double.random(in: 4.0...11.0) : 8.0
+        let hAcc = naturalGpsJitter ? Double.random(in: 6.0...12.5) : 5.0
+        let vAcc = naturalGpsJitter ? Double.random(in: 3.5...8.5) : 6.0
+        let smoothAlt = naturalGpsJitter ? max(1.0, baseAltitude + Double.random(in: -0.6...0.6)) : baseAltitude
         let simLocation = CLLocation(
             coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lon),
-            altitude: Double.random(in: 18.0...145.0),
+            altitude: smoothAlt,
             horizontalAccuracy: hAcc,
             verticalAccuracy: vAcc,
             course: -1,
@@ -833,8 +1071,8 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         stopGpsDriftTimer()
         gpsDriftTimer = Timer.scheduledTimer(withTimeInterval: 45.0, repeats: true) { [weak self] _ in
             guard let self = self, self.isSimulating, self.naturalGpsJitter, let anchor = self.lockedProfile else { return }
-            let dLat = anchor.latitude + Double.random(in: -0.000025...0.000025)
-            let dLon = anchor.longitude + Double.random(in: -0.000025...0.000025)
+            let dLat = anchor.latitude + Double.random(in: -0.000022...0.000022)
+            let dLon = anchor.longitude + Double.random(in: -0.000022...0.000022)
             self.pushSimulatedCoordinate(lat: dLat, lon: dLon)
         }
     }
@@ -844,7 +1082,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         gpsDriftTimer = nil
     }
 
-    private func commitSimulation(_ profile: GeoProfile) {
+    private func commitSimulation(_ profile: GeoProfile, keepExistingWiFi: Bool) {
         self.lockedProfile = profile
         self.isSimulating = true
         self.isSyncing = false
@@ -853,13 +1091,15 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         self.ispText = profile.isp
         self.timezoneName = profile.timezone
         self.coordText = String(format: "%.5f, %.5f", profile.latitude, profile.longitude)
+        self.baseAltitude = profile.altitude ?? self.baseAltitude
+        self.altitudeText = String(format: "%.1fm (平滑锁定)", self.baseAltitude)
         self.streetAddress = profile.street
         self.zipCode = profile.zip
         self.updateMappedProfileSummary(for: profile.countryCode)
 
-        if self.wifiList.isEmpty || self.lastWiFiCountry != profile.countryCode {
+        if !keepExistingWiFi && (self.wifiList.isEmpty || self.lastWiFiCountry != profile.countryCode) {
             self.lastWiFiCountry = profile.countryCode
-            regenerateWiFiList(for: profile.countryCode, save: false)
+            self.wifiList = buildWiFiList(for: profile.countryCode)
         }
 
         writeGeoPlist(profile)
@@ -870,8 +1110,8 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         }
     }
 
-    func regenerateWiFiList(for countryCode: String? = nil, save: Bool = true) {
-        let cc = (countryCode ?? lockedProfile?.countryCode ?? lastWiFiCountry).uppercased()
+    private func buildWiFiList(for countryCode: String) -> [[String: String]] {
+        let cc = countryCode.uppercased()
         let prefixMap: [String: [String]] = [
             "US": ["Xfinity", "SpectrumSetup", "ATT-FIBER", "Fios", "MySpectrumWiFi", "NETGEAR", "Linksys"],
             "GB": ["BTWi-fi", "SKY", "VM", "TalkTalk", "Plusnet", "Vodafone", "EE-Hub"],
@@ -894,10 +1134,19 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             let mac = String(format: "%@:%02X:%02X:%02X", oui, Int.random(in: 0...255), Int.random(in: 0...255), Int.random(in: 0...255))
             generated.append(["SSID": "\(p)-\(suffix)\(band)", "BSSID": mac])
         }
-        self.wifiList = generated
+        return generated
+    }
+
+    func regenerateWiFiList(for countryCode: String? = nil, save: Bool = true) {
+        let cc = (countryCode ?? lockedProfile?.countryCode ?? lastWiFiCountry).uppercased()
+        self.wifiList = buildWiFiList(for: cc)
         self.lastWiFiCountry = cc
         if save {
             saveWiFiPlist(enabled: isSimulating)
+            if let aid = activeProfileId, let idx = savedProfiles.firstIndex(where: { $0.id == aid }) {
+                savedProfiles[idx].wifiList = self.wifiList
+                saveProfileVault()
+            }
         }
     }
 
@@ -909,6 +1158,19 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         writeSharedPlist(dict, paths: wifiPlistPaths)
     }
 
+    // MARK: - 深度防泄露体检（插件 + 商宽/机房 + DNS + IPv6 + 高风控隔离）
+
+    private func isCommercialOrHostingISP(_ isp: String) -> Bool {
+        let lower = isp.lowercased()
+        let keywords = [
+            "business", "hosting", "cloud", "datacenter", "data center",
+            "amazon", "aws", "google", "microsoft", "azure", "digitalocean",
+            "vultr", "linode", "akamai", "ovh", "hetzner", "cogent",
+            "choopa", "m247", "leaseweb", "datacamp", "server", "vps", "proxy"
+        ]
+        return keywords.contains(where: { lower.contains($0) })
+    }
+
     func runEnvironmentAudit() {
         guard !isAuditing else { return }
         isAuditing = true
@@ -916,44 +1178,77 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
 
         let group = DispatchGroup()
         var ipv6LeakedIP: String? = nil
+        var dnsResolverIP: String? = nil
+        var dnsResolverGeo: String? = nil
+
         var ipRiskDetail = "未同步节点，请先点击同步"
         var ipRiskPassed = false
         var ipRiskWarn = true
 
         if let p = lockedProfile {
+            let commercialFlag = isCommercialOrHostingISP(p.isp)
             if p.isHosting == true || p.isProxy == true {
                 let tags = [p.isHosting == true ? "机房(Hosting)" : nil, p.isProxy == true ? "代理(Proxy)" : nil].compactMap { $0 }.joined(separator: " / ")
                 ipRiskDetail = "\(p.ip) · 检测到风险标签: \(tags)（ISP: \(p.isp)）"
                 ipRiskPassed = false
                 ipRiskWarn = true
+            } else if commercialFlag {
+                ipRiskDetail = "\(p.ip) · 检测到商宽/企业特征（ISP: \(p.isp)），普通 App 可用，Amazon 等极高风控建议换家宽住宅 IP"
+                ipRiskPassed = false
+                ipRiskWarn = true
             } else if p.isHosting == false && p.isProxy == false {
-                ipRiskDetail = "\(p.ip) · 住宅/非机房特征良好（ISP: \(p.isp)）"
+                ipRiskDetail = "\(p.ip) · 纯净家宽住宅特征良好（ISP: \(p.isp)）"
                 ipRiskPassed = true
                 ipRiskWarn = false
             } else {
-                ipRiskDetail = "\(p.ip) · ISP: \(p.isp)（当前接口未返回风险标签）"
+                ipRiskDetail = "\(p.ip) · ISP: \(p.isp)（无商宽关键词，未返回风险标签）"
                 ipRiskPassed = true
-                ipRiskWarn = true
+                ipRiskWarn = false
             }
         }
 
+        // 检测 1: IPv6 泄露
         group.enter()
-        let cfg = URLSessionConfiguration.ephemeral
-        cfg.timeoutIntervalForRequest = 3.5
-        cfg.timeoutIntervalForResource = 4.0
-        let session = URLSession(configuration: cfg)
+        let v6Cfg = URLSessionConfiguration.ephemeral
+        v6Cfg.timeoutIntervalForRequest = 3.5
+        v6Cfg.timeoutIntervalForResource = 4.0
+        let v6Session = URLSession(configuration: v6Cfg)
         if let v6Url = URL(string: "https://api6.ipify.org?format=json") {
-            session.dataTask(with: v6Url) { data, response, _ in
+            v6Session.dataTask(with: v6Url) { data, response, _ in
                 if let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
                    let data = data,
                    let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                    let ip = obj["ip"] as? String, ip.contains(":") {
                     ipv6LeakedIP = ip
                 }
-                session.finishTasksAndInvalidate()
+                v6Session.finishTasksAndInvalidate()
                 group.leave()
             }.resume()
         } else {
+            v6Session.finishTasksAndInvalidate()
+            group.leave()
+        }
+
+        // 检测 2: DNS 出口归属地泄露
+        group.enter()
+        let dnsCfg = URLSessionConfiguration.ephemeral
+        dnsCfg.timeoutIntervalForRequest = 4.5
+        dnsCfg.timeoutIntervalForResource = 5.0
+        let dnsSession = URLSession(configuration: dnsCfg)
+        if let dnsUrl = URL(string: "http://edns.ip-api.com/json") {
+            dnsSession.dataTask(with: dnsUrl) { data, response, _ in
+                if let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
+                   let data = data,
+                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let dnsDict = obj["dns"] as? [String: Any] {
+                    dnsResolverIP = dnsDict["ip"] as? String
+                    dnsResolverGeo = dnsDict["geo"] as? String
+                }
+                dnsSession.finishTasksAndInvalidate()
+                group.leave()
+            }.resume()
+        } else {
+            dnsSession.finishTasksAndInvalidate()
             group.leave()
         }
 
@@ -969,16 +1264,36 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
             ))
 
             results.append(AuditItem(
-                title: "出口 IP 纯净度",
+                title: "出口 IP 纯净度与商宽预警",
                 detail: ipRiskDetail,
                 passed: ipRiskPassed,
                 isWarning: ipRiskWarn
             ))
 
+            if let geoStr = dnsResolverGeo, let ipStr = dnsResolverIP {
+                let lowerGeo = geoStr.lowercased()
+                let leakedCN = lowerGeo.contains("china") || lowerGeo.contains("hong kong") || lowerGeo.contains("macao")
+                results.append(AuditItem(
+                    title: "DNS 出口防泄露实测",
+                    detail: leakedCN
+                        ? "检测到国内/港澳 DNS 泄露：\(geoStr) (\(ipStr))，请开启代理远程加密 DNS！"
+                        : "海外解析正常：\(geoStr) (\(ipStr))",
+                    passed: !leakedCN,
+                    isWarning: leakedCN
+                ))
+            } else {
+                results.append(AuditItem(
+                    title: "DNS 出口防泄露实测",
+                    detail: "探测接口超时，请确认代理网络通畅后重测",
+                    passed: false,
+                    isWarning: true
+                ))
+            }
+
             if let v6 = ipv6LeakedIP {
                 results.append(AuditItem(
                     title: "IPv6 防泄露检测",
-                    detail: "检测到活跃 IPv6 出口 (\(v6))，建议在路由器或代理中关闭 IPv6 防止真实地址泄露",
+                    detail: "检测到活跃 IPv6 出口 (\(v6))，建议在路由器或代理中关闭 IPv6",
                     passed: false,
                     isWarning: true
                 ))
@@ -991,11 +1306,25 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
                 ))
             }
 
-            let consistencyOk = self.isSimulating && self.lockedProfile != nil
+            let highRiskInjected = self.enabledBundleIDs.contains { bid in
+                let l = bid.lowercased()
+                return l.contains("amazon") || l.contains("paypal") || l.contains("chase") || l.contains("stripe")
+            }
             results.append(AuditItem(
-                title: "定位 / 时区 / 运营商 / 语言联动",
+                title: "极高风控零注入安全检查",
+                detail: highRiskInjected
+                    ? "检测到高风控原生 App 仍在白名单内！请关闭其开关并移至 RootHide 黑名单 + 路由器透明代理"
+                    : "白名单仅含常规 App（共 \(self.enabledBundleIDs.count) 个），高风控原生 App 已安全隔离",
+                passed: !highRiskInjected,
+                isWarning: highRiskInjected
+            ))
+
+            let consistencyOk = self.isSimulating && self.lockedProfile != nil
+            let idfvMode = self.delegateIdfvToCrane ? "Crane托管" : "档案独立"
+            results.append(AuditItem(
+                title: "多维指纹 / 网页 / 档案联动",
                 detail: consistencyOk
-                    ? "\(self.lockedProfile!.countryCode) · \(self.timezoneName) · \(self.mappedProfileText)（白名单已选 \(self.enabledBundleIDs.count) 个 App）"
+                    ? "档案[\(self.activeProfileName)] · \(self.currentDeviceName) · IDFV(\(idfvMode)) · WKWebView(\(self.spoofWebView ? "已保护" : "关"))"
                     : "尚未开启模拟，目标 App 将读取本机真实参数",
                 passed: consistencyOk,
                 isWarning: !consistencyOk
@@ -1044,6 +1373,7 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
         ispText = "--"
         timezoneName = "- (待同步)"
         coordText = "- (0.0000, 0.0000)"
+        altitudeText = "--"
         mappedProfileText = "已恢复原机参数"
         streetAddress = "等待同步解析附近精确街道地址..."
         zipCode = "--"
@@ -1053,14 +1383,131 @@ final class LocationEngine: NSObject, ObservableObject, CLLocationManagerDelegat
 
         let geoDict: [String: Any] = [
             "enabled": false,
+            "schemaVersion": Self.schemaVersion,
             "spoofLocale": spoofLocale,
             "spoofCarrier": spoofCarrier,
-            "spoofProxy": spoofProxy
+            "spoofProxy": spoofProxy,
+            "spoofWebView": spoofWebView,
+            "spoofDevice": spoofDevice,
+            "delegateIdfvToCrane": delegateIdfvToCrane
         ]
         writeSharedPlist(geoDict, paths: geoPlistPaths)
         saveWiFiPlist(enabled: false)
     }
 }
+
+// MARK: - 环境档案库管理页
+
+struct ProfileVaultView: View {
+    @ObservedObject var engine: LocationEngine
+    @State private var newProfileName = ""
+
+    var body: some View {
+        VStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("每个档案永久锁定独立坐标、基准海拔、14个周边 Wi-Fi、英文设备名与 IDFV。新号请建新档，老号固定切回同一档案切勿频繁重刷指纹。")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                if let fb = engine.profileFeedback {
+                    Text(fb)
+                        .font(.caption.bold())
+                        .foregroundColor(.white)
+                        .padding(8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.green)
+                        .cornerRadius(8)
+                }
+
+                HStack(spacing: 8) {
+                    TextField("输入新档案名（如 美东-号1，可留空）", text: $newProfileName)
+                        .textFieldStyle(RoundedBorderTextFieldStyle())
+                        .font(.caption)
+                    Button("建全新档") {
+                        engine.createProfileFromCurrent(customName: newProfileName)
+                        newProfileName = ""
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .font(.caption.bold())
+                }
+
+                Button(action: { engine.regenerateFingerprintForActiveProfile() }) {
+                    Text("一键换新当前环境的全部周边与设备指纹（仅新号用）")
+                        .font(.caption.bold())
+                        .foregroundColor(.orange)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 8)
+                        .background(Color.orange.opacity(0.12))
+                        .cornerRadius(8)
+                }
+            }
+            .padding()
+            .background(Color(.secondarySystemBackground))
+
+            if engine.savedProfiles.isEmpty {
+                VStack(spacing: 8) {
+                    Spacer()
+                    Image(systemName: "person.crop.rectangle.stack")
+                        .font(.largeTitle)
+                        .foregroundColor(.secondary)
+                    Text("暂无保存的环境档案")
+                        .font(.subheadline.bold())
+                    Text("先在主页同步一次海外 IP，再点上方「建全新档」即可永久锁定一套身份。")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 24)
+                    Spacer()
+                }
+            } else {
+                List {
+                    ForEach(engine.savedProfiles) { prof in
+                        Button(action: { engine.activateProfile(prof) }) {
+                            HStack(alignment: .top) {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    HStack(spacing: 6) {
+                                        Text(prof.name)
+                                            .font(.subheadline.bold())
+                                            .foregroundColor(.primary)
+                                        if engine.activeProfileId == prof.id {
+                                            Text("使用中")
+                                                .font(.caption2.bold())
+                                                .padding(.horizontal, 6)
+                                                .padding(.vertical, 2)
+                                                .background(Color.green.opacity(0.18))
+                                                .foregroundColor(.green)
+                                                .cornerRadius(4)
+                                        }
+                                    }
+                                    Text("\(prof.geo.countryCode) · \(prof.geo.timezone) · \(prof.deviceName)")
+                                        .font(.caption)
+                                        .foregroundColor(.blue)
+                                    Text("IDFV: \(String(prof.idfv.prefix(18)))... · 海拔 \(String(format: "%.1fm", prof.geo.altitude ?? 35.0)) · Wi-Fi \(prof.wifiList.count)个")
+                                        .font(.caption2.monospaced())
+                                        .foregroundColor(.secondary)
+                                    Text(prof.geo.street)
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                        .lineLimit(1)
+                                }
+                                Spacer()
+                                Image(systemName: engine.activeProfileId == prof.id ? "checkmark.circle.fill" : "circle")
+                                    .foregroundColor(engine.activeProfileId == prof.id ? .green : .gray)
+                            }
+                            .padding(.vertical, 4)
+                        }
+                    }
+                    .onDelete(perform: engine.deleteProfiles)
+                }
+                .listStyle(PlainListStyle())
+            }
+        }
+        .navigationTitle("多账号环境档案库")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+// MARK: - 定向伪装白名单管理页
 
 struct WhitelistManagerView: View {
     @ObservedObject var engine: LocationEngine
@@ -1078,10 +1525,10 @@ struct WhitelistManagerView: View {
     var body: some View {
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 8) {
-                Text("仅对下方打开开关的 App 注入 AutoIPLocHook（隐藏小火箭代理/VPN网卡/模拟定位标记，伪造时区与运营商）。工具软件已自动排除防闪退。")
+                Text("仅对下方打开开关的 App 注入 AutoIPLocHook（含 WKWebView 防泄露、设备名/键盘隐身、代理隐藏）。工具软件已自动排除。")
                     .font(.caption)
                     .foregroundColor(.secondary)
-                Text("提示：Amazon 等极高风控原生 App 请保持关闭，改去 RootHide 黑名单 + 路由器代理。")
+                Text("提示：Amazon 等极高风控原生 App 请保持关闭，改去 RootHide 黑名单 + 路由器透明代理。")
                     .font(.caption2.bold())
                     .foregroundColor(.orange)
 
@@ -1161,6 +1608,8 @@ struct WhitelistManagerView: View {
     }
 }
 
+// MARK: - 主界面
+
 struct ContentView: View {
     @ObservedObject private var engine = LocationEngine.shared
     @Environment(\.scenePhase) private var scenePhase
@@ -1196,7 +1645,18 @@ struct ContentView: View {
                                 .foregroundColor(engine.isSimulating ? .green : .gray)
                             Text(engine.isSimulating ? "正在模拟海外住宅环境" : "已停止模拟")
                                 .font(.headline)
+                            Spacer()
+                            Text("v5.3.0")
+                                .font(.caption2.bold())
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.blue.opacity(0.15))
+                                .foregroundColor(.blue)
+                                .cornerRadius(4)
                         }
+                        Text("当前档案: \(engine.activeProfileName) · 设备名: \(engine.currentDeviceName)")
+                            .font(.caption.bold())
+                            .foregroundColor(.purple)
                         Text("出口 IP: \(engine.exitIP)")
                             .font(.subheadline.monospaced())
                         Text("运营商/ISP: \(engine.ispText)")
@@ -1207,7 +1667,7 @@ struct ContentView: View {
                         Text("伪造身份: \(engine.mappedProfileText)")
                             .font(.caption.bold())
                             .foregroundColor(.blue)
-                        Text("模拟坐标: \(engine.coordText)")
+                        Text("模拟坐标: \(engine.coordText) · 海拔 \(engine.altitudeText)")
                             .font(.caption.monospaced())
                             .foregroundColor(.secondary)
                         Divider()
@@ -1249,6 +1709,32 @@ struct ContentView: View {
                     .background(Color(.secondarySystemBackground))
                     .cornerRadius(14)
 
+                    // 多账号环境档案库入口
+                    NavigationLink(destination: ProfileVaultView(engine: engine)) {
+                        HStack {
+                            Image(systemName: "person.crop.rectangle.stack.fill")
+                                .font(.title3)
+                                .foregroundColor(.white)
+                                .frame(width: 34, height: 34)
+                                .background(Color.purple)
+                                .cornerRadius(8)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("多账号独立环境档案库")
+                                    .font(.subheadline.bold())
+                                    .foregroundColor(.primary)
+                                Text("已保存 \(engine.savedProfiles.count) 套档案 · 一键换新/锁定坐标、Wi-Fi、设备名与 IDFV")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .foregroundColor(.secondary)
+                        }
+                        .padding()
+                        .background(Color(.secondarySystemBackground))
+                        .cornerRadius(14)
+                    }
+
                     // 可视化定向白名单入口
                     NavigationLink(destination: WhitelistManagerView(engine: engine)) {
                         HStack {
@@ -1262,7 +1748,7 @@ struct ContentView: View {
                                 Text("定向伪装 App 白名单管理")
                                     .font(.subheadline.bold())
                                     .foregroundColor(.primary)
-                                Text("已勾选 \(engine.enabledBundleIDs.count) 个目标 App · 点此勾选隐身与代理隐藏对象")
+                                Text("已勾选 \(engine.enabledBundleIDs.count) 个目标 App · 点此管理定向注入对象")
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                             }
@@ -1293,10 +1779,10 @@ struct ContentView: View {
                     }
                     .disabled(engine.isSyncing)
 
-                    // 一键环境与防泄露体检
+                    // 一键深度环境与防泄露体检
                     VStack(alignment: .leading, spacing: 10) {
                         HStack {
-                            Text("环境一致性与防泄露体检")
+                            Text("深度环境一致性与防泄露体检")
                                 .font(.subheadline.bold())
                             Spacer()
                             Button(action: { engine.runEnvironmentAudit() }) {
@@ -1312,7 +1798,7 @@ struct ContentView: View {
                             .disabled(engine.isAuditing)
                         }
                         if engine.auditItems.isEmpty {
-                            Text("点击“开始体检”检测插件版本、IP 机房风险及 IPv6 泄露状态。")
+                            Text("一键检测：插件版本、商宽/机房 IP 风险、DNS 出口泄露、IPv6 阻断及高风控零注入隔离。")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         } else {
@@ -1338,18 +1824,24 @@ struct ContentView: View {
 
                     // 模块化风控开关
                     VStack(spacing: 10) {
-                        Toggle("网络与代理切换自动同步 IP + 时区 + Wi-Fi", isOn: $engine.autoSyncOnNetworkChange)
+                        Toggle("网络切换自动同步 IP + 时区 + Wi-Fi", isOn: $engine.autoSyncOnNetworkChange)
                             .font(.subheadline)
                         Toggle("防旋转 IP 跳变锁定（同会话固定坐标与时区）", isOn: $engine.lockSessionGeo)
                             .font(.subheadline)
                         Divider()
-                        Toggle("伪造目标 App 语言与区域 (NSLocale)", isOn: $engine.spoofLocale)
+                        Toggle("伪造目标 App 语言、区域与 HTTP 请求头", isOn: $engine.spoofLocale)
                             .font(.subheadline)
                         Toggle("伪造运营商与 SIM 卡信息 (CTCarrier)", isOn: $engine.spoofCarrier)
                             .font(.subheadline)
-                        Toggle("隐藏系统代理与 VPN 网卡特征", isOn: $engine.spoofProxy)
+                        Toggle("隐藏系统代理、VPN 网卡与 NEVPN 状态", isOn: $engine.spoofProxy)
                             .font(.subheadline)
-                        Toggle("GPS 自然精度与微幅漂移保活（45秒刷新）", isOn: $engine.naturalGpsJitter)
+                        Toggle("WKWebView 网页时区/语言/WebRTC 防泄露注入", isOn: $engine.spoofWebView)
+                            .font(.subheadline)
+                        Toggle("伪造英文设备名、IDFA归零与隐藏中文键盘", isOn: $engine.spoofDevice)
+                            .font(.subheadline)
+                        Toggle("IDFV 委托 Crane 管理（推荐多开时开启）", isOn: $engine.delegateIdfvToCrane)
+                            .font(.subheadline)
+                        Toggle("GPS 平滑海拔与微幅漂移保活（45秒刷新）", isOn: $engine.naturalGpsJitter)
                             .font(.subheadline)
                     }
                     .padding()
@@ -1405,7 +1897,7 @@ struct ContentView: View {
                 }
                 .padding()
             }
-            .navigationTitle("IP 自动定位与全局时区助手")
+            .navigationTitle("AutoIPLoc 全维环境隐身")
             .onAppear {
                 engine.refreshHookStatus()
                 engine.loadInstalledAppsAndWhitelist()
