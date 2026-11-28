@@ -25,8 +25,8 @@
 
 #define HOOK_VER_MAJOR 5
 #define HOOK_VER_MINOR 2
-#define HOOK_VER_PATCH 0
-#define HOOK_VER_STR   @"5.2.0"
+#define HOOK_VER_PATCH 1
+#define HOOK_VER_STR   @"5.2.1"
 
 typedef void (*MSHookFunction_t)(void *symbol, void *replace, void **result);
 typedef void (*MSHookMessageEx_t)(Class _class, SEL message, IMP hook, IMP *old);
@@ -1166,8 +1166,13 @@ static NSString *hook_hotspotBSSID(id self, SEL _cmd) {
 }
 
 // ============================================================================
-// 14. 跨沙盒实时心跳上报（Darwin notify_set_state + 多路径 plist）
+// 14. 跨沙盒实时心跳上报（自身沙盒 Caches/tmp + 持久 Darwin token + 兜底路径）
 // ============================================================================
+
+static int g_hbNotifyToken = 0;
+static BOOL g_hbNotifyRegistered = NO;
+static char g_hbProgName[128] = {0};
+static BOOL g_hbCHookReady = NO;
 
 static void PublishHookHeartbeat(const char *prog, BOOL cHookReady) {
     g_selfCallDepth++;
@@ -1178,29 +1183,51 @@ static void PublishHookHeartbeat(const char *prog, BOOL cHookReady) {
                      ((uint64_t)(HOOK_VER_PATCH & 0x7F) << 41) |
                      ((uint64_t)(cHookReady ? 1 : 0) << 40) |
                      (ts & 0xFFFFFFFFFFULL);
-    int token = 0;
-    if (notify_register_check("com.autoiploc.hook.heartbeat", &token) == NOTIFY_STATUS_OK) {
-        notify_set_state(token, state);
-        notify_cancel(token);
+
+    if (!g_hbNotifyRegistered) {
+        if (notify_register_check("com.autoiploc.hook.heartbeat", &g_hbNotifyToken) == NOTIFY_STATUS_OK) {
+            g_hbNotifyRegistered = YES;
+        }
+    }
+    if (g_hbNotifyRegistered) {
+        notify_set_state(g_hbNotifyToken, state);
+        notify_post("com.autoiploc.hook.heartbeat");
     }
 
+    NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
     NSDictionary *status = @{
         @"active": @YES,
         @"version": HOOK_VER_STR,
-        @"lastProc": [NSString stringWithUTF8String:prog ?: "App"],
+        @"lastProc": [NSString stringWithUTF8String:(prog && prog[0]) ? prog : "App"],
+        @"bundleId": bundleId,
         @"cHookReady": @(cHookReady),
         @"timestamp": @((double)ts)
     };
+
+    NSData *plistData = [NSPropertyListSerialization dataWithPropertyList:status
+                                                                   format:NSPropertyListXMLFormat_v1_0
+                                                                  options:0
+                                                                    error:nil];
+    if (plistData) {
+        NSString *cachesDir = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
+        if (cachesDir.length > 0) {
+            [[NSFileManager defaultManager] createDirectoryAtPath:cachesDir withIntermediateDirectories:YES attributes:nil error:nil];
+            NSString *cacheFile = [cachesDir stringByAppendingPathComponent:@"com.autoiploc.hookstatus.plist"];
+            [plistData writeToFile:cacheFile options:NSDataWritingFileProtectionNone error:nil];
+        }
+        NSString *tmpDir = NSTemporaryDirectory();
+        if (tmpDir.length > 0) {
+            NSString *tmpFile = [tmpDir stringByAppendingPathComponent:@"com.autoiploc.hookstatus.plist"];
+            [plistData writeToFile:tmpFile options:NSDataWritingFileProtectionNone error:nil];
+        }
+    }
+
     if (g_selfDirPath[0] != '\0') {
         char selfStatusPath[1024] = {0};
         snprintf(selfStatusPath, sizeof(selfStatusPath), "%s/AutoIPLoc.hookstatus.plist", g_selfDirPath);
         [status writeToFile:[NSString stringWithUTF8String:selfStatusPath] atomically:NO];
-        chmod(selfStatusPath, 0666);
     }
     [status writeToFile:@"/var/tmp/com.autoiploc.hookstatus.plist" atomically:NO];
-    chmod("/var/tmp/com.autoiploc.hookstatus.plist", 0666);
-    [status writeToFile:@"/var/mobile/Library/Preferences/com.autoiploc.hookstatus.plist" atomically:NO];
-    chmod("/var/mobile/Library/Preferences/com.autoiploc.hookstatus.plist", 0666);
 
     g_selfCallDepth--;
 }
@@ -1354,6 +1381,15 @@ static void AutoIPLocHookEntry(void) {
             g_MSHookFunction((void *)CNCopySupportedInterfaces, (void *)hook_CNCopySupportedInterfaces, (void **)&orig_CNCopySupportedInterfaces);
         }
 
-        PublishHookHeartbeat(prog, (g_MSHookFunction != NULL && g_MSHookMessageEx != NULL));
+        strlcpy(g_hbProgName, prog, sizeof(g_hbProgName));
+        g_hbCHookReady = (g_MSHookFunction != NULL && g_MSHookMessageEx != NULL);
+        PublishHookHeartbeat(g_hbProgName, g_hbCHookReady);
+
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                          object:nil
+                                                           queue:nil
+                                                      usingBlock:^(__unused NSNotification *note) {
+            PublishHookHeartbeat(g_hbProgName, g_hbCHookReady);
+        }];
     }
 }
